@@ -1,0 +1,42 @@
+# Root workspace: ON-CHAIN code only (Anchor program + shared types).
+#
+# The `relayer/` directory is deliberately EXCLUDED and is its own Cargo
+# workspace. This is the mechanism that enforces the rule "off-chain relayer
+# dependencies must never appear in crates linked into the Solana program":
+# tokio, reqwest, solana-client etc. live in the relayer workspace and can
+# never be unified into the SBF dependency graph of this one.
+# See docs/adr/0001-repo-layout-and-workspace-split.md.
+
+[workspace]
+resolver = "2"
+members = [
+    "programs/glc-bridge",
+    "shared",
+]
+exclude = ["relayer"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/Reaper-lk/glc-solana-bridge"
+
+[workspace.dependencies]
+# Anchor 0.31.x targets the Agave 2.x line. Do NOT additionally pin
+# `solana-program` here: anchor-lang re-exports its matching version, and a
+# second pin is how duplicate-crate version conflicts happen.
+# Exact Anchor <-> Agave <-> rustc pairing is re-verified in Phase 1 CI.
+anchor-lang = "0.31.1"
+anchor-spl = "0.31.1"
+glc-bridge-shared = { path = "shared" }
+
+# Overflow checks stay ON in release: this program will eventually move value,
+# and silent wrap-around arithmetic is unacceptable there.
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+
+[profile.release.build-override]
+opt-level = 3
+incremental = false
+codegen-units = 1

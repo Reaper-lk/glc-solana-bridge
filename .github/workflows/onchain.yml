@@ -1,0 +1,44 @@
+# On-chain workspace CI (programs/glc-bridge + shared).
+# This machine class has no local toolchain — CI is the compilation authority.
+
+name: onchain
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-and-check:
+    name: fmt / clippy / check (host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.85.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo check --workspace --all-targets
+
+  anchor-build:
+    name: anchor build (SBF)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # Agave version provisionally pinned; finalized with the Anchor pairing
+      # in Phase 1 (see Anchor.toml [toolchain]).
+      - name: Install Agave toolchain
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/v2.1.21/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - name: Install Anchor
+        run: cargo install anchor-cli --version 0.31.1 --locked
+      - run: anchor build
+      # No deploy steps in this repository, at any phase, by policy.

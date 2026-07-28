@@ -1,0 +1,7 @@
+# Pins the HOST toolchain (relayer, shared-crate host builds, lints).
+# The SBF build of the on-chain program uses the rustc bundled with Solana
+# platform-tools, which this file does not control.
+# Version is a provisional pin; re-validated against Anchor's MSRV in Phase 1.
+[toolchain]
+channel = "1.85.0"
+components = ["rustfmt", "clippy"]
