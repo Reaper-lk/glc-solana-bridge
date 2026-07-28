@@ -1,0 +1,22 @@
+# Anchor CLI configuration. Phase 0: localnet only, nothing is deployed.
+
+[toolchain]
+anchor_version = "0.31.1"
+# solana_version intentionally unpinned in Phase 0; pinned in Phase 1 once the
+# Anchor <-> Agave compatibility pair is verified in CI.
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+# Placeholder ID (deterministically generated, no known private key).
+# Replaced via `anchor keys sync` when a real deploy keypair exists.
+glc_bridge = "77oYT33t13HnZ6PNxKdbHDABb1uR2zzJMW9u7cJuwkRq"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "echo 'E2E harness lands in Phase 6 — see docs/architecture.md (implementation phases)'"

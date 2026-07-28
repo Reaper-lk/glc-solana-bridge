@@ -1,0 +1,23 @@
+[package]
+name = "glc-bridge"
+description = "Solana Anchor program for the Goldcoin (GLC) federated bridge — Phase 0 placeholder"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "glc_bridge"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang.workspace = true
+anchor-spl.workspace = true
+glc-bridge-shared.workspace = true

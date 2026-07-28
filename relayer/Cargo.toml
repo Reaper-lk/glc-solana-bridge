@@ -1,0 +1,24 @@
+[package]
+name = "glc-relayer"
+description = "Off-chain federated validator daemon for the GLC<->Solana bridge — Phase 0 placeholder"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/Reaper-lk/glc-solana-bridge"
+
+# This crate is its OWN workspace root (empty [workspace] below), detached
+# from the repository root workspace on purpose: its async/networking
+# dependency graph must never unify with the on-chain (SBF) build.
+# See docs/adr/0001-repo-layout-and-workspace-split.md.
+[workspace]
+
+[dependencies]
+glc-bridge-shared = { path = "../shared" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+# Added in later phases (NOT Phase 0):
+#   Phase 2: reqwest 0.12 or jsonrpsee (Goldcoin JSON-RPC), rust-bitcoin types
+#   Phase 5: solana-client / solana-sdk (version matched to the Anchor line),
+#            clap + config loading

@@ -1,0 +1,26 @@
+# Supply-chain audit for BOTH workspaces: advisories, license policy, banned
+# sources (deny.toml). Runs on PRs and weekly, so new advisories against
+# existing dependencies still surface.
+
+name: supply-chain
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        workspace: [".", "relayer"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: ${{ matrix.workspace }}/Cargo.toml
+          command: check

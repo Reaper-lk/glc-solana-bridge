@@ -1,0 +1,23 @@
+# Rust
+target/
+Cargo.lock.orig
+
+# Anchor / Solana
+.anchor/
+test-ledger/
+**/*.so
+
+# Keys & secrets — never committed, in any form
+*.json.key
+id.json
+keypair*.json
+.env
+.env.*
+
+# Node (Phase 6 TS e2e harness)
+node_modules/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
