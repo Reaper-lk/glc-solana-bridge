@@ -74,4 +74,25 @@ pub mod glc_bridge {
     pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> {
         instructions::accept_admin(ctx)
     }
+
+    /// One-time creation of the wrapped-GLC SPL mint; admin-only. Mint
+    /// authority is the mint-authority PDA, freeze authority is None
+    /// (custody #6, ADR-0009).
+    pub fn create_wrapped_mint(ctx: Context<CreateWrappedMint>) -> Result<()> {
+        instructions::create_wrapped_mint(ctx)
+    }
+
+    /// TEMPORARY Phase 2 test scaffolding: the deposit-claim mint path with
+    /// admin-signature authorization instead of federation proof
+    /// verification. Deleted in Phase 3 (ADR-0009); see the module docs in
+    /// [`instructions::mint_testonly`].
+    pub fn mint_wrapped_testonly(
+        ctx: Context<MintWrappedTestonly>,
+        txid: [u8; 32],
+        vout: u32,
+        amount: u64,
+        epoch: u64,
+    ) -> Result<()> {
+        instructions::mint_wrapped_testonly(ctx, txid, vout, amount, epoch)
+    }
 }

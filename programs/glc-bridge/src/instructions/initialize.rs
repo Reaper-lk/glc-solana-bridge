@@ -83,7 +83,11 @@ pub fn initialize(
     config.min_deposit = min_deposit;
     config.min_withdrawal = min_withdrawal;
     config.bump = ctx.bumps.bridge_config;
-    config.reserved = [0u8; 64];
+    // Wrapped mint not created here (ADR-0008/0009): default = unset
+    // sentinel until `create_wrapped_mint`.
+    config.wrapped_mint = Pubkey::default();
+    config.mint_authority_bump = 0;
+    config.reserved = [0u8; 31];
 
     let validator_count = validators.len() as u8;
     let set = &mut ctx.accounts.validator_set;

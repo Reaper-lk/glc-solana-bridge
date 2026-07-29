@@ -1,23 +1,13 @@
-//! Phase 1 integration tests: run the real SBF binary under litesvm and
-//! exercise every instruction path — happy paths, each validation rejection,
-//! authorization failures, and the structural reinitialization guard.
-//!
-//! Requires `anchor build` to have produced `target/deploy/glc_bridge.so`
-//! (CI runs these tests in the anchor-build job for exactly that reason).
-//!
-//! The program is installed as a loader-v3 (upgradeable) program with a
-//! test-controlled upgrade authority, because `initialize` authorization is
-//! proven against the ProgramData account (ADR-0008).
+//! Phase 1 integration tests: bridge state and governance — happy paths,
+//! each validation rejection, authorization failures, and the structural
+//! reinitialization guard. Harness lives in `common`.
 
-use anchor_lang::{AccountDeserialize, InstructionData, ToAccountMetas};
-use litesvm::LiteSVM;
+mod common;
+use common::*;
+
 use solana_sdk::{
-    account::Account,
-    bpf_loader_upgradeable::{self, UpgradeableLoaderState},
-    instruction::{Instruction, InstructionError},
     pubkey::Pubkey,
     signature::{Keypair, Signer},
-    transaction::{Transaction, TransactionError},
 };
 
 use glc_bridge::constants::{
@@ -25,230 +15,6 @@ use glc_bridge::constants::{
 };
 use glc_bridge::errors::BridgeError;
 use glc_bridge::state::{BridgeConfig, ValidatorSet};
-
-// ---------------------------------------------------------------- harness --
-
-fn program_bytes() -> Vec<u8> {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../target/deploy/glc_bridge.so"
-    );
-    std::fs::read(path).expect("target/deploy/glc_bridge.so missing — run `anchor build` first")
-}
-
-fn programdata_address() -> Pubkey {
-    Pubkey::find_program_address(&[glc_bridge::ID.as_ref()], &bpf_loader_upgradeable::id()).0
-}
-
-fn config_pda() -> Pubkey {
-    Pubkey::find_program_address(&[SEED_BRIDGE_CONFIG], &glc_bridge::ID).0
-}
-
-fn validator_set_pda() -> Pubkey {
-    Pubkey::find_program_address(&[SEED_VALIDATOR_SET], &glc_bridge::ID).0
-}
-
-/// Serialized loader-v3 ProgramData account: 45-byte metadata header
-/// followed by the ELF.
-fn programdata_account(upgrade_authority: Option<Pubkey>, elf: &[u8]) -> Account {
-    let mut data = bincode::serialize(&UpgradeableLoaderState::ProgramData {
-        slot: 0,
-        upgrade_authority_address: upgrade_authority,
-    })
-    .unwrap();
-    data.resize(UpgradeableLoaderState::size_of_programdata_metadata(), 0);
-    data.extend_from_slice(elf);
-    Account {
-        lamports: 10_000_000_000,
-        data,
-        owner: bpf_loader_upgradeable::id(),
-        executable: false,
-        rent_epoch: 0,
-    }
-}
-
-/// Fresh VM with the program installed as upgradeable and `authority` as its
-/// upgrade authority (funded).
-fn setup(authority: &Keypair) -> LiteSVM {
-    let mut svm = LiteSVM::new();
-    svm.airdrop(&authority.pubkey(), 100_000_000_000).unwrap();
-
-    let elf = program_bytes();
-    // ProgramData must exist before the executable account: litesvm loads
-    // the program the moment the executable account is set.
-    svm.set_account(
-        programdata_address(),
-        programdata_account(Some(authority.pubkey()), &elf),
-    )
-    .unwrap();
-    let program_state = bincode::serialize(&UpgradeableLoaderState::Program {
-        programdata_address: programdata_address(),
-    })
-    .unwrap();
-    svm.set_account(
-        glc_bridge::ID,
-        Account {
-            lamports: 1_000_000_000,
-            data: program_state,
-            owner: bpf_loader_upgradeable::id(),
-            executable: true,
-            rent_epoch: 0,
-        },
-    )
-    .unwrap();
-    svm
-}
-
-fn keys(n: usize) -> Vec<Pubkey> {
-    (0..n).map(|_| Pubkey::new_unique()).collect()
-}
-
-fn initialize_ix(
-    authority: &Pubkey,
-    program_data: Pubkey,
-    validators: Vec<Pubkey>,
-    threshold: u8,
-) -> Instruction {
-    Instruction {
-        program_id: glc_bridge::ID,
-        accounts: glc_bridge::accounts::Initialize {
-            authority: *authority,
-            bridge_config: config_pda(),
-            validator_set: validator_set_pda(),
-            program: glc_bridge::ID,
-            program_data,
-            system_program: solana_sdk::system_program::id(),
-        }
-        .to_account_metas(None),
-        data: glc_bridge::instruction::Initialize {
-            validators,
-            threshold,
-            min_deposit: 1_000,
-            min_withdrawal: 2_000,
-        }
-        .data(),
-    }
-}
-
-// The Err type is litesvm's own; its size is not ours to shrink.
-#[allow(clippy::result_large_err)]
-fn send(
-    svm: &mut LiteSVM,
-    ix: Instruction,
-    payer: &Keypair,
-    extra_signers: &[&Keypair],
-) -> Result<litesvm::types::TransactionMetadata, litesvm::types::FailedTransactionMetadata> {
-    let mut signers: Vec<&Keypair> = vec![payer];
-    signers.extend_from_slice(extra_signers);
-    let tx = Transaction::new_signed_with_payer(
-        &[ix],
-        Some(&payer.pubkey()),
-        &signers,
-        svm.latest_blockhash(),
-    );
-    svm.send_transaction(tx)
-}
-
-/// Sets up an initialized bridge with `authority` as upgrade authority and
-/// admin, `n` validators at `threshold`.
-fn setup_initialized(authority: &Keypair, n: usize, threshold: u8) -> (LiteSVM, Vec<Pubkey>) {
-    let mut svm = setup(authority);
-    let validators = keys(n);
-    let ix = initialize_ix(
-        &authority.pubkey(),
-        programdata_address(),
-        validators.clone(),
-        threshold,
-    );
-    send(&mut svm, ix, authority, &[]).expect("initialize should succeed");
-    (svm, validators)
-}
-
-fn expected_code(e: BridgeError) -> u32 {
-    match anchor_lang::error::Error::from(e) {
-        anchor_lang::error::Error::AnchorError(ae) => ae.error_code_number,
-        _ => unreachable!(),
-    }
-}
-
-#[track_caller]
-fn assert_bridge_error(
-    result: Result<litesvm::types::TransactionMetadata, litesvm::types::FailedTransactionMetadata>,
-    expected: BridgeError,
-) {
-    let err = result.expect_err("transaction should have failed").err;
-    match err {
-        TransactionError::InstructionError(_, InstructionError::Custom(code)) => {
-            assert_eq!(code, expected_code(expected), "wrong custom error code")
-        }
-        other => panic!("expected custom program error, got {other:?}"),
-    }
-}
-
-fn get_config(svm: &LiteSVM) -> BridgeConfig {
-    let account = svm.get_account(&config_pda()).expect("config must exist");
-    BridgeConfig::try_deserialize(&mut account.data.as_slice()).unwrap()
-}
-
-fn get_validator_set(svm: &LiteSVM) -> ValidatorSet {
-    let account = svm
-        .get_account(&validator_set_pda())
-        .expect("validator set must exist");
-    ValidatorSet::try_deserialize(&mut account.data.as_slice()).unwrap()
-}
-
-fn admin_config_metas(admin: &Pubkey) -> Vec<solana_sdk::instruction::AccountMeta> {
-    glc_bridge::accounts::AdminConfig {
-        admin: *admin,
-        bridge_config: config_pda(),
-    }
-    .to_account_metas(None)
-}
-
-fn set_paused_ix(admin: &Pubkey, paused: bool) -> Instruction {
-    Instruction {
-        program_id: glc_bridge::ID,
-        accounts: admin_config_metas(admin),
-        data: glc_bridge::instruction::SetPaused { paused }.data(),
-    }
-}
-
-fn update_validator_set_ix(admin: &Pubkey, validators: Vec<Pubkey>, threshold: u8) -> Instruction {
-    Instruction {
-        program_id: glc_bridge::ID,
-        accounts: glc_bridge::accounts::UpdateValidatorSet {
-            admin: *admin,
-            bridge_config: config_pda(),
-            validator_set: validator_set_pda(),
-        }
-        .to_account_metas(None),
-        data: glc_bridge::instruction::UpdateValidatorSet {
-            validators,
-            threshold,
-        }
-        .data(),
-    }
-}
-
-fn transfer_admin_ix(admin: &Pubkey, new_admin: Pubkey) -> Instruction {
-    Instruction {
-        program_id: glc_bridge::ID,
-        accounts: admin_config_metas(admin),
-        data: glc_bridge::instruction::TransferAdmin { new_admin }.data(),
-    }
-}
-
-fn accept_admin_ix(new_admin: &Pubkey) -> Instruction {
-    Instruction {
-        program_id: glc_bridge::ID,
-        accounts: glc_bridge::accounts::AcceptAdmin {
-            new_admin: *new_admin,
-            bridge_config: config_pda(),
-        }
-        .to_account_metas(None),
-        data: glc_bridge::instruction::AcceptAdmin {}.data(),
-    }
-}
 
 // ------------------------------------------------------------- initialize --
 
@@ -265,7 +31,9 @@ fn initialize_happy_path() {
     assert_eq!(config.withdrawal_count, 0);
     assert_eq!(config.min_deposit, 1_000);
     assert_eq!(config.min_withdrawal, 2_000);
-    assert_eq!(config.reserved, [0u8; 64]);
+    assert_eq!(config.reserved, [0u8; 31]);
+    assert_eq!(config.wrapped_mint, Pubkey::default());
+    assert_eq!(config.mint_authority_bump, 0);
     let (expected_config, config_bump) =
         Pubkey::find_program_address(&[SEED_BRIDGE_CONFIG], &glc_bridge::ID);
     assert_eq!(expected_config, config_pda());

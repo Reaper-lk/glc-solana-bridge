@@ -6,8 +6,7 @@
 //! and logs are truncated/pruned. Every fact below is recoverable from
 //! `BridgeConfig` / `ValidatorSet` account state.
 //!
-//! Planned (Phase 2–3):
-//! - `DepositMinted { deposit_txid, vout, amount, recipient }`
+//! Planned (Phase 3):
 //! - `WithdrawalRequested { withdrawal_index, amount, glc_address }`
 
 use anchor_lang::prelude::*;
@@ -47,4 +46,23 @@ pub struct AdminTransferInitiated {
 pub struct AdminTransferred {
     pub previous_admin: Pubkey,
     pub new_admin: Pubkey,
+}
+
+/// The wrapped-GLC SPL mint was created (`create_wrapped_mint`, once ever).
+#[event]
+pub struct WrappedMintCreated {
+    pub mint: Pubkey,
+    pub mint_authority: Pubkey,
+    pub decimals: u8,
+}
+
+/// A deposit claim was processed and wrapped GLC minted 1:1. Advisory only —
+/// the `DepositClaim` account is the authoritative record (ADR-0006).
+#[event]
+pub struct DepositClaimMinted {
+    pub txid: [u8; 32],
+    pub vout: u32,
+    pub recipient: Pubkey,
+    pub amount: u64,
+    pub epoch: u64,
 }

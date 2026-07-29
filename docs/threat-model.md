@@ -20,11 +20,12 @@ OPEN blocks deployment.
 | **Upgrade authority = infinite mint** | Multisig custody of upgrade authority, immutability timeline — OPEN (custody.md) |
 | **Federation capture (M collude)** | Phase 1: rotations admin-gated, epoch-tracked, invariant-checked (ADR-0007). Threshold-gated + timelocked governance lands with proof verification (3); federation composition OPEN |
 | **Initialization front-running** — first caller on a fresh deployment becomes admin | `initialize` restricted to the program upgrade authority via ProgramData check; reinitialization structurally impossible (1, ADR-0008) |
-| **Replay of processed deposits** | Per-claim PDA, existence = guard (2) |
+| **Replay of processed deposits** | Per-claim PDA, existence = guard (done, Phase 2); claims additionally bind validator epoch + protocol version |
 | **Lost withdrawal events** | Persistent `WithdrawalRequest` accounts are authoritative; events UX-only (3) |
 | **Arithmetic overflow** | `overflow-checks = true` in release (done, Phase 0); checked math in program code (done for Phase 1 paths; ongoing) |
 | **Dust/PDA-rent DoS** | `min_deposit` / `min_withdrawal` floors; rent funding policy (1) |
 | **No emergency stop** | `paused` flag in `BridgeConfig` (done, Phase 1), checked by the mint & burn paths from Phase 2 on; interim pause authority = admin key, final authority/quorum OPEN (custody.md #7) |
+| **Phase 2 mint path is admin-trusted TEST SCAFFOLDING** — `mint_wrapped_testonly` authorizes with a single admin signature, not federation proof | Standing block on any deployment beyond localnet while it exists; instruction is named/documented as test-only and is deleted (not renamed) when Phase 3 proof verification lands (ADR-0009) |
 | **Key material leakage** | No keys in repo at any phase; signer code isolated in relayer; `.gitignore` guards; TSS/vault signing out of scope until custody decided |
 | **Dependency/supply chain** | cargo-deny in CI on both workspaces (Phase 0); on-chain workspace structurally isolated from network deps (ADR-0001) |
 

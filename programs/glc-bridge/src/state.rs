@@ -24,12 +24,15 @@ use crate::constants::MAX_VALIDATORS;
 /// | `min_deposit`      | `u64`          | 8     |
 /// | `min_withdrawal`   | `u64`          | 8     |
 /// | `bump`             | `u8`           | 1     |
-/// | `reserved`         | `[u8; 64]`     | 64    |
+/// | `wrapped_mint`     | `Pubkey`       | 32    |
+/// | `mint_authority_bump` | `u8`        | 1     |
+/// | `reserved`         | `[u8; 31]`     | 31    |
 ///
 /// `Option<Pubkey>` is allocated at its maximum (`Some`) size so the account
-/// never needs realloc. The wrapped mint's pubkey is deliberately NOT here
-/// yet: the mint is created in Phase 2 (ADR-0008), and its field is added
-/// then, taken out of `reserved`.
+/// never needs realloc. Phase 2 consumed 33 bytes of the original 64-byte
+/// reserve for `wrapped_mint` + `mint_authority_bump`, appended after `bump`
+/// so every pre-existing field keeps its byte offset (ADR-0009); total size
+/// is unchanged.
 #[account]
 pub struct BridgeConfig {
     /// [`crate::constants::PROTOCOL_VERSION`] at initialization; bumped by
@@ -55,14 +58,22 @@ pub struct BridgeConfig {
     pub min_withdrawal: u64,
     /// Canonical PDA bump, stored so later phases never re-derive it.
     pub bump: u8,
-    /// Expansion space for future fields (e.g. the Phase 2 `wrapped_mint`),
-    /// so already-initialized deployments can migrate without moving
-    /// accounts. Must be all zeroes until a migration assigns meaning.
-    pub reserved: [u8; 64],
+    /// The wrapped-GLC SPL mint, set once by `create_wrapped_mint`.
+    /// `Pubkey::default()` means "not yet created" — every mint path
+    /// explicitly rejects that sentinel (`MintNotConfigured`).
+    pub wrapped_mint: Pubkey,
+    /// Canonical bump of the mint-authority PDA
+    /// ([`crate::constants::SEED_MINT_AUTHORITY`]), stored at
+    /// `create_wrapped_mint` for `invoke_signed`.
+    pub mint_authority_bump: u8,
+    /// Expansion space for future fields, so already-initialized deployments
+    /// can migrate without moving accounts. Must be all zeroes until a
+    /// migration assigns meaning.
+    pub reserved: [u8; 31],
 }
 
 impl BridgeConfig {
-    /// 8 (discriminator) + 1 + 32 + 33 + 1 + 8 + 8 + 8 + 1 + 64 = 164.
+    /// 8 (discriminator) + 1 + 32 + 33 + 1 + 8 + 8 + 8 + 1 + 32 + 1 + 31 = 164.
     pub const SPACE: usize = 8 // Anchor discriminator
         + 1 // protocol_version
         + 32 // admin
@@ -72,7 +83,9 @@ impl BridgeConfig {
         + 8 // min_deposit
         + 8 // min_withdrawal
         + 1 // bump
-        + 64; // reserved
+        + 32 // wrapped_mint
+        + 1 // mint_authority_bump
+        + 31; // reserved
 }
 
 /// Singleton federation validator set (PDA:
@@ -123,13 +136,63 @@ impl ValidatorSet {
 }
 
 /// One processed Goldcoin deposit (PDA: [`crate::constants::SEED_DEPOSIT_CLAIM`]
-/// + `txid` + `vout`). The account's existence is the replay guard: a second
-/// `mint_wrapped` for the same `(txid, vout)` fails at account creation.
+/// + `txid` + `vout.to_le_bytes()`). The account's existence is the replay
+/// guard (ADR-0003): a second mint for the same `(txid, vout)` fails at
+/// account creation. Doubles as the permanent audit record of the deposit.
 ///
-/// Phase 2 fields (planned): `txid: [u8; 32]`, `vout: u32`, `amount: u64`,
-/// `recipient: Pubkey`, `minted_at_slot: u64`.
+/// Byte layout (borsh, after the 8-byte Anchor discriminator):
+///
+/// | field              | type        | bytes |
+/// |--------------------|-------------|-------|
+/// | `txid`             | `[u8; 32]`  | 32    |
+/// | `vout`             | `u32`       | 4     |
+/// | `amount`           | `u64`       | 8     |
+/// | `recipient`        | `Pubkey`    | 32    |
+/// | `epoch`            | `u64`       | 8     |
+/// | `protocol_version` | `u8`        | 1     |
+/// | `slot_created`     | `u64`       | 8     |
+/// | `bump`             | `u8`        | 1     |
+/// | `reserved`         | `[u8; 16]`  | 16    |
 #[account]
-pub struct DepositClaim {}
+pub struct DepositClaim {
+    /// Goldcoin transaction id, 32 bytes used VERBATIM as supplied in the
+    /// claim — the program never reorders bytes. Canonical convention is
+    /// Goldcoin internal (little-endian) byte order per `shared::DepositId`;
+    /// verified against real node RPC output in Phase 4
+    /// (docs/goldcoin-rpc-notes.md).
+    pub txid: [u8; 32],
+    /// Output index within the transaction (ADR-0002).
+    pub vout: u32,
+    /// Minted amount in atomic GLC units (8 decimals, 1:1 with the deposit).
+    pub amount: u64,
+    /// Solana wallet the wrapped GLC was minted to (its associated token
+    /// account for the wrapped mint received the tokens).
+    pub recipient: Pubkey,
+    /// Validator-set epoch (ADR-0007) this claim was authorized under.
+    pub epoch: u64,
+    /// `BridgeConfig.protocol_version` at mint time.
+    pub protocol_version: u8,
+    /// Solana slot in which the claim was created.
+    pub slot_created: u64,
+    /// Canonical PDA bump.
+    pub bump: u8,
+    /// Expansion space. Must be all zeroes until a migration assigns meaning.
+    pub reserved: [u8; 16],
+}
+
+impl DepositClaim {
+    /// 8 (discriminator) + 32 + 4 + 8 + 32 + 8 + 1 + 8 + 1 + 16 = 118.
+    pub const SPACE: usize = 8 // Anchor discriminator
+        + 32 // txid
+        + 4 // vout
+        + 8 // amount
+        + 32 // recipient
+        + 8 // epoch
+        + 1 // protocol_version
+        + 8 // slot_created
+        + 1 // bump
+        + 16; // reserved
+}
 
 /// Persistent withdrawal record (PDA: [`crate::constants::SEED_WITHDRAWAL`]
 /// + index). Created by `burn_wrapped`; the authoritative source relayers
@@ -160,11 +223,70 @@ mod space {
             min_deposit: u64::MAX,
             min_withdrawal: u64::MAX,
             bump: u8::MAX,
-            reserved: [0u8; 64],
+            wrapped_mint: Pubkey::new_unique(),
+            mint_authority_bump: u8::MAX,
+            reserved: [0u8; 31],
         };
         let serialized = max.try_to_vec().unwrap();
         assert_eq!(8 + serialized.len(), BridgeConfig::SPACE);
         assert_eq!(BridgeConfig::SPACE, 164);
+    }
+
+    /// The Phase 2 fields were appended after `bump` precisely so that every
+    /// Phase 1 field keeps its byte offset (ADR-0009); this pins the offsets
+    /// of the fields flanking the insertion point and the total length.
+    /// Offsets are for the maximum-size (`pending_admin: Some`) encoding the
+    /// account is allocated for, excluding the 8-byte discriminator:
+    /// bump was — and stays — at body offset 91 (1+32+33+1+8+8+8).
+    #[test]
+    fn bridge_config_phase1_field_offsets_preserved() {
+        let admin = Pubkey::new_unique();
+        let wrapped_mint = Pubkey::new_unique();
+        let config = BridgeConfig {
+            protocol_version: 7,
+            admin,
+            pending_admin: Some(Pubkey::new_unique()),
+            paused: false,
+            withdrawal_count: 0,
+            min_deposit: 0,
+            min_withdrawal: 0,
+            bump: 0xAB,
+            wrapped_mint,
+            mint_authority_bump: 0xCD,
+            reserved: [0u8; 31],
+        };
+        let bytes = config.try_to_vec().unwrap();
+        assert_eq!(bytes[0], 7, "protocol_version at offset 0");
+        assert_eq!(&bytes[1..33], admin.as_ref(), "admin at offset 1");
+        assert_eq!(
+            bytes[91], 0xAB,
+            "bump at offset 91 (unchanged from Phase 1)"
+        );
+        assert_eq!(
+            &bytes[92..124],
+            wrapped_mint.as_ref(),
+            "wrapped_mint appended at offset 92"
+        );
+        assert_eq!(bytes[124], 0xCD, "mint_authority_bump at offset 124");
+        assert_eq!(bytes.len(), BridgeConfig::SPACE - 8);
+    }
+
+    #[test]
+    fn deposit_claim_space_matches_serialized_max() {
+        let max = DepositClaim {
+            txid: [u8::MAX; 32],
+            vout: u32::MAX,
+            amount: u64::MAX,
+            recipient: Pubkey::new_unique(),
+            epoch: u64::MAX,
+            protocol_version: u8::MAX,
+            slot_created: u64::MAX,
+            bump: u8::MAX,
+            reserved: [0u8; 16],
+        };
+        let serialized = max.try_to_vec().unwrap();
+        assert_eq!(8 + serialized.len(), DepositClaim::SPACE);
+        assert_eq!(DepositClaim::SPACE, 118);
     }
 
     #[test]
