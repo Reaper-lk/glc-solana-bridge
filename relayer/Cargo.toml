@@ -3,7 +3,11 @@ name = "glc-relayer"
 description = "Off-chain federated validator daemon for the GLC<->Solana bridge — Phase 0 placeholder"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 repository = "https://github.com/Reaper-lk/glc-solana-bridge"
+# Never published to crates.io (also lets cargo-deny's allow-wildcard-paths
+# accept the versionless path dependency on `shared`).
+publish = false
 
 # This crate is its OWN workspace root (empty [workspace] below), detached
 # from the repository root workspace on purpose: its async/networking

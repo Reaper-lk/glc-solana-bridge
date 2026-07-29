@@ -18,7 +18,18 @@ exclude = ["relayer"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 repository = "https://github.com/Reaper-lk/glc-solana-bridge"
+
+# Anchor's macros emit cfg values (`custom-heap`, `custom-panic`,
+# `anchor-debug`, `target_os = "solana"`) that rustc's check-cfg does not know
+# about; declaring them here keeps `-D warnings` viable in CI without blanket
+# allows. Member crates opt in with `[lints] workspace = true`.
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(feature, values("custom-heap", "custom-panic", "anchor-debug"))',
+    'cfg(target_os, values("solana"))',
+] }
 
 [workspace.dependencies]
 # Anchor 0.31.x targets the Agave 2.x line. Do NOT additionally pin

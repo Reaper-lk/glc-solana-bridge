@@ -3,7 +3,13 @@ name = "glc-bridge-shared"
 description = "Types shared between the glc-bridge Anchor program and the off-chain relayer"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 repository.workspace = true
+# Never published to crates.io.
+publish = false
+
+[lints]
+workspace = true
 
 # RULES for this crate (enforced by membership in the on-chain workspace,
 # which CI builds for SBF):

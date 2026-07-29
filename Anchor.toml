@@ -2,8 +2,12 @@
 
 [toolchain]
 anchor_version = "0.31.1"
-# solana_version intentionally unpinned in Phase 0; pinned in Phase 1 once the
-# Anchor <-> Agave compatibility pair is verified in CI.
+# Verified pairing (Phase 1): Anchor 0.31.1 <-> Agave 2.1.21 <-> rustc 1.85.0
+# (host). The SBF build uses Agave's bundled platform-tools (cargo 1.79), which
+# cannot parse edition-2024 manifests — the committed Cargo.lock pins the
+# dependency graph to versions that predate that requirement. Bump this pin and
+# the lockfile together.
+solana_version = "2.1.21"
 
 [features]
 resolution = true

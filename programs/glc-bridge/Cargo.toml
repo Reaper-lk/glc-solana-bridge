@@ -3,7 +3,14 @@ name = "glc-bridge"
 description = "Solana Anchor program for the Goldcoin (GLC) federated bridge — Phase 0 placeholder"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 repository.workspace = true
+# Never published to crates.io (also lets cargo-deny's allow-wildcard-paths
+# accept the versionless path dependency on `shared`).
+publish = false
+
+[lints]
+workspace = true
 
 [lib]
 crate-type = ["cdylib", "lib"]
