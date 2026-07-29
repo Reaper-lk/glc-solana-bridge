@@ -15,7 +15,8 @@ meanings, only the meaning used here is given.
 | **Deposit** | A confirmed Goldcoin transaction output paying the vault, identified canonically by `(txid, vout)` (ADR-0002). |
 | **`(txid, vout)`** | Goldcoin transaction id (32 bytes) + output index — the unique, L1-derived identity of one deposit. |
 | **Claim / `InboundClaim`** | The payload the federation signs asserting "deposit `(txid, vout)` of amount X is confirmed; mint to recipient R". |
-| **Deposit claim PDA (`DepositClaim`)** | Per-deposit Solana account seeded by `(txid, vout)`; its existence is the replay guard (ADR-0003). |
+| **Deposit claim PDA (`DepositClaim`)** | Per-deposit Solana account seeded by `(txid, vout little-endian)`; its existence is the replay guard (ADR-0003). Records amount, recipient, validator epoch, protocol version, and creation slot (ADR-0009). |
+| **`mint_wrapped_testonly`** | TEMPORARY Phase 2 instruction: the real deposit-claim mint path authorized by an admin signature instead of federation proof. Test scaffolding only; deleted when Phase 3's `mint_wrapped` lands (ADR-0009). |
 | **Withdrawal request (`WithdrawalRequest`)** | Persistent Solana account created atomically with a burn; the authoritative payout obligation record (ADR-0006). Status: `Pending → Broadcast → Completed`. |
 | **Replay** | Attempting to mint twice for the same deposit; structurally rejected by claim-PDA creation. |
 | **PDA (program-derived address)** | A Solana address derived from seeds + program id with no private key. Used for the mint authority (ADR-0004), config, claims, and withdrawal records. |

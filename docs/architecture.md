@@ -50,9 +50,9 @@ Goldcoin L1 (unmodified) ──JSON-RPC──▶ relayer (×N validators) ──
 |---|---|
 | 0 | This scaffold. No logic. |
 | 1 | Program state (`BridgeConfig` + epoch-tracked `ValidatorSet`, ADR-0007), upgrade-authority-gated `initialize` (ADR-0008), pause + validator-set rotation + two-step admin handover, litesvm tests. No mint yet. `shared` borsh alignment moved to Phase 2, where the first shared payloads appear. |
-| 2 | Deposit path on-chain: claim PDA lifecycle; Goldcoin RPC facts verified (`goldcoin-rpc-notes.md`) |
-| 3 | Federation proof format + on-chain verification; `burn_wrapped` + withdrawal records |
-| 4 | `relayer` Goldcoin indexer against regtest: depth tracking, reorg rollback |
+| 2 | Deposit path on-chain with test assets: wrapped mint (freeze = None, custody #6), claim PDA lifecycle, ATA-only recipients, `mint_wrapped_testonly` admin-authorized scaffolding (ADR-0009). No RPC, no real federation verification. |
+| 3 | Federation proof format + on-chain verification (replaces `mint_wrapped_testonly` with `mint_wrapped`); `burn_wrapped` + withdrawal records |
+| 4 | `relayer` Goldcoin indexer against regtest: depth tracking, reorg rollback; Goldcoin RPC facts verified (`goldcoin-rpc-notes.md`, moved from Phase 2 — needs a real node) |
 | 5 | Relayer orchestration + p2p signature aggregation (no vault signing) |
 | 6 | E2E harness: regtest deposit → localnet mint; burn → payout record |
 | — | Vault custody design, audits, devnet/mainnet: gated on `custody.md`, outside this plan |

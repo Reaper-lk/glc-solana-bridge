@@ -11,7 +11,7 @@ open as of 2026-07-28 (Phase 0).**
 | 3 | Vault signing model: script multisig vs TSS (both explicitly out of scope now) | relayer `signer`, `WithdrawalRequest` schema stays signing-agnostic |
 | 4 | Key rotation & vault migration procedure (UTXO sweep to new vault) | operations runbook |
 | 5 | Program upgrade-authority custody (e.g., Squads multisig) and immutability timeline | deployment gating |
-| 6 | Freeze authority on wrapped mint: `None` (censorship-resistant) vs governance-held | `initialize` design |
+| 6 | ~~Freeze authority on wrapped mint~~ — **DECIDED 2026-07-29**, see decision log | `create_wrapped_mint` (ADR-0009) |
 | 7 | Emergency pause: who can pause, what quorum un-pauses | admin instructions |
 | 8 | Proof-of-reserves / attestation cadence | operations |
 | 9 | Withdrawal payout policy: deterministic UTXO selection, fee bearer, min amount | `WithdrawalRequest` schema reserves fields |
@@ -23,4 +23,7 @@ decided. See ADR-0008.
 
 ## Decision log
 
-*(empty — no custody decisions have been made)*
+- **2026-07-29 — #6 Freeze authority: `None`** (owner decision, Phase 2,
+  ADR-0009). The federation must not be able to freeze user funds;
+  censorship-resistance chosen over a governance-held freeze. Irreversible
+  per mint; costless to revisit until a persistent deployment exists.

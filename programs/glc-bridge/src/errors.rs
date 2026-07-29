@@ -33,4 +33,18 @@ pub enum BridgeError {
     PendingAdminMismatch,
     #[msg("Arithmetic overflow")]
     ArithmeticOverflow,
+    #[msg("Wrapped mint has already been created")]
+    MintAlreadyConfigured,
+    #[msg("Wrapped mint has not been created yet")]
+    MintNotConfigured,
+    #[msg("Mint account does not match the configured wrapped mint")]
+    WrongWrappedMint,
+    #[msg("Bridge is paused")]
+    BridgePaused,
+    #[msg("Claim epoch does not match the current validator-set epoch")]
+    StaleValidatorEpoch,
+    #[msg("Deposit amount must be greater than zero")]
+    ZeroDepositAmount,
+    #[msg("Deposit amount is below the configured minimum")]
+    BelowMinimumDeposit,
 }
