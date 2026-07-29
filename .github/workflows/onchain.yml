@@ -41,4 +41,8 @@ jobs:
       - name: Install Anchor
         run: cargo install anchor-cli --version 0.31.1 --locked
       - run: anchor build
+      # Unit + litesvm integration tests run here (not in the host lint job)
+      # because the integration tests execute the freshly built
+      # target/deploy/glc_bridge.so.
+      - run: cargo test --workspace
       # No deploy steps in this repository, at any phase, by policy.

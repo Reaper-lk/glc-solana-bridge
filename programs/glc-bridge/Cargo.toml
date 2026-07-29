@@ -28,3 +28,11 @@ idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
 anchor-lang.workspace = true
 anchor-spl.workspace = true
 glc-bridge-shared.workspace = true
+
+# Host-only test harness (dev-dependencies are never linked into the SBF
+# build, so ADR-0001's isolation of the on-chain dependency graph holds).
+# Versions must stay within the Agave 2.1 line pinned by Cargo.lock.
+[dev-dependencies]
+litesvm = "0.5"
+solana-sdk = "2.1"
+bincode = "1.3"

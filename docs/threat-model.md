@@ -18,12 +18,13 @@ OPEN blocks deployment.
 |---|---|
 | **Goldcoin deep reorg / 51%** — low-hashrate PoW; deposit double-spend is the dominant risk | High confirmation depth; per-deposit and rolling-window value caps; indexer halts on reorg deeper than threshold (2/4). Depth number is OPEN. |
 | **Upgrade authority = infinite mint** | Multisig custody of upgrade authority, immutability timeline — OPEN (custody.md) |
-| **Federation capture (M collude)** | Governance changes threshold-gated + timelocked (1/3); federation composition OPEN |
+| **Federation capture (M collude)** | Phase 1: rotations admin-gated, epoch-tracked, invariant-checked (ADR-0007). Threshold-gated + timelocked governance lands with proof verification (3); federation composition OPEN |
+| **Initialization front-running** — first caller on a fresh deployment becomes admin | `initialize` restricted to the program upgrade authority via ProgramData check; reinitialization structurally impossible (1, ADR-0008) |
 | **Replay of processed deposits** | Per-claim PDA, existence = guard (2) |
 | **Lost withdrawal events** | Persistent `WithdrawalRequest` accounts are authoritative; events UX-only (3) |
-| **Arithmetic overflow** | `overflow-checks = true` in release (done, Phase 0); checked math in program code (1+) |
+| **Arithmetic overflow** | `overflow-checks = true` in release (done, Phase 0); checked math in program code (done for Phase 1 paths; ongoing) |
 | **Dust/PDA-rent DoS** | `min_deposit` / `min_withdrawal` floors; rent funding policy (1) |
-| **No emergency stop** | `paused` flag in `BridgeConfig`, checked by mint & burn paths; pause authority OPEN (1) |
+| **No emergency stop** | `paused` flag in `BridgeConfig` (done, Phase 1), checked by the mint & burn paths from Phase 2 on; interim pause authority = admin key, final authority/quorum OPEN (custody.md #7) |
 | **Key material leakage** | No keys in repo at any phase; signer code isolated in relayer; `.gitignore` guards; TSS/vault signing out of scope until custody decided |
 | **Dependency/supply chain** | cargo-deny in CI on both workspaces (Phase 0); on-chain workspace structurally isolated from network deps (ADR-0001) |
 

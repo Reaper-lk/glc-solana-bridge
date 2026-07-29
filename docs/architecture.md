@@ -49,7 +49,7 @@ Goldcoin L1 (unmodified) ──JSON-RPC──▶ relayer (×N validators) ──
 | Phase | Deliverable |
 |---|---|
 | 0 | This scaffold. No logic. |
-| 1 | `shared` types finalized (borsh alignment), program state + `initialize` + admin/pause, litesvm tests |
+| 1 | Program state (`BridgeConfig` + epoch-tracked `ValidatorSet`, ADR-0007), upgrade-authority-gated `initialize` (ADR-0008), pause + validator-set rotation + two-step admin handover, litesvm tests. No mint yet. `shared` borsh alignment moved to Phase 2, where the first shared payloads appear. |
 | 2 | Deposit path on-chain: claim PDA lifecycle; Goldcoin RPC facts verified (`goldcoin-rpc-notes.md`) |
 | 3 | Federation proof format + on-chain verification; `burn_wrapped` + withdrawal records |
 | 4 | `relayer` Goldcoin indexer against regtest: depth tracking, reorg rollback |

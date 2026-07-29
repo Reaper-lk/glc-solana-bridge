@@ -1,6 +1,12 @@
 # cargo-deny supply-chain policy. CI runs this against BOTH workspaces
 # (root and relayer/) — see .github/workflows/supply-chain.yml.
 
+# Audit only what ships: dev-dependencies (litesvm test harness and its
+# TLS/networking tree) are never linked into the SBF program or the relayer
+# binary.
+[graph]
+exclude-dev = true
+
 [advisories]
 version = 2
 yanked = "deny"
