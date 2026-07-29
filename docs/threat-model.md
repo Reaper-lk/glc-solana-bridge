@@ -25,7 +25,9 @@ OPEN blocks deployment.
 | **Arithmetic overflow** | `overflow-checks = true` in release (done, Phase 0); checked math in program code (done for Phase 1 paths; ongoing) |
 | **Dust/PDA-rent DoS** | `min_deposit` / `min_withdrawal` floors; rent funding policy (1) |
 | **No emergency stop** | `paused` flag in `BridgeConfig` (done, Phase 1), checked by the mint & burn paths from Phase 2 on; interim pause authority = admin key, final authority/quorum OPEN (custody.md #7) |
-| **Phase 2 mint path is admin-trusted TEST SCAFFOLDING** — `mint_wrapped_testonly` authorizes with a single admin signature, not federation proof | Standing block on any deployment beyond localnet while it exists; instruction is named/documented as test-only and is deleted (not renamed) when Phase 3 proof verification lands (ADR-0009) |
+| **Ed25519 introspection sharp edges** — instruction-sysvar verification is historically bug-prone | Fixed relative position, self-referential-offset-only entries, exact message equality, full bounds checks; parser unit-tested against malformed payloads (ADR-0010). Focused external review still required before deployment |
+| **Threshold exceeds transaction capacity** — a single tx fits ~4 (legacy) / ~7 (v0+ALT) signatures | Liveness-only bound (mints stall, never mint wrongly); documented in ADR-0010; vote-accumulation fallback (ADR-0005) if a larger M is ever needed |
+| **Admin rotates validator set to attacker keys** — governance key is an indirect mint capability | Unchanged interim risk since Phase 1: rotation is visible on-chain, epoch-bumping, and pause-independent; resolved by custody decisions #1/#7 (threshold-gated + timelocked governance) |
 | **Key material leakage** | No keys in repo at any phase; signer code isolated in relayer; `.gitignore` guards; TSS/vault signing out of scope until custody decided |
 | **Dependency/supply chain** | cargo-deny in CI on both workspaces (Phase 0); on-chain workspace structurally isolated from network deps (ADR-0001) |
 
@@ -35,4 +37,6 @@ OPEN blocks deployment.
 2. A `(txid, vout)` pair mints at most once, ever.
 3. Every burn has exactly one `WithdrawalRequest` account, forever queryable.
 4. No instruction path mints without a valid M-of-N proof over the exact
-   claim bytes.
+   claim bytes. (Holds from Phase 3: the only mint path verifies threshold
+   signatures over the canonical message via the ed25519 precompile;
+   the admin-signed test path was deleted.)

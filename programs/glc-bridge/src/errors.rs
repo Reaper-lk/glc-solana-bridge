@@ -47,4 +47,22 @@ pub enum BridgeError {
     ZeroDepositAmount,
     #[msg("Deposit amount is below the configured minimum")]
     BelowMinimumDeposit,
+    #[msg("Expected an ed25519 signature-verification instruction immediately before this one")]
+    MissingSignatureVerification,
+    #[msg("Ed25519 verification instruction data is malformed or references other instructions")]
+    MalformedSignatureVerification,
+    #[msg("A signature covers bytes other than the expected claim message")]
+    SignatureMessageMismatch,
+    #[msg("A signature was produced by a key that is not a current validator")]
+    UnknownValidatorSignature,
+    #[msg("The same validator signed more than once")]
+    DuplicateValidatorSignature,
+    #[msg("Fewer unique validator signatures than the required threshold")]
+    InsufficientSignatures,
+    #[msg("Withdrawal amount must be greater than zero")]
+    ZeroWithdrawalAmount,
+    #[msg("Withdrawal amount is below the configured minimum")]
+    BelowMinimumWithdrawal,
+    #[msg("Goldcoin destination address length is invalid")]
+    InvalidGlcAddressLength,
 }

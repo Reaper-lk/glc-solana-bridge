@@ -29,6 +29,7 @@ pub mod events;
 pub mod instructions;
 pub mod state;
 pub mod validation;
+pub mod verification;
 
 use instructions::*;
 
@@ -82,17 +83,26 @@ pub mod glc_bridge {
         instructions::create_wrapped_mint(ctx)
     }
 
-    /// TEMPORARY Phase 2 test scaffolding: the deposit-claim mint path with
-    /// admin-signature authorization instead of federation proof
-    /// verification. Deleted in Phase 3 (ADR-0009); see the module docs in
-    /// [`instructions::mint_testonly`].
-    pub fn mint_wrapped_testonly(
-        ctx: Context<MintWrappedTestonly>,
+    /// Mints wrapped GLC 1:1 for a confirmed Goldcoin deposit, authorized by
+    /// an M-of-N federation proof carried in a preceding ed25519
+    /// verification instruction (ADR-0010). Any fee payer may submit.
+    pub fn mint_wrapped(
+        ctx: Context<MintWrapped>,
         txid: [u8; 32],
         vout: u32,
         amount: u64,
         epoch: u64,
     ) -> Result<()> {
-        instructions::mint_wrapped_testonly(ctx, txid, vout, amount, epoch)
+        instructions::mint_wrapped(ctx, txid, vout, amount, epoch)
+    }
+
+    /// Burns wrapped GLC and atomically records the payout obligation as a
+    /// persistent [`state::WithdrawalRequest`] (ADR-0006).
+    pub fn burn_wrapped(
+        ctx: Context<BurnWrapped>,
+        amount: u64,
+        glc_address: Vec<u8>,
+    ) -> Result<()> {
+        instructions::burn_wrapped(ctx, amount, glc_address)
     }
 }

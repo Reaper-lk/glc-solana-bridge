@@ -147,17 +147,28 @@ pub fn send(
 }
 
 /// Sets up an initialized bridge with `authority` as upgrade authority and
-/// admin, `n` validators at `threshold`.
-pub fn setup_initialized(authority: &Keypair, n: usize, threshold: u8) -> (LiteSVM, Vec<Pubkey>) {
+/// admin, and the given validator pubkeys at `threshold`.
+pub fn setup_initialized_with(
+    authority: &Keypair,
+    validators: Vec<Pubkey>,
+    threshold: u8,
+) -> LiteSVM {
     let mut svm = setup(authority);
-    let validators = keys(n);
     let ix = initialize_ix(
         &authority.pubkey(),
         programdata_address(),
-        validators.clone(),
+        validators,
         threshold,
     );
     send(&mut svm, ix, authority, &[]).expect("initialize should succeed");
+    svm
+}
+
+/// Sets up an initialized bridge with `authority` as upgrade authority and
+/// admin, `n` random validators at `threshold`.
+pub fn setup_initialized(authority: &Keypair, n: usize, threshold: u8) -> (LiteSVM, Vec<Pubkey>) {
+    let validators = keys(n);
+    let svm = setup_initialized_with(authority, validators.clone(), threshold);
     (svm, validators)
 }
 
@@ -288,42 +299,6 @@ pub fn create_wrapped_mint_ix(admin: &Pubkey, mint: &Pubkey) -> Instruction {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn mint_testonly_ix(
-    admin: &Pubkey,
-    mint: &Pubkey,
-    recipient: &Pubkey,
-    recipient_token_account: &Pubkey,
-    txid: [u8; 32],
-    vout: u32,
-    amount: u64,
-    epoch: u64,
-) -> Instruction {
-    Instruction {
-        program_id: glc_bridge::ID,
-        accounts: glc_bridge::accounts::MintWrappedTestonly {
-            admin: *admin,
-            bridge_config: config_pda(),
-            validator_set: validator_set_pda(),
-            deposit_claim: claim_pda(&txid, vout),
-            wrapped_mint: *mint,
-            mint_authority: mint_authority_pda(),
-            recipient: *recipient,
-            recipient_token_account: *recipient_token_account,
-            token_program: spl_token::ID,
-            system_program: solana_sdk::system_program::id(),
-        }
-        .to_account_metas(None),
-        data: glc_bridge::instruction::MintWrappedTestonly {
-            txid,
-            vout,
-            amount,
-            epoch,
-        }
-        .data(),
-    }
-}
-
 /// Initialized bridge + wrapped mint created; returns the mint address.
 pub fn setup_with_mint(authority: &Keypair, n: usize, threshold: u8) -> (LiteSVM, Pubkey) {
     let (mut svm, _) = setup_initialized(authority, n, threshold);
@@ -427,4 +402,175 @@ pub fn assert_anchor_error(
         }
         other => panic!("expected anchor framework error, got {other:?}"),
     }
+}
+
+// ------------------------------------------- Phase 3 (proofs/withdrawals) --
+
+use glc_bridge::constants::{PROTOCOL_VERSION, SEED_WITHDRAWAL};
+use glc_bridge::state::WithdrawalRequest;
+use glc_bridge_shared::claim::deposit_claim_message;
+use solana_sdk::ed25519_program;
+
+/// Sends several instructions in one transaction (proof + mint pattern).
+#[allow(clippy::result_large_err)]
+pub fn send_ixs(
+    svm: &mut LiteSVM,
+    ixs: &[Instruction],
+    payer: &Keypair,
+    extra_signers: &[&Keypair],
+) -> Result<litesvm::types::TransactionMetadata, litesvm::types::FailedTransactionMetadata> {
+    let mut signers: Vec<&Keypair> = vec![payer];
+    signers.extend_from_slice(extra_signers);
+    let tx = Transaction::new_signed_with_payer(
+        ixs,
+        Some(&payer.pubkey()),
+        &signers,
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(tx)
+}
+
+/// Canonical claim message for THIS deployment/protocol version.
+pub fn claim_message(
+    epoch: u64,
+    txid: &[u8; 32],
+    vout: u32,
+    amount: u64,
+    recipient: &Pubkey,
+    mint: &Pubkey,
+) -> Vec<u8> {
+    deposit_claim_message(
+        PROTOCOL_VERSION,
+        &glc_bridge::ID.to_bytes(),
+        epoch,
+        txid,
+        vout,
+        amount,
+        &recipient.to_bytes(),
+        &mint.to_bytes(),
+    )
+    .to_vec()
+}
+
+/// Builds an ed25519-precompile instruction: one shared message, one entry
+/// per signer, all offsets self-referential (`u16::MAX`) like production
+/// relayers will produce.
+pub fn ed25519_proof_ix(signers: &[&Keypair], message: &[u8]) -> Instruction {
+    ed25519_proof_ix_with_index(signers, message, u16::MAX)
+}
+
+/// Variant with an explicit instruction-index field, for tests that exercise
+/// the parser's self-reference requirement.
+pub fn ed25519_proof_ix_with_index(
+    signers: &[&Keypair],
+    message: &[u8],
+    ix_index: u16,
+) -> Instruction {
+    let n = signers.len();
+    let entries_end = 2 + n * 14;
+    let keys_end = entries_end + n * 32;
+    let sigs_end = keys_end + n * 64;
+    let msg_off = sigs_end;
+    let mut data = vec![0u8; msg_off + message.len()];
+    data[0] = n as u8;
+    data[1] = 0;
+    for (i, kp) in signers.iter().enumerate() {
+        let base = 2 + i * 14;
+        let pk_off = (entries_end + i * 32) as u16;
+        let sig_off = (keys_end + i * 64) as u16;
+        data[base..base + 2].copy_from_slice(&sig_off.to_le_bytes());
+        data[base + 2..base + 4].copy_from_slice(&ix_index.to_le_bytes());
+        data[base + 4..base + 6].copy_from_slice(&pk_off.to_le_bytes());
+        data[base + 6..base + 8].copy_from_slice(&ix_index.to_le_bytes());
+        data[base + 8..base + 10].copy_from_slice(&(msg_off as u16).to_le_bytes());
+        data[base + 10..base + 12].copy_from_slice(&(message.len() as u16).to_le_bytes());
+        data[base + 12..base + 14].copy_from_slice(&ix_index.to_le_bytes());
+        let pk_pos = entries_end + i * 32;
+        data[pk_pos..pk_pos + 32].copy_from_slice(kp.pubkey().as_ref());
+        let sig = kp.sign_message(message);
+        let sig_pos = keys_end + i * 64;
+        data[sig_pos..sig_pos + 64].copy_from_slice(sig.as_ref());
+    }
+    data[msg_off..].copy_from_slice(message);
+    Instruction {
+        program_id: ed25519_program::id(),
+        accounts: vec![],
+        data,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn mint_wrapped_ix(
+    submitter: &Pubkey,
+    mint: &Pubkey,
+    recipient: &Pubkey,
+    recipient_token_account: &Pubkey,
+    txid: [u8; 32],
+    vout: u32,
+    amount: u64,
+    epoch: u64,
+) -> Instruction {
+    Instruction {
+        program_id: glc_bridge::ID,
+        accounts: glc_bridge::accounts::MintWrapped {
+            submitter: *submitter,
+            bridge_config: config_pda(),
+            validator_set: validator_set_pda(),
+            deposit_claim: claim_pda(&txid, vout),
+            wrapped_mint: *mint,
+            mint_authority: mint_authority_pda(),
+            recipient: *recipient,
+            recipient_token_account: *recipient_token_account,
+            instructions_sysvar: solana_sdk::sysvar::instructions::id(),
+            token_program: spl_token::ID,
+            system_program: solana_sdk::system_program::id(),
+        }
+        .to_account_metas(None),
+        data: glc_bridge::instruction::MintWrapped {
+            txid,
+            vout,
+            amount,
+            epoch,
+        }
+        .data(),
+    }
+}
+
+pub fn withdrawal_pda(index: u64) -> Pubkey {
+    Pubkey::find_program_address(&[SEED_WITHDRAWAL, &index.to_le_bytes()], &glc_bridge::ID).0
+}
+
+pub fn burn_wrapped_ix(
+    user: &Pubkey,
+    mint: &Pubkey,
+    user_token_account: &Pubkey,
+    withdrawal_index: u64,
+    amount: u64,
+    glc_address: Vec<u8>,
+) -> Instruction {
+    Instruction {
+        program_id: glc_bridge::ID,
+        accounts: glc_bridge::accounts::BurnWrapped {
+            user: *user,
+            bridge_config: config_pda(),
+            wrapped_mint: *mint,
+            user_token_account: *user_token_account,
+            withdrawal_request: withdrawal_pda(withdrawal_index),
+            token_program: spl_token::ID,
+            system_program: solana_sdk::system_program::id(),
+        }
+        .to_account_metas(None),
+        data: glc_bridge::instruction::BurnWrapped {
+            amount,
+            glc_address,
+        }
+        .data(),
+    }
+}
+
+pub fn get_withdrawal(svm: &LiteSVM, index: u64) -> WithdrawalRequest {
+    let account = svm
+        .get_account(&withdrawal_pda(index))
+        .expect("withdrawal record must exist");
+    WithdrawalRequest::try_deserialize(&mut account.data.as_slice()).unwrap()
 }

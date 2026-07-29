@@ -1,21 +1,22 @@
-//! # TEMPORARY Phase 2 test scaffolding — NOT federation verification
+//! Production deposit-claim mint path (ADR-0010). Replaces the Phase 2
+//! `mint_wrapped_testonly` scaffolding, which was deleted per ADR-0009.
 //!
-//! `mint_wrapped_testonly` authorizes minting with a plain **admin
-//! signature**. It exists so the entire deposit-claim path — claim-PDA
-//! replay guard, pause, minimum-deposit, epoch binding, ATA checks, and the
-//! `MintToChecked` CPI — is real and tested before Phase 3 adds the
-//! federation's M-of-N proof verification (ADR-0005, ADR-0009).
-//!
-//! In Phase 3 this instruction is **deleted, not renamed**: the production
-//! `mint_wrapped` replaces it with aggregated-proof verification in place of
-//! the admin signature. Nothing in this module may ever be mistaken for
-//! production-ready federation verification, and deployment beyond
-//! localnet/test remains blocked by policy while it exists
-//! (docs/threat-model.md).
+//! Authorization is an M-of-N federation proof: the transaction carries one
+//! ed25519-precompile instruction, immediately before this one, in which at
+//! least `threshold` distinct current validators signed the canonical claim
+//! message ([`glc_bridge_shared::claim`]). The runtime verified the
+//! signatures before execution; [`crate::verification`] proves what was
+//! signed and by whom. The submitter can be anyone — a valid proof is the
+//! only authority, and the submitter merely pays fees and claim rent
+//! (owner decision U7).
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::program::invoke_signed;
+use anchor_lang::solana_program::sysvar::instructions::{
+    get_instruction_relative, ID as INSTRUCTIONS_SYSVAR_ID,
+};
 use anchor_spl::token::{spl_token, Mint, Token, TokenAccount};
+use glc_bridge_shared::claim::deposit_claim_message;
 
 use crate::constants::{
     SEED_BRIDGE_CONFIG, SEED_DEPOSIT_CLAIM, SEED_MINT_AUTHORITY, SEED_VALIDATOR_SET,
@@ -24,19 +25,18 @@ use crate::constants::{
 use crate::errors::BridgeError;
 use crate::events::DepositClaimMinted;
 use crate::state::{BridgeConfig, DepositClaim, ValidatorSet};
+use crate::verification::count_unique_validator_signers;
 
 #[derive(Accounts)]
 #[instruction(txid: [u8; 32], vout: u32)]
-pub struct MintWrappedTestonly<'info> {
-    /// TEMPORARY authorization: the bridge admin. Replaced by federation
-    /// M-of-N proof verification in Phase 3 (see module docs).
+pub struct MintWrapped<'info> {
+    /// Any fee payer; funds the claim account's rent. Confers no authority.
     #[account(mut)]
-    pub admin: Signer<'info>,
+    pub submitter: Signer<'info>,
 
     #[account(
         seeds = [SEED_BRIDGE_CONFIG],
         bump = bridge_config.bump,
-        constraint = bridge_config.admin == admin.key() @ BridgeError::UnauthorizedAdmin,
         constraint = bridge_config.wrapped_mint != Pubkey::default()
             @ BridgeError::MintNotConfigured
     )]
@@ -49,7 +49,7 @@ pub struct MintWrappedTestonly<'info> {
     /// mint for the same `(txid, vout)` fails right here at `init`.
     #[account(
         init,
-        payer = admin,
+        payer = submitter,
         space = DepositClaim::SPACE,
         seeds = [SEED_DEPOSIT_CLAIM, txid.as_ref(), &vout.to_le_bytes()],
         bump
@@ -68,13 +68,12 @@ pub struct MintWrappedTestonly<'info> {
     pub mint_authority: UncheckedAccount<'info>,
 
     /// CHECK: the deposit's bound Solana recipient. Only its address is
-    /// used: it anchors the associated-token-account derivation below and is
-    /// recorded in the claim.
+    /// used: it anchors the ATA derivation below, is committed to inside the
+    /// signed claim message, and is recorded in the claim.
     pub recipient: UncheckedAccount<'info>,
 
     /// Must be the recipient's Associated Token Account for the wrapped
-    /// mint (owner decision: ATA required, arbitrary token accounts
-    /// rejected).
+    /// mint (owner decision: ATA required).
     #[account(
         mut,
         associated_token::mint = wrapped_mint,
@@ -82,12 +81,17 @@ pub struct MintWrappedTestonly<'info> {
     )]
     pub recipient_token_account: Account<'info, TokenAccount>,
 
+    /// CHECK: the Instructions sysvar, address-pinned; read to locate the
+    /// ed25519 verification instruction in this transaction.
+    #[account(address = INSTRUCTIONS_SYSVAR_ID)]
+    pub instructions_sysvar: UncheckedAccount<'info>,
+
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
 
-pub fn mint_wrapped_testonly(
-    ctx: Context<MintWrappedTestonly>,
+pub fn mint_wrapped(
+    ctx: Context<MintWrapped>,
     txid: [u8; 32],
     vout: u32,
     amount: u64,
@@ -107,8 +111,36 @@ pub fn mint_wrapped_testonly(
         BridgeError::BelowMinimumDeposit
     );
 
-    // MintToChecked: the token program re-verifies `decimals` against the
-    // mint, closing any decimals-confusion path.
+    // The federation proof: the instruction directly before this one must
+    // be the ed25519 precompile carrying >= threshold unique current
+    // validators over exactly the canonical claim bytes.
+    let verification_ix =
+        get_instruction_relative(-1, &ctx.accounts.instructions_sysvar.to_account_info())
+            .map_err(|_| BridgeError::MissingSignatureVerification)?;
+    require!(
+        verification_ix.program_id == anchor_lang::solana_program::ed25519_program::ID,
+        BridgeError::MissingSignatureVerification
+    );
+    let expected_message = deposit_claim_message(
+        config.protocol_version,
+        &crate::ID.to_bytes(),
+        validator_set.epoch,
+        &txid,
+        vout,
+        amount,
+        &ctx.accounts.recipient.key().to_bytes(),
+        &config.wrapped_mint.to_bytes(),
+    );
+    let signer_count = count_unique_validator_signers(
+        &verification_ix.data,
+        &expected_message,
+        &validator_set.validators,
+    )?;
+    require!(
+        signer_count >= usize::from(validator_set.threshold),
+        BridgeError::InsufficientSignatures
+    );
+
     let ix = spl_token::instruction::mint_to_checked(
         ctx.accounts.token_program.key,
         &ctx.accounts.wrapped_mint.key(),
