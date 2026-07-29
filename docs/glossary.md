@@ -6,7 +6,8 @@ meanings, only the meaning used here is given.
 | Term | Meaning here |
 |---|---|
 | **Bridge** | The whole system letting GLC holders obtain wrapped GLC on Solana and redeem it back 1:1. Federated — trust-minimized, not trustless. |
-| **Federation / validator set** | The N operators whose M-of-N approval authorizes mints (and eventually vault spends). Registered as public keys in `BridgeConfig`. |
+| **Federation / validator set** | The N operators whose M-of-N approval authorizes mints (and eventually vault spends). Registered as public keys in the `ValidatorSet` PDA (ADR-0007), at most `MAX_VALIDATORS` (16). |
+| **Epoch** | Revision counter of the validator set, incremented on every rotation. Phase 3 proofs bind to the epoch they were signed under, so a rotation invalidates in-flight proofs (ADR-0007). |
 | **M-of-N / threshold** | Minimum number of validator signatures (M) out of the registered set (N) required for a federation action. |
 | **Relayer** | The off-chain daemon (`relayer/`) each federation member runs beside their own Goldcoin full node: watches deposits, signs claims, aggregates signatures, submits Solana transactions, tracks withdrawals. |
 | **Vault** | The Goldcoin address/script holding all native GLC backing the wrapped supply. Construction and signing model are unresolved (`custody.md`). |

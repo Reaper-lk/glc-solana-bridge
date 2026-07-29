@@ -3,7 +3,14 @@ name = "glc-bridge"
 description = "Solana Anchor program for the Goldcoin (GLC) federated bridge — Phase 0 placeholder"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 repository.workspace = true
+# Never published to crates.io (also lets cargo-deny's allow-wildcard-paths
+# accept the versionless path dependency on `shared`).
+publish = false
+
+[lints]
+workspace = true
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -21,3 +28,11 @@ idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
 anchor-lang.workspace = true
 anchor-spl.workspace = true
 glc-bridge-shared.workspace = true
+
+# Host-only test harness (dev-dependencies are never linked into the SBF
+# build, so ADR-0001's isolation of the on-chain dependency graph holds).
+# Versions must stay within the Agave 2.1 line pinned by Cargo.lock.
+[dev-dependencies]
+litesvm = "0.5"
+solana-sdk = "2.1"
+bincode = "1.3"

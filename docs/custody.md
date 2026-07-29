@@ -16,6 +16,11 @@ open as of 2026-07-28 (Phase 0).**
 | 8 | Proof-of-reserves / attestation cadence | operations |
 | 9 | Withdrawal payout policy: deterministic UTXO selection, fee bearer, min amount | `WithdrawalRequest` schema reserves fields |
 
+Interim note (Phase 1, not a custody decision): a single `admin` pubkey —
+the initializer, i.e. the program upgrade authority — gates pause,
+validator-set rotation, and its own two-step handover until #1/#7 are
+decided. See ADR-0008.
+
 ## Decision log
 
 *(empty — no custody decisions have been made)*

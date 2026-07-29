@@ -1,27 +1,36 @@
 //! # glc-bridge — Solana side of the Goldcoin federated bridge
 //!
-//! **Phase 0 placeholder.** No bridge logic is implemented. This crate exists
-//! so the workspace, Anchor project, and CI are wired end-to-end before any
-//! value-bearing code is written.
+//! **Phase 1: bridge state and governance.** [`state::BridgeConfig`] and
+//! [`state::ValidatorSet`] PDAs, upgrade-authority-gated initialization
+//! (ADR-0008), pause circuit breaker, epoch-tracked validator-set rotation
+//! (ADR-0007), and two-step admin handover. No value moves in this phase:
+//! the wrapped mint, deposits, and withdrawals land in Phases 2–3.
 //!
-//! ## Planned instruction set (see docs/architecture.md)
-//! - `initialize` — create [`state::BridgeConfig`], the wrapped-GLC mint, and
-//!   the PDA mint authority. (Phase 1)
+//! ## Instruction set
+//! - [`initialize`](glc_bridge::initialize) — create the two state PDAs;
+//!   only the program upgrade authority may call, exactly once. (Phase 1)
+//! - [`set_paused`](glc_bridge::set_paused),
+//!   [`update_validator_set`](glc_bridge::update_validator_set),
+//!   [`transfer_admin`](glc_bridge::transfer_admin) /
+//!   [`accept_admin`](glc_bridge::accept_admin) — admin-gated governance.
+//!   (Phase 1)
 //! - `mint_wrapped` — verify an M-of-N aggregated federation proof for a
 //!   deposit identified by Goldcoin `(txid, vout)`, create the per-claim
 //!   [`state::DepositClaim`] PDA (replay guard), mint 1:1. (Phases 2–3)
 //! - `burn_wrapped` — burn wrapped GLC and create a persistent
 //!   [`state::WithdrawalRequest`] PDA; events are emitted as a convenience
 //!   but the account record is authoritative. (Phase 3)
-//! - admin instructions — pause flag, validator-set / threshold updates,
-//!   governance-gated. (Phase 1)
 
 use anchor_lang::prelude::*;
 
 pub mod constants;
 pub mod errors;
 pub mod events;
+pub mod instructions;
 pub mod state;
+pub mod validation;
+
+use instructions::*;
 
 declare_id!("77oYT33t13HnZ6PNxKdbHDABb1uR2zzJMW9u7cJuwkRq");
 
@@ -29,12 +38,40 @@ declare_id!("77oYT33t13HnZ6PNxKdbHDABb1uR2zzJMW9u7cJuwkRq");
 pub mod glc_bridge {
     use super::*;
 
-    /// Phase 0 scaffold check: proves the program compiles, deploys to a
-    /// localnet, and is callable. Removed when real instructions land.
-    pub fn ping(_ctx: Context<Ping>) -> Result<()> {
-        Ok(())
+    /// One-time creation of [`state::BridgeConfig`] and
+    /// [`state::ValidatorSet`]. Caller must be the program upgrade authority
+    /// and becomes the initial admin.
+    pub fn initialize(
+        ctx: Context<Initialize>,
+        validators: Vec<Pubkey>,
+        threshold: u8,
+        min_deposit: u64,
+        min_withdrawal: u64,
+    ) -> Result<()> {
+        instructions::initialize(ctx, validators, threshold, min_deposit, min_withdrawal)
+    }
+
+    /// Admin-only circuit breaker for the value-moving paths (Phase 2+).
+    pub fn set_paused(ctx: Context<AdminConfig>, paused: bool) -> Result<()> {
+        instructions::set_paused(ctx, paused)
+    }
+
+    /// Admin-only validator-set/threshold rotation; advances the epoch.
+    pub fn update_validator_set(
+        ctx: Context<UpdateValidatorSet>,
+        validators: Vec<Pubkey>,
+        threshold: u8,
+    ) -> Result<()> {
+        instructions::update_validator_set(ctx, validators, threshold)
+    }
+
+    /// Admin-only step 1 of the two-step admin handover.
+    pub fn transfer_admin(ctx: Context<AdminConfig>, new_admin: Pubkey) -> Result<()> {
+        instructions::transfer_admin(ctx, new_admin)
+    }
+
+    /// Step 2 of the handover; only the pending admin may call.
+    pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> {
+        instructions::accept_admin(ctx)
     }
 }
-
-#[derive(Accounts)]
-pub struct Ping {}

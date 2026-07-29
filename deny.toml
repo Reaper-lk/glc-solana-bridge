@@ -1,9 +1,28 @@
 # cargo-deny supply-chain policy. CI runs this against BOTH workspaces
 # (root and relayer/) — see .github/workflows/supply-chain.yml.
 
+# Audit only what ships: dev-dependencies (litesvm test harness and its
+# TLS/networking tree) are never linked into the SBF program or the relayer
+# binary.
+[graph]
+exclude-dev = true
+
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # Transitive via the Solana/Anchor stack; unavoidable until upstream moves
+    # off them. Both are "unmaintained" notices, not vulnerabilities.
+    { id = "RUSTSEC-2025-0141", reason = "bincode pulled in by solana-program; no vulnerability, upstream migration pending" },
+    { id = "RUSTSEC-2025-0161", reason = "libsecp256k1 pulled in by solana crates; no vulnerability, upstream migration pending" },
+    # Known advisories of the Agave 2.1.x dependency line (lockfile is pinned
+    # to 2.1 to match the SBF toolchain — see Anchor.toml [toolchain]).
+    # Re-evaluate all four when the Agave pin moves to 2.2+.
+    { id = "RUSTSEC-2024-0344", reason = "curve25519-dalek 3.x timing variability in Scalar::sub; transitive via solana-zk-sdk 2.1, no scalar secrets handled by this program; fixed upstream in the Agave 2.2+ line" },
+    { id = "RUSTSEC-2022-0093", reason = "ed25519-dalek 1.x signing-oracle attack; signing APIs are never used on-chain (verification only), no keys exist in this workspace; fixed upstream in the Agave 2.2+ line" },
+    { id = "RUSTSEC-2024-0388", reason = "derivative unmaintained; proc-macro only, transitive via ark-* in solana-zk-sdk 2.1" },
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; proc-macro only, transitive via the solana 2.1 stack" },
+]
 
 [licenses]
 version = 2
@@ -21,6 +40,9 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Path dependencies (glc-bridge-shared) carry no version requirement by
+# design; only registry wildcards remain banned.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
