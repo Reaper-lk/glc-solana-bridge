@@ -6,8 +6,6 @@
 //! and logs are truncated/pruned. Every fact below is recoverable from
 //! `BridgeConfig` / `ValidatorSet` account state.
 //!
-//! Planned (Phase 3):
-//! - `WithdrawalRequested { withdrawal_index, amount, glc_address }`
 
 use anchor_lang::prelude::*;
 
@@ -65,4 +63,15 @@ pub struct DepositClaimMinted {
     pub recipient: Pubkey,
     pub amount: u64,
     pub epoch: u64,
+}
+
+/// Wrapped GLC burned and a payout obligation recorded. Advisory only — the
+/// `WithdrawalRequest` account is the authoritative record relayers scan
+/// (ADR-0006).
+#[event]
+pub struct WithdrawalRequested {
+    pub index: u64,
+    pub requester: Pubkey,
+    pub amount: u64,
+    pub glc_address: Vec<u8>,
 }

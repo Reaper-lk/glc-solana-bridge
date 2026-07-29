@@ -194,16 +194,88 @@ impl DepositClaim {
         + 16; // reserved
 }
 
-/// Persistent withdrawal record (PDA: [`crate::constants::SEED_WITHDRAWAL`]
-/// + index). Created by `burn_wrapped`; the authoritative source relayers
-/// scan — NOT the event stream. Schema stays signing-agnostic so the later
-/// vault-custody decision (docs/custody.md) doesn't force a migration.
+/// Lifecycle of a withdrawal record. Mirrors `shared::types::WithdrawalStatus`
+/// — keep the two in sync. Borsh encodes the variant tag as one byte
+/// (Pending = 0, Broadcast = 1, Completed = 2).
 ///
-/// Phase 3 fields (planned): `index: u64`, `amount: u64`,
-/// `glc_address: [u8; 25]` (format verified in Phase 2), `requested_at_slot: u64`,
-/// `status: WithdrawalStatus` (`Pending → Broadcast → Completed`).
+/// Phase 3 only ever writes `Pending`: the status write-back instructions
+/// (and their authority model) are deliberately deferred until the payout
+/// side exists (owner decision U2; ADR-0006 flagged this as
+/// governance-relevant).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WithdrawalStatus {
+    /// Burn executed on Solana; GLC payout not yet broadcast.
+    Pending,
+    /// Payout transaction broadcast to the Goldcoin network.
+    Broadcast,
+    /// Payout confirmed at the required Goldcoin depth.
+    Completed,
+}
+
+/// Persistent withdrawal record (PDA: [`crate::constants::SEED_WITHDRAWAL`]
+/// + `index.to_le_bytes()`). Created atomically with the burn by
+/// `burn_wrapped`; the authoritative payout-obligation record relayers scan
+/// — NOT the event stream (ADR-0006). Schema stays signing-agnostic so the
+/// later vault-custody decision (docs/custody.md) doesn't force a migration.
+///
+/// Byte layout (borsh, after the 8-byte Anchor discriminator):
+///
+/// | field               | type               | bytes |
+/// |---------------------|--------------------|-------|
+/// | `index`             | `u64`              | 8     |
+/// | `amount`            | `u64`              | 8     |
+/// | `requester`         | `Pubkey`           | 32    |
+/// | `glc_address`       | `[u8; 64]`         | 64    |
+/// | `glc_address_len`   | `u8`               | 1     |
+/// | `status`            | `WithdrawalStatus` | 1     |
+/// | `requested_at_slot` | `u64`              | 8     |
+/// | `protocol_version`  | `u8`               | 1     |
+/// | `bump`              | `u8`               | 1     |
+/// | `reserved`          | `[u8; 48]`         | 48    |
 #[account]
-pub struct WithdrawalRequest {}
+pub struct WithdrawalRequest {
+    /// Monotonic index from `BridgeConfig.withdrawal_count`; also the PDA
+    /// seed suffix.
+    pub index: u64,
+    /// Burned amount in atomic GLC units (8 decimals) — the payout
+    /// obligation, gross of any future fee policy (custody.md #9).
+    pub amount: u64,
+    /// The wallet that burned; the payout dispute/audit anchor.
+    pub requester: Pubkey,
+    /// Opaque ASCII Goldcoin destination, left-justified, zero-padded.
+    /// NOT semantically validated until the address format is verified
+    /// against a real node in Phase 4 (owner decision U3).
+    pub glc_address: [u8; 64],
+    /// Number of meaningful bytes in `glc_address` (1..=64).
+    pub glc_address_len: u8,
+    /// Always `Pending` in Phase 3 (see enum docs).
+    pub status: WithdrawalStatus,
+    /// Solana slot in which the burn executed.
+    pub requested_at_slot: u64,
+    /// `BridgeConfig.protocol_version` at burn time.
+    pub protocol_version: u8,
+    /// Canonical PDA bump.
+    pub bump: u8,
+    /// Expansion space — sized so the future payout record (GLC payout txid
+    /// 32B + confirmation slot/depth 8B) fits without migration. Must be all
+    /// zeroes until a migration assigns meaning.
+    pub reserved: [u8; 48],
+}
+
+impl WithdrawalRequest {
+    /// 8 (discriminator) + 8 + 8 + 32 + 64 + 1 + 1 + 8 + 1 + 1 + 48 = 180.
+    pub const SPACE: usize = 8 // Anchor discriminator
+        + 8 // index
+        + 8 // amount
+        + 32 // requester
+        + 64 // glc_address
+        + 1 // glc_address_len
+        + 1 // status
+        + 8 // requested_at_slot
+        + 1 // protocol_version
+        + 1 // bump
+        + 48; // reserved
+}
 
 /// The `SPACE` constants above are hand-written arithmetic; these tests pin
 /// them to what borsh actually produces for maximally-populated values, so a
@@ -269,6 +341,32 @@ mod space {
         );
         assert_eq!(bytes[124], 0xCD, "mint_authority_bump at offset 124");
         assert_eq!(bytes.len(), BridgeConfig::SPACE - 8);
+    }
+
+    #[test]
+    fn withdrawal_request_space_matches_serialized_max() {
+        let max = WithdrawalRequest {
+            index: u64::MAX,
+            amount: u64::MAX,
+            requester: Pubkey::new_unique(),
+            glc_address: [u8::MAX; 64],
+            glc_address_len: u8::MAX,
+            status: WithdrawalStatus::Completed,
+            requested_at_slot: u64::MAX,
+            protocol_version: u8::MAX,
+            bump: u8::MAX,
+            reserved: [0u8; 48],
+        };
+        let serialized = max.try_to_vec().unwrap();
+        assert_eq!(8 + serialized.len(), WithdrawalRequest::SPACE);
+        assert_eq!(WithdrawalRequest::SPACE, 180);
+    }
+
+    #[test]
+    fn withdrawal_status_borsh_tags_are_stable() {
+        assert_eq!(WithdrawalStatus::Pending.try_to_vec().unwrap(), vec![0]);
+        assert_eq!(WithdrawalStatus::Broadcast.try_to_vec().unwrap(), vec![1]);
+        assert_eq!(WithdrawalStatus::Completed.try_to_vec().unwrap(), vec![2]);
     }
 
     #[test]

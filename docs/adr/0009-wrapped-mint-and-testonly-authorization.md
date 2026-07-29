@@ -1,6 +1,9 @@
 # ADR-0009: Wrapped-mint creation, freeze authority None, test-only mint authorization
 
-- Status: Accepted (owner decision, 2026-07-29)
+- Status: Accepted (owner decision, 2026-07-29);
+  **test-only-authorization section superseded by ADR-0010 (Phase 3)** —
+  `mint_wrapped_testonly` was deleted as promised; the mint-creation and
+  freeze-authority decisions stand.
 - Phase: 2
 
 ## Context

@@ -10,5 +10,6 @@
 
 #![forbid(unsafe_code)]
 
+pub mod claim;
 pub mod crypto;
 pub mod types;

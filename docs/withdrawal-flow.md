@@ -1,19 +1,25 @@
 # Withdrawal flow (wrapped GLC → GLC)
 
-Status: design notes; on-chain part Phase 3, payout side gated on custody.md.
+Status: on-chain part implemented in Phase 3; payout side gated on
+custody.md.
 
-## On-chain (Phase 3)
+## On-chain (implemented, Phase 3)
 
 `burn_wrapped(amount, glc_address)`:
 
-1. Checks: not paused; `amount ≥ min_withdrawal`; `glc_address` well-formed
-   (format/version bytes verified in Phase 2 → `goldcoin-rpc-notes.md`).
-2. Burns `amount` from the caller's token account.
-3. Creates `WithdrawalRequest` PDA seeded by a monotonic index from
-   `BridgeConfig`: `{ index, amount, glc_address, requested_at_slot,
-   status: Pending }`.
+1. Checks: not paused; `amount > 0` and `≥ min_withdrawal`; `glc_address`
+   is 1–64 opaque ASCII bytes (semantic format validation deferred to
+   Phase 4 → `goldcoin-rpc-notes.md`); withdrawal counter increments with
+   checked arithmetic.
+2. Burns `amount` from the caller's associated token account
+   (`BurnChecked`).
+3. Creates the `WithdrawalRequest` PDA seeded by the monotonic index from
+   `BridgeConfig`: `{ index, amount, requester, glc_address,
+   requested_at_slot, status: Pending, … }` (180 bytes, ADR-0010).
 4. Emits `WithdrawalRequested` — convenience only; the ACCOUNT is the record
-   (ADR-0006).
+   (ADR-0006). Status write-back (`Broadcast`/`Completed`) is deliberately
+   not implemented yet; every record stays `Pending` until the payout side
+   exists.
 
 Burn-then-record in one atomic instruction: there is no state in which value
 was burned without a persistent, queryable payout obligation.

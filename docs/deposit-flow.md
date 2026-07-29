@@ -1,8 +1,8 @@
 # Deposit flow (GLC → wrapped GLC)
 
-Status: on-chain claim/mint path implemented in Phase 2 with test-only
-admin authorization (ADR-0009); federation proof verification is Phase 3;
-L1 observation (indexer + RPC facts) is Phase 4.
+Status: on-chain claim/mint path with real M-of-N federation proof
+verification implemented in Phase 3 (ADR-0010); L1 observation (indexer +
+RPC facts) is Phase 4; relayer signing/aggregation is Phase 5.
 
 ## Identity
 
@@ -31,12 +31,13 @@ The depositor must bind a Solana recipient pubkey to the deposit. Options:
    (N is OPEN — see threat-model.md; mempool is never consulted).
 3. Validator signs the canonical `InboundClaim` bytes; signatures aggregate
    across the federation (ADR-0005); one relayer submits `mint_wrapped`.
-4. Program-side checks (implemented in Phase 2, authorization test-only
-   until Phase 3), in order: authorized → not paused → claim epoch matches
-   current validator-set epoch → amount nonzero and ≥ `min_deposit` →
-   `DepositClaim` PDA for `(txid, vout)` does not yet exist (create =
-   claim; exists = replay, abort) → `MintToChecked` 1:1 to the bound
-   recipient's associated token account.
+4. Program-side checks (implemented, Phase 3), in order: not paused →
+   claim epoch matches current validator-set epoch → amount nonzero and
+   ≥ `min_deposit` → M-of-N federation proof verified (ed25519 precompile
+   instruction at relative −1 over the exact canonical claim bytes,
+   ADR-0010) → `DepositClaim` PDA for `(txid, vout)` does not yet exist
+   (create = claim; exists = replay, abort) → `MintToChecked` 1:1 to the
+   bound recipient's associated token account.
 
 ## Edge cases to cover in tests (Phase 2+)
 

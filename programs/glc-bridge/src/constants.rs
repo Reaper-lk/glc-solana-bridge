@@ -41,5 +41,11 @@ pub const PROTOCOL_VERSION: u8 = 1;
 pub const MAX_VALIDATORS: usize = 16;
 
 /// Wrapped-token decimals. Provisional: assumed equal to native GLC's 8;
-/// verified against Goldcoin Core source in Phase 2 (docs/goldcoin-rpc-notes.md).
+/// verified against Goldcoin Core source in Phase 4 (docs/goldcoin-rpc-notes.md).
 pub const WRAPPED_GLC_DECIMALS: u8 = 8;
+
+/// Maximum byte length of the opaque ASCII Goldcoin destination address
+/// stored in a `WithdrawalRequest`. Generous for base58 (26–35 chars for a
+/// ~Bitcoin-0.14-era chain) plus headroom; the real format is verified in
+/// Phase 4 and semantic validation added then (docs/goldcoin-rpc-notes.md).
+pub const MAX_GLC_ADDRESS_LEN: usize = 64;
