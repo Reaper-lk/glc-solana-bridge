@@ -24,3 +24,4 @@ pub mod deposit;
 pub mod hex;
 pub mod indexer;
 pub mod rpc;
+pub mod withdrawal_db;
