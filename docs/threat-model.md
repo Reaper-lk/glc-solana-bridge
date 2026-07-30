@@ -16,7 +16,7 @@ OPEN blocks deployment.
 
 | Risk | Mitigation (planned phase) |
 |---|---|
-| **Goldcoin deep reorg / 51%** — low-hashrate PoW; deposit double-spend is the dominant risk | High confirmation depth; per-deposit and rolling-window value caps; indexer halts on reorg deeper than threshold (2/4). Depth number is OPEN. |
+| **Goldcoin deep reorg / 51%** — low-hashrate PoW; deposit double-spend is the dominant risk | Configurable confirmation depth + per-deposit/rolling-window value caps enforced before `ReadyForSignature`; indexer halts (no further writes) on a reorg deeper than `max_reorg_depth` rather than guessing a fork point (done, Phase 4, ADR-0011). **Production depth/cap numbers remain OPEN** — no built-in defaults exist by design (owner decision U6); this is a live security/ops decision, not an implementation gap. |
 | **Upgrade authority = infinite mint** | Multisig custody of upgrade authority, immutability timeline — OPEN (custody.md) |
 | **Federation capture (M collude)** | Phase 1: rotations admin-gated, epoch-tracked, invariant-checked (ADR-0007). Threshold-gated + timelocked governance lands with proof verification (3); federation composition OPEN |
 | **Initialization front-running** — first caller on a fresh deployment becomes admin | `initialize` restricted to the program upgrade authority via ProgramData check; reinitialization structurally impossible (1, ADR-0008) |
