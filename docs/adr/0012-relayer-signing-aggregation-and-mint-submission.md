@@ -179,14 +179,40 @@ the sole security authority regardless of what this check returns.
   uses a `RefCell`) — invisible while each ran as a plain awaited future in
   `main`, but a hard compile error once `tokio::spawn` requires the whole
   future to be `Send`.
-- `cargo deny check` newly reports two RustSec advisories (`rustls-webpki`
-  CRL-parsing panic, `time` RFC 2822 stack exhaustion) and several
-  copyleft/non-allow-listed licenses (`MPL-2.0`, `CDLA-Permissive-2.0` via
-  `webpki-roots`/`webpki-root-certs`), all transitively forced by
-  `solana-client`'s non-optional QUIC/pubsub-websocket sub-crates
-  (`solana-quic-client`, `solana-pubsub-client`, `solana-streamer`), which
-  `RealSolanaRpc` never actually exercises (it only ever uses plain HTTPS
-  JSON-RPC). `solana-client` does not expose a feature flag to drop these.
-  This needs an explicit owner decision (documented `deny.toml` exception
-  vs. an alternative dependency shape) — not something to resolve
-  unilaterally.
+- Adding `solana-sdk`/`solana-client` brought six new `cargo deny` findings,
+  all transitive and none in a code path `RealSolanaRpc` executes.
+  `solana-client` unconditionally pulls its QUIC/TPU and websocket-pubsub
+  sub-crates and exposes no feature flag to drop them. **Owner decision
+  (2026-07-30): accepted as documented exceptions in `deny.toml`**, each with
+  a per-finding justification recorded there:
+  - four advisories reachable only through those unused transports —
+    `RUSTSEC-2026-0104`/`-0098`/`-0099` (`rustls-webpki` 0.101.7, via
+    `solana-pubsub-client`'s websocket stack) and `RUSTSEC-2026-0009`
+    (`time` 0.3.36, via `solana-streamer`'s QUIC TLS certificate parsing);
+  - two unmaintained-crate notices, not vulnerabilities —
+    `RUSTSEC-2024-0375` (`atty`, via `solana-logger`, a logger this relayer
+    never initializes) and `RUSTSEC-2025-0119` (`number_prefix`, via
+    `indicatif` progress bars);
+  - four license exceptions, scoped to a specific crate AND version so the
+    global allow-list is unchanged and any other crate arriving under the
+    same license still fails.
+
+  One of those license exceptions deserves standalone attention rather than
+  being filed under "unused transport", because it is **not** confined to
+  one: `webpki-roots` 1.0.9 (`CDLA-Permissive-2.0`) is linked into the
+  relayer binary through `reqwest`. Phase 4 deliberately selected reqwest's
+  `rustls-tls-native-roots` precisely to keep this crate out of the graph
+  (see the comment in `relayer/Cargo.toml`), but `solana-rpc-client` depends
+  on `reqwest` via `reqwest-middleware` with the webpki-roots feature
+  enabled, and Cargo unifies features across the single shared `reqwest`
+  build — so the Mozilla CA bundle is now compiled into the same reqwest
+  instance the Goldcoin RPC client uses, and that Phase 4 intent is no
+  longer achieved by the feature setting alone. It is accepted on the
+  license's own permissive terms (it covers CA certificate *data*, imposes
+  no obligation on our code), not on non-use. Revisit if either crate ever
+  permits disabling it.
+
+  Note also that license obligations attach to what is linked and
+  distributed, not to what executes — so "we never call it" justifies the
+  advisory ignores but deliberately does not justify the license
+  exceptions, which are argued on their actual terms instead.
