@@ -17,12 +17,31 @@ publish = false
 
 [dependencies]
 glc-bridge-shared = { path = "../shared" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+thiserror = "1"
+# Goldcoin JSON-RPC client (Phase 4). No bitcoincore-rpc: Goldcoin's RPC
+# shapes diverge from modern Bitcoin Core (docs/goldcoin-rpc-notes.md), so a
+# thin hand-rolled client against reqwest is safer than trusting a crate
+# tuned for current Bitcoin Core semantics.
+# native-roots (not the default rustls-tls, which bundles Mozilla's list via
+# webpki-roots under a CDLA-Permissive-2.0 data license not in deny.toml's
+# allow-list) uses the OS's own trusted CA store — pure-Rust TLS, no OpenSSL
+# dependency, and the more correct choice for RPC endpoints anyway.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Embedded, transactional persistence for the indexer (ADR-0011, decision U1).
+rusqlite = { version = "0.31", features = ["bundled"] }
+# message_hash fingerprint in claim_artifacts (Phase 4); off-chain only, no
+# SBF constraint applies here (unlike the shared crate).
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
 
 # Added in later phases (NOT Phase 0):
-#   Phase 2: reqwest 0.12 or jsonrpsee (Goldcoin JSON-RPC), rust-bitcoin types
 #   Phase 5: solana-client / solana-sdk (version matched to the Anchor line),
-#            clap + config loading
+#            clap + config loading, p2p transport
