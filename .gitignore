@@ -17,6 +17,10 @@ keypair*.json
 # Node (Phase 6 TS e2e harness)
 node_modules/
 
+# Local design/review working notes — scratch material, not project docs.
+# Anything meant to be part of the record belongs in docs/adr/ instead.
+docs/reviews/
+
 # Editors / OS
 .DS_Store
 .idea/
