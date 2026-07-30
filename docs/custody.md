@@ -23,6 +23,18 @@ decided. See ADR-0008.
 
 ## Decision log
 
+- **2026-07-30 — #9 (partial) Withdrawal payout policy, Phase 6 only**
+  (owner decisions D3/D4/D6, ADR-0013). Deterministic coin selection
+  (exact-match → smallest-covering → greedy largest-first, tie-broken on
+  `(txid, vout)`); **the vault bears the fee** so the user receives exactly
+  the burned amount; the fee rate is explicitly configured with no default
+  (node fee estimation is unusable on regtest). Scoped to regtest; the
+  production policy remains open.
+- **2026-07-30 — #2/#3 remain OPEN; Phase 6 uses a test-only stand-in.**
+  The regtest vault is a single-key P2PKH address held by the Goldcoin node
+  wallet (owner decision D2). One key can drain it, and the node wallet will
+  spend vault outputs for unrelated transactions (verified). Explicitly not
+  production custody; do not deploy beyond regtest.
 - **2026-07-29 — #6 Freeze authority: `None`** (owner decision, Phase 2,
   ADR-0009). The federation must not be able to freeze user funds;
   censorship-resistance chosen over a governance-held freeze. Irreversible

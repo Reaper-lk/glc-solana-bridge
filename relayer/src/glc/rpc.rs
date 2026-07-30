@@ -227,6 +227,13 @@ impl RpcClient {
             .map_err(|e| RpcError::Malformed(e.to_string()))
     }
 
+    /// Raw JSON-RPC passthrough, for responses whose full shape the typed
+    /// helpers above deliberately do not model (Phase 6 decodes only the
+    /// fields it verifies).
+    pub async fn call_raw(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+        self.call(method, params).await
+    }
+
     // ---- Withdrawal payout path (Phase 6, ADR-0013) ----
 
     /// Spendable outputs paying `addresses`. Wallet-based because

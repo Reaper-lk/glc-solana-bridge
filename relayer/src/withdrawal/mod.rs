@@ -14,6 +14,7 @@
 //! ceremony. custody.md #2 (vault construction) and #3 (signing model)
 //! remain OPEN. Do not deploy this beyond a controlled regtest environment.
 
+pub mod adapter;
 pub mod address;
 pub mod builder;
 pub mod coin;

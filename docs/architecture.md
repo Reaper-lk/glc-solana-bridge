@@ -40,9 +40,12 @@ Goldcoin L1 (unmodified) ──JSON-RPC──▶ relayer (×N validators) ──
    **persistent `WithdrawalRequest` account** is created with status
    `Pending` (ADR-0006). An event is emitted for UX only.
 2. Relayers discover requests by scanning program accounts (recoverable after
-   downtime), wait for Solana finality, then construct/sign/broadcast the GLC
-   payout — the signing model is deliberately undecided (`custody.md`) and
-   out of scope until then. Status advances `Pending → Broadcast → Completed`.
+   downtime), wait for Solana **finality**, then construct/sign/broadcast the
+   GLC payout (Phase 6, ADR-0013). Production vault custody and the signing
+   model remain undecided (`custody.md` #2/#3); Phase 6 uses a regtest
+   single-key wallet vault. **On-chain status is never advanced** — no
+   write-back instruction exists — so `Completed` is recorded off-chain in
+   the relayer database only.
 
 ## Implementation phases
 
@@ -54,5 +57,5 @@ Goldcoin L1 (unmodified) ──JSON-RPC──▶ relayer (×N validators) ──
 | 3 | Federation proof format (canonical 166-byte signed message, `shared::claim`) + on-chain M-of-N verification via the ed25519 precompile (ADR-0010); `mint_wrapped` replaces the deleted `mint_wrapped_testonly`; `burn_wrapped` + persistent withdrawal records. Status write-back and payout remain out of scope. |
 | 4 | `relayer` Goldcoin indexer (ADR-0011): persistent SQLite state, confirmation-depth tracking, reorg walk-back/rollback/halt, deposit state machine, unsigned canonical claim artifacts. Goldcoin RPC facts verified against a real regtest binary (`goldcoin-rpc-notes.md`). No signing, no Solana RPC, no submission. |
 | 5 | Relayer orchestration + p2p signature aggregation (no vault signing) |
-| 6 | E2E harness: regtest deposit → localnet mint; burn → payout record |
+| 6 | Goldcoin withdrawal executor (ADR-0013): withdrawal discovery, persistent UTXO reservation, deterministic coin selection, verified payout construction, guarded signing, idempotent broadcast, confirmation tracking and reconciliation. Regtest only; single-key wallet-held vault (test custody). Completion tracked off-chain — no on-chain status write-back. |
 | — | Vault custody design, audits, devnet/mainnet: gated on `custody.md`, outside this plan |

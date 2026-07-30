@@ -193,6 +193,43 @@ All required methods are present: `getblockchaininfo`, `getblockcount`,
   deployments should prefer cookie-file or `rpcauth` authentication over
   plaintext `rpcuser`/`rpcpassword` in a config file.
 
+### Wallet / payout RPCs (verified Phase 6)
+
+Established by probing a real v0.15.0 regtest node; all directly shape the
+withdrawal executor (ADR-0013).
+
+- **Present**: `listunspent`, `createrawtransaction`, `fundrawtransaction`,
+  `signrawtransaction`, `sendrawtransaction`, `estimatefee`,
+  `estimatesmartfee`, `getnewaddress`, `importaddress`, `importprivkey`,
+  `getbalance`, `settxfee`, `gettransaction`, `listtransactions`,
+  `getmempoolentry`, `dumpprivkey`, `getrawchangeaddress`, `lockunspent`,
+  `listlockunspent`.
+- **ABSENT**: `scantxoutset` (no wallet-less UTXO scan — vault discovery
+  must go through the wallet), and `signrawtransactionwithwallet` (this
+  lineage predates the Bitcoin Core 0.17 split; the method is the older
+  `signrawtransaction`).
+- **Fee estimation is unusable on regtest**: `estimatefee 6` returns `-1`
+  and `estimatesmartfee 6` returns `{"feerate":-1,"blocks":25}`. A payout
+  fee rate must therefore be configured explicitly; there is no node-derived
+  default to fall back on.
+- **`lockunspent` locks are in-memory only** — confirmed lost across a node
+  restart (`listlockunspent` returns `[]` afterwards). Reservations that must
+  survive a restart have to be persisted by the relayer.
+- **Broadcast semantics** (the basis of restart-safe payouts):
+  - re-sending a transaction already in the mempool **succeeds** and returns
+    the same txid — rebroadcast is idempotent;
+  - re-sending one already mined fails with **code -27**, which means
+    "already in block chain" and must be treated as success;
+  - spending an already-spent outpoint fails at signing (`complete: false`)
+    and at broadcast with **code -25 "Missing inputs"** — a conflict, never
+    a retry. `gettxout` on that outpoint returns null.
+- **The wallet does not treat a vault address as special.** With the vault
+  address in the node's own wallet, an unrelated `sendtoaddress` will consume
+  vault outputs as inputs and consolidate them. Relevant to custody.md #2/#3
+  and to any single-wallet vault arrangement.
+- Regtest block subsidy observed at **10000 GLC**; coinbase maturity 100
+  blocks, as in the Bitcoin lineage.
+
 ## Not yet verified / explicitly out of scope for Phase 4
 
 - P2SH multisig vault construction end-to-end (spend path) — custody.md #2
