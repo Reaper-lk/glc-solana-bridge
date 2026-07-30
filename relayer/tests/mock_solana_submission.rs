@@ -23,7 +23,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::transaction::Transaction;
 
-use glc_relayer::glc::db::{Db, DepositState, NewBlock, NewCandidate, NewClaimArtifact};
+use glc_relayer::glc::db::{Db, DbError, DepositState, NewBlock, NewCandidate, NewClaimArtifact};
 use glc_relayer::glc::deposit::build_claim_message;
 use glc_relayer::orchestrator::Orchestrator;
 use glc_relayer::solana::instruction;
@@ -989,4 +989,216 @@ async fn a_halted_deposit_does_not_block_other_healthy_deposits() {
         .state;
     assert_eq!(second_state, DepositState::Submitted);
     assert_eq!(h.deposit_state(), DepositState::IntegrityHalted);
+}
+
+// ---------------------------------------------------------------------
+// operator_clear_integrity_halt cannot be abused
+// ---------------------------------------------------------------------
+//
+// The recovery procedure is the single sanctioned exit from a security
+// halt, which makes it the most attractive thing in the codebase to
+// misuse: if it could touch a Submitted or Minted deposit, it would be a
+// way to re-open a completed mint; if it could rewrite the audit trail, it
+// would be a way to erase evidence of the anomaly that triggered the halt.
+// This test proves it can do neither.
+
+/// One row of a deposit's audit trail: `(id, from_state, to_state, at,
+/// reason)`, ordered by insertion. Compared wholesale to prove history is
+/// only ever appended to.
+type AuditRow = (i64, Option<String>, String, i64, Option<String>);
+
+fn audit_trail(db_path: &Path, deposit_id: i64) -> Vec<AuditRow> {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, from_state, to_state, at, reason FROM deposit_state_log
+             WHERE deposit_id = ?1 ORDER BY id",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([deposit_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .unwrap();
+    rows.collect::<Result<Vec<_>, _>>().unwrap()
+}
+
+fn assert_not_integrity_halted(err: &DbError, expect_deposit: i64, expect_found: &str) {
+    match err {
+        DbError::NotIntegrityHalted { deposit_id, found } => {
+            assert_eq!(*deposit_id, expect_deposit);
+            assert_eq!(
+                found.as_str(),
+                expect_found,
+                "the refusal must name the state actually found"
+            );
+        }
+        other => panic!("expected NotIntegrityHalted, got: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn operator_recovery_cannot_reopen_completed_deposits_or_rewrite_history() {
+    // -- 1. A deposit driven through the REAL pipeline to Submitted is
+    //       not recoverable, even with a perfectly plausible note.
+    let h = build_harness(3, 2);
+    let mut orch = h.orchestrator();
+    orch.tick().await.unwrap();
+    assert_eq!(h.deposit_state(), DepositState::Submitted);
+    let submitted_trail = audit_trail(&h.db_path, h.fixture.deposit_id);
+
+    {
+        let mut db = Db::open(&h.db_path).unwrap();
+        let err = db
+            .operator_clear_integrity_halt(
+                h.fixture.deposit_id,
+                DepositState::ReadyForSignature,
+                "in flight too long, forcing a resend",
+                1_000,
+            )
+            .unwrap_err();
+        assert_not_integrity_halted(&err, h.fixture.deposit_id, "Submitted");
+    }
+    assert_eq!(
+        h.deposit_state(),
+        DepositState::Submitted,
+        "a refused recovery must not move an in-flight deposit"
+    );
+
+    // -- 2. Once the claim PDA lands and the deposit reconciles to Minted,
+    //       it is likewise untouchable — for every permitted target state.
+    h.rpc
+        .insert_account(h.claim_pda(), h.fixture.program_id, vec![]);
+    orch.tick().await.unwrap();
+    assert_eq!(h.deposit_state(), DepositState::Minted);
+
+    {
+        let mut db = Db::open(&h.db_path).unwrap();
+        for target in [DepositState::ReadyForSignature, DepositState::Failed] {
+            let err = db
+                .operator_clear_integrity_halt(
+                    h.fixture.deposit_id,
+                    target,
+                    "re-open this deposit for another mint",
+                    2_000,
+                )
+                .unwrap_err();
+            assert_not_integrity_halted(&err, h.fixture.deposit_id, "Minted");
+        }
+    }
+    assert_eq!(
+        h.deposit_state(),
+        DepositState::Minted,
+        "a completed deposit stays completed"
+    );
+    assert_eq!(
+        h.rpc.send_transaction_calls(),
+        1,
+        "no refused recovery may lead to a second submission — never double mint"
+    );
+    let final_trail = audit_trail(&h.db_path, h.fixture.deposit_id);
+    assert_eq!(
+        &final_trail[..submitted_trail.len()],
+        submitted_trail.as_slice(),
+        "refused recoveries never rewrite earlier history"
+    );
+
+    // -- 3. A healthy, never-halted deposit is not recoverable either:
+    //       this is not a general-purpose "force any state" backdoor.
+    let h2 = build_harness(3, 2);
+    {
+        let mut db = Db::open(&h2.db_path).unwrap();
+        let err = db
+            .operator_clear_integrity_halt(
+                h2.fixture.deposit_id,
+                DepositState::Failed,
+                "retire this deposit",
+                3_000,
+            )
+            .unwrap_err();
+        assert_not_integrity_halted(&err, h2.fixture.deposit_id, "ReadyForSignature");
+    }
+    assert_eq!(h2.deposit_state(), DepositState::ReadyForSignature);
+
+    // -- 4. On a genuinely halted deposit, an anonymous recovery is
+    //       refused and leaves absolutely no trace.
+    let (h3, _, _) = halted_harness().await;
+    let before = audit_trail(&h3.db_path, h3.fixture.deposit_id);
+    assert!(
+        before.iter().any(|row| row.2 == "IntegrityHalted"),
+        "the halt itself is on record before any recovery is attempted"
+    );
+
+    {
+        let mut db = Db::open(&h3.db_path).unwrap();
+        for anonymous in ["", "   ", "\t\n  "] {
+            let err = db
+                .operator_clear_integrity_halt(
+                    h3.fixture.deposit_id,
+                    DepositState::Failed,
+                    anonymous,
+                    4_000,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(&err, DbError::OperatorNoteRequired(d) if *d == h3.fixture.deposit_id),
+                "an unattributed recovery must be refused, got: {err}"
+            );
+        }
+    }
+    assert_eq!(h3.deposit_state(), DepositState::IntegrityHalted);
+    assert_eq!(
+        audit_trail(&h3.db_path, h3.fixture.deposit_id),
+        before,
+        "refused recovery attempts must change nothing at all"
+    );
+
+    // -- 5. The sanctioned recovery appends; it never edits or deletes.
+    {
+        let mut db = Db::open(&h3.db_path).unwrap();
+        db.operator_clear_integrity_halt(
+            h3.fixture.deposit_id,
+            DepositState::Failed,
+            "investigated: confirmed disk corruption, retiring deposit",
+            5_000,
+        )
+        .unwrap();
+    }
+    let after = audit_trail(&h3.db_path, h3.fixture.deposit_id);
+
+    assert_eq!(
+        after.len(),
+        before.len() + 1,
+        "recovery appends exactly one audit row"
+    );
+    assert_eq!(
+        &after[..before.len()],
+        before.as_slice(),
+        "every pre-existing audit row is preserved byte-for-byte — including the \
+         original IntegrityHalted record; history is never rewritten"
+    );
+    let appended = after.last().unwrap();
+    assert_eq!(appended.1.as_deref(), Some("IntegrityHalted"));
+    assert_eq!(appended.2, "Failed");
+    assert_eq!(appended.3, 5_000, "the recovery is timestamped");
+    assert!(
+        appended
+            .4
+            .as_deref()
+            .unwrap()
+            .starts_with("operator_recovery: "),
+        "the recovery is attributed and distinguishable from an ordinary transition"
+    );
+    assert!(appended.4.as_deref().unwrap().contains("disk corruption"));
+
+    // The halt record is still exactly one row, still present, unchanged.
+    let halt_rows: Vec<&AuditRow> = after
+        .iter()
+        .filter(|row| row.2 == "IntegrityHalted")
+        .collect();
+    assert_eq!(
+        halt_rows.len(),
+        1,
+        "the original anomaly record survives recovery, exactly once"
+    );
 }
