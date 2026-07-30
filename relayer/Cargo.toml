@@ -39,9 +39,28 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # SBF constraint applies here (unlike the shared crate).
 sha2 = "0.10"
 
+# Solana side (Phase 5). Resolved to 2.3.x — newer than the 2.1.21 Agave
+# line pinned for the on-chain SBF toolchain (Anchor.toml), because exact
+# 2.1.21 pinning here would require cascading precise-pins through many
+# solana-client sub-crates for no real benefit: unlike the SBF program, this
+# is a host-side JSON-RPC client, not something the Agave platform-tools
+# compiler builds, so exact patch-version match isn't a hard constraint the
+# way it is on-chain. Compatibility against the actual pinned
+# solana-test-validator 2.1.21 binary is verified empirically by
+# `relayer/tests/local_validator_e2e.rs`, not assumed from version numbers.
+#
+# The relayer does NOT depend on the on-chain `glc-bridge` crate itself
+# (owner decision R1, ADR-0012): the mint_wrapped instruction is hand-built
+# here (discriminator + Borsh args + raw account metas) to keep this
+# workspace genuinely independent of anchor-lang, matching ADR-0001's
+# isolation intent.
+solana-sdk = "2.1"
+solana-client = "2.1"
+# Pure address-derivation math (no SBF/Anchor coupling) for the recipient's
+# associated token account, and the well-known SPL Token program id
+# constant (classic Token program — owner decision U5, Phase 2).
+spl-associated-token-account = "4"
+spl-token = "6"
+
 [dev-dependencies]
 tempfile = "3"
-
-# Added in later phases (NOT Phase 0):
-#   Phase 5: solana-client / solana-sdk (version matched to the Anchor line),
-#            clap + config loading, p2p transport

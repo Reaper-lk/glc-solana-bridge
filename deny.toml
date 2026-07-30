@@ -22,10 +22,32 @@ ignore = [
     { id = "RUSTSEC-2022-0093", reason = "ed25519-dalek 1.x signing-oracle attack; signing APIs are never used on-chain (verification only), no keys exist in this workspace; fixed upstream in the Agave 2.2+ line" },
     { id = "RUSTSEC-2024-0388", reason = "derivative unmaintained; proc-macro only, transitive via ark-* in solana-zk-sdk 2.1" },
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; proc-macro only, transitive via the solana 2.1 stack" },
+    # --- solana-client transport crates the relayer never exercises (Phase 5,
+    # ADR-0012) ---
+    #
+    # `solana-client` unconditionally pulls its QUIC/TPU and websocket-pubsub
+    # sub-crates (solana-quic-client, solana-tpu-client, solana-streamer,
+    # solana-pubsub-client); it exposes no feature flag to drop them. The
+    # relayer's only Solana client is `solana::rpc::RealSolanaRpc`, which uses
+    # `solana_client::nonblocking::rpc_client::RpcClient` — plain HTTPS
+    # JSON-RPC. It constructs no pubsub client, no TPU/QUIC client, and opens
+    # no websocket. Both advisories below were confirmed by `cargo tree -i` to
+    # reach the graph ONLY through those unused transports.
+    #
+    # Re-evaluate whenever the solana-client pin moves.
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7 CRL-parsing panic; reachable only via rustls 0.21 <- tokio-tungstenite <- solana-pubsub-client (websocket transport this relayer never opens), and the advisory further notes applications that do not use CRLs are unaffected — no CRL is ever supplied here" },
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 accepts name constraints for URI names; same crate and same pubsub-websocket-only path as RUSTSEC-2026-0104. Reachable only after signature verification and requires a misissued certificate to exploit" },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7 accepts name constraints on wildcard certificates; same crate and same pubsub-websocket-only path as RUSTSEC-2026-0104. Reachable only after signature verification and requires a misissued certificate to exploit" },
+    { id = "RUSTSEC-2026-0009", reason = "time 0.3.36 stack exhaustion parsing attacker-supplied RFC 2822 dates; reachable only via x509-parser <- solana-streamer/solana-tls-utils (QUIC/UDP transport this relayer never uses), and that path parses ASN.1 certificate validity dates, never RFC 2822 input" },
+    # The remaining two are unmaintained notices, not vulnerabilities — the
+    # same class as the bincode/libsecp256k1 entries above.
+    { id = "RUSTSEC-2024-0375", reason = "atty unmaintained; transitive via env_logger <- solana-logger <- solana-sdk. Terminal-detection helper inside a logger this relayer never initializes (it uses tracing-subscriber)" },
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix unmaintained; transitive via indicatif <- solana-client, a CLI progress-bar dependency with no code path from RealSolanaRpc" },
 ]
 
 [licenses]
 version = 2
+
 allow = [
   "MIT",
   "Apache-2.0",
@@ -36,6 +58,55 @@ allow = [
   "Unicode-3.0",
   "Zlib",
 ]
+
+# Per-crate exceptions ONLY (Phase 5, ADR-0012). Deliberately NOT added to
+# the `allow` list below: an exception admits one named crate at one version,
+# so any OTHER crate arriving under the same license still fails the check.
+# The global policy is unchanged.
+#
+# Unlike the advisory ignores above, these are not justified by "we never call
+# it": license obligations attach to what is linked and distributed, not to
+# what executes. Each is justified on its actual terms.
+[[licenses.exceptions]]
+# Mozilla's CA root bundle, reached via tungstenite <- solana-pubsub-client.
+# MPL-2.0 is file-level copyleft: it obliges us to make MPL-covered source
+# available if we distribute it, and imposes nothing on our own MIT code. We
+# vendor no modifications to it.
+name = "webpki-roots"
+version = "=0.24.0"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+# Same crate/licence, second version in the graph (tokio-tungstenite).
+name = "webpki-roots"
+version = "=0.25.4"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+# CDLA-Permissive-2.0 covers the CA certificate DATA, not code: it permits
+# use and redistribution with no copyleft and no obligation on our own work.
+#
+# NOTE (honest scope): unlike everything else in this block, this one is NOT
+# confined to an unused transport. relayer/Cargo.toml deliberately selects
+# reqwest's `rustls-tls-native-roots` to avoid webpki-roots entirely, but
+# solana-rpc-client depends on reqwest (via reqwest-middleware) with the
+# webpki-roots feature enabled, and Cargo unifies features across the single
+# shared reqwest build — so this bundle IS compiled into the relayer binary,
+# in the same reqwest instance the Goldcoin RPC client uses. The Phase 4
+# intent behind `rustls-tls-native-roots` is therefore no longer achieved by
+# that setting alone. Accepted here on the license's permissive terms, not on
+# non-use. Revisit if reqwest/solana-rpc-client ever allow disabling it.
+name = "webpki-roots"
+version = "=1.0.9"
+allow = ["CDLA-Permissive-2.0"]
+
+[[licenses.exceptions]]
+# Same permissive CA-data license; pulled by rustls-platform-verifier <-
+# quinn-proto (the QUIC stack behind solana-quic-client), which this relayer
+# never uses. Present in the graph for some target platforms only.
+name = "webpki-root-certs"
+version = "=1.0.9"
+allow = ["CDLA-Permissive-2.0"]
 
 [bans]
 multiple-versions = "warn"

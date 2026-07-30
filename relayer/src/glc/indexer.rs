@@ -132,7 +132,14 @@ impl<R: GoldcoinRpc> Indexer<R> {
         }
     }
 
-    async fn call<T, F, Fut>(&self, f: F) -> Result<T, IndexerError>
+    // A free function, not a method: taking `&self` here would let a
+    // shared `&Indexer` reference get held across an `.await` (since call
+    // sites' closures separately borrow `self.rpc`), which requires
+    // `Indexer: Sync` — it isn't, because `rusqlite::Connection`'s
+    // statement cache uses a `RefCell`. Now that this runs inside
+    // `tokio::spawn` (Phase 5, alongside the orchestrator's own loop), the
+    // whole future must be `Send`, which a `&self` method here would break.
+    async fn call<T, F, Fut>(f: F) -> Result<T, IndexerError>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, RpcError>>,
@@ -157,7 +164,7 @@ impl<R: GoldcoinRpc> Indexer<R> {
             });
         }
 
-        let live_tip_height = self.call(|| self.rpc.get_block_count()).await?;
+        let live_tip_height = Self::call(|| self.rpc.get_block_count()).await?;
 
         let (start_height, reorg) = match self.db.chain_tip()? {
             None => (0i64, None),
@@ -170,7 +177,7 @@ impl<R: GoldcoinRpc> Indexer<R> {
                 }
                 Some(fork_height) if fork_height == local_height => (local_height + 1, None),
                 Some(fork_height) => {
-                    let fork_hash_hex = self.call(|| self.rpc.get_block_hash(fork_height)).await?;
+                    let fork_hash_hex = Self::call(|| self.rpc.get_block_hash(fork_height)).await?;
                     let fork_hash: [u8; 32] = hex::decode_exact(&fork_hash_hex)
                         .map_err(|e| IndexerError::Rpc(RpcError::Malformed(e.to_string())))?;
                     let orphaned_count = self.db.rollback_reorg(
@@ -212,13 +219,15 @@ impl<R: GoldcoinRpc> Indexer<R> {
     /// against the live chain, returning the fork point (the highest height
     /// at which they agree), or `None` if no agreement is found within
     /// `max_reorg_depth` — the caller must halt in that case, never guess.
-    async fn find_fork_point(&self, from_height: i64) -> Result<Option<i64>, IndexerError> {
+    // `&mut self`, not `&self` — see `call`'s doc comment above: a shared
+    // `&Indexer` held across `.await` would require `Indexer: Sync`.
+    async fn find_fork_point(&mut self, from_height: i64) -> Result<Option<i64>, IndexerError> {
         let mut h = from_height;
         loop {
             if h < 0 {
                 return Ok(None);
             }
-            let live_hash_hex = self.call(|| self.rpc.get_block_hash(h)).await?;
+            let live_hash_hex = Self::call(|| self.rpc.get_block_hash(h)).await?;
             let live_hash: [u8; 32] = hex::decode_exact(&live_hash_hex)
                 .map_err(|e| IndexerError::Rpc(RpcError::Malformed(e.to_string())))?;
             let local_hash = self.db.block_hash_at_height(h)?;
@@ -234,10 +243,10 @@ impl<R: GoldcoinRpc> Indexer<R> {
     }
 
     async fn index_block(&mut self, height: i64) -> Result<(), IndexerError> {
-        let hash_hex = self.call(|| self.rpc.get_block_hash(height)).await?;
+        let hash_hex = Self::call(|| self.rpc.get_block_hash(height)).await?;
         let hash: [u8; 32] = hex::decode_exact(&hash_hex)
             .map_err(|e| IndexerError::Rpc(RpcError::Malformed(e.to_string())))?;
-        let header = self.call(|| self.rpc.get_block(&hash_hex)).await?;
+        let header = Self::call(|| self.rpc.get_block(&hash_hex)).await?;
         let prev_hash: [u8; 32] = match &header.previousblockhash {
             Some(p) => hex::decode_exact(p)
                 .map_err(|e| IndexerError::Rpc(RpcError::Malformed(e.to_string())))?,
@@ -256,10 +265,8 @@ impl<R: GoldcoinRpc> Indexer<R> {
             if is_genesis {
                 break;
             }
-            let decoded = self.call(|| self.rpc.get_raw_transaction(txid_hex)).await?;
-            let raw_tx_hex = self
-                .call(|| self.rpc.get_raw_transaction_hex(txid_hex))
-                .await?;
+            let decoded = Self::call(|| self.rpc.get_raw_transaction(txid_hex)).await?;
+            let raw_tx_hex = Self::call(|| self.rpc.get_raw_transaction_hex(txid_hex)).await?;
             let vault_outputs = vault_output_candidates(&decoded, &self.vault_script_hex);
             if vault_outputs.is_empty() {
                 continue;
@@ -356,13 +363,12 @@ impl<R: GoldcoinRpc> Indexer<R> {
                 continue;
             }
 
-            let still_unspent = self
-                .call(|| {
-                    self.rpc
-                        .get_tx_out_confirmed(&row.txid_hex, row.vout as u32)
-                })
-                .await?
-                .is_some();
+            let still_unspent = Self::call(|| {
+                self.rpc
+                    .get_tx_out_confirmed(&row.txid_hex, row.vout as u32)
+            })
+            .await?
+            .is_some();
             if !still_unspent {
                 tracing::warn!(
                     deposit_id = row.id,
