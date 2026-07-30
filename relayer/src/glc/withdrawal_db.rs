@@ -695,6 +695,18 @@ impl Db {
         Ok(n)
     }
 
+    /// True when this withdrawal's oldest reservation predates `cutoff`.
+    /// Used only to reclaim reservations that never reached a payout (D10).
+    pub fn reservation_is_stale(&self, index: i64, cutoff: i64) -> Result<bool, DbError> {
+        let stale: bool = self.conn.query_row(
+            "SELECT COALESCE(MIN(reserved_at), 0) < ?1
+             FROM vault_utxos WHERE reserved_by = ?2",
+            params![cutoff, index],
+            |r| r.get(0),
+        )?;
+        Ok(stale)
+    }
+
     pub fn reserved_utxos(&self, index: i64) -> Result<Vec<VaultUtxo>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT txid, txid_hex, vout, amount_atomic, script_pubkey_hex, confirmations

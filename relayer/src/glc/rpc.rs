@@ -25,6 +25,7 @@
 //!   wastes cycles and can mask a real bug.
 
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use thiserror::Error;
 
@@ -225,6 +226,104 @@ impl RpcClient {
             .map(Some)
             .map_err(|e| RpcError::Malformed(e.to_string()))
     }
+
+    // ---- Withdrawal payout path (Phase 6, ADR-0013) ----
+
+    /// Spendable outputs paying `addresses`. Wallet-based because
+    /// `scantxoutset` does not exist in this Goldcoin lineage (verified —
+    /// docs/goldcoin-rpc-notes.md), so there is no wallet-less UTXO scan.
+    pub async fn list_unspent(
+        &self,
+        min_conf: i64,
+        addresses: &[String],
+    ) -> Result<Vec<ListUnspentEntry>, RpcError> {
+        self.call_typed("listunspent", json!([min_conf, 9_999_999, addresses]))
+            .await
+    }
+
+    pub async fn create_raw_transaction(
+        &self,
+        inputs: &[(String, i64)],
+        outputs: &serde_json::Map<String, Value>,
+    ) -> Result<String, RpcError> {
+        let ins: Vec<Value> = inputs
+            .iter()
+            .map(|(txid, vout)| json!({ "txid": txid, "vout": vout }))
+            .collect();
+        self.call_typed("createrawtransaction", json!([ins, outputs]))
+            .await
+    }
+
+    pub async fn decode_raw_transaction(&self, hex: &str) -> Result<DecodedTransaction, RpcError> {
+        self.call_typed("decoderawtransaction", json!([hex])).await
+    }
+
+    /// Signs with the node wallet's keys. NOTE: this Goldcoin lineage
+    /// predates the 0.17 split, so the method is `signrawtransaction`, not
+    /// `signrawtransactionwithwallet` (verified: the latter is absent).
+    pub async fn sign_raw_transaction(&self, hex: &str) -> Result<SignResult, RpcError> {
+        self.call_typed("signrawtransaction", json!([hex])).await
+    }
+
+    /// Broadcasts, normalising the two benign outcomes verified against a
+    /// real node:
+    ///
+    /// - resending a transaction already in the mempool SUCCEEDS and returns
+    ///   the same txid;
+    /// - resending one already mined fails with code **-27**, which means
+    ///   "already in the chain" — a success for our purposes, not a failure.
+    ///
+    /// Code **-25** ("Missing inputs") means the inputs are gone: a genuine
+    /// conflict the caller must treat as an anomaly, never as a retry.
+    pub async fn send_raw_transaction(&self, hex: &str) -> Result<BroadcastOutcome, RpcError> {
+        match self.call("sendrawtransaction", json!([hex])).await {
+            Ok(v) => {
+                let txid = v
+                    .as_str()
+                    .ok_or_else(|| {
+                        RpcError::Malformed("sendrawtransaction returned non-string".into())
+                    })?
+                    .to_string();
+                Ok(BroadcastOutcome::Accepted { txid })
+            }
+            Err(RpcError::Method { code: -27, .. }) => Ok(BroadcastOutcome::AlreadyInChain),
+            Err(RpcError::Method { code: -25, .. }) => Ok(BroadcastOutcome::MissingInputs),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// One entry from `listunspent`, in the exact shape a real node returns
+/// (captured in docs/goldcoin-rpc-notes.md).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListUnspentEntry {
+    pub txid: String,
+    pub vout: i64,
+    pub address: Option<String>,
+    #[serde(rename = "scriptPubKey")]
+    pub script_pub_key: String,
+    pub amount: f64,
+    pub confirmations: i64,
+    #[serde(default)]
+    pub spendable: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignResult {
+    pub hex: String,
+    pub complete: bool,
+}
+
+/// The normalised result of a broadcast attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BroadcastOutcome {
+    Accepted {
+        txid: String,
+    },
+    /// RPC -27: the transaction is already in a block. Idempotent success.
+    AlreadyInChain,
+    /// RPC -25: inputs are missing/already spent. A conflict, never retried.
+    MissingInputs,
 }
 
 /// Retry policy for transient transport blips (module docs). Bounded and
