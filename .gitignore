@@ -21,6 +21,12 @@ node_modules/
 # Anything meant to be part of the record belongs in docs/adr/ instead.
 docs/reviews/
 
+# Claude Code local settings: machine/session-specific, and carries local
+# absolute paths and session metadata. Only this one file — the rest of
+# .claude/ stays trackable, since project-level agent/skill definitions are
+# shared configuration worth committing.
+.claude/settings.local.json
+
 # Editors / OS
 .DS_Store
 .idea/
