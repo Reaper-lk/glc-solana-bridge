@@ -230,6 +230,50 @@ withdrawal executor (ADR-0013).
 - Regtest block subsidy observed at **10000 GLC**; coinbase maturity 100
   blocks, as in the Bitcoin lineage.
 
+### P2SH M-of-N multisig vault (verified Phase 7b)
+
+The spend path custody.md #2 depended on, verified end to end against a real
+v0.15.0 regtest node with three independently-held keys. This closes what
+ADR-0014 recorded as finding **F4**.
+
+- **`createmultisig 2 [pk1,pk2,pk3]`** returns a `Q`-prefixed P2SH address
+  and its `redeemScript`. The `Q` prefix (Goldcoin-specific version byte,
+  neither Bitcoin mainnet `3` nor testnet `2`) is confirmed again here.
+- **The wallet does not see the vault at all** until `importaddress`. After
+  importing the *address* only, its UTXOs appear with **`spendable: false`
+  and `solvable: false`**. Importing the **redeemScript** with the `p2sh`
+  flag makes them `solvable`. **Consequence: a relayer that filters
+  `listunspent` on `spendable` will see an empty vault** whenever the local
+  node does not hold enough keys to sign alone — which is the normal case
+  for production custody. `solvable` is the correct filter.
+- **Partial signing works and partials are unspendable.** Signing with one
+  key of a 2-of-3 returns `complete: false` with
+  `"Operation not valid with the current stack size"`, and broadcasting that
+  partial is rejected with **`-26 mandatory-script-verify-flag-failed`**. A
+  second independent signature over the first signer's partial returns
+  `complete: true` and broadcasts normally.
+- **`signrawtransaction` requires explicit `prevtxs` carrying the
+  `redeemScript`** (plus the signer's own WIF key) to sign for a vault the
+  wallet cannot solve on its own. The bare `signrawtransaction(hex)` form
+  used for a wallet-owned P2PKH vault is not sufficient.
+- **Signature order does not matter**: any M of N, in any order, produces a
+  valid transaction (verified with signers {3,1} as well as {1,2}).
+- **The txid is stable across signing ORDER but not across signing SET.**
+  The same quorum signing in either order yields an identical txid
+  (deterministic ECDSA), but different quorums over identical inputs and
+  outputs yield different txids:
+
+  ```
+  signers {1,2}: cc21b040eec6803c1a9ae71409a57e45e311e28e898e88f75c2db828f443ffd5
+  signers {1,3}: 13edc8c3b9b1a6b2d0844812446c965ea02fff6fc93fd13b08a8698248a50fe8
+  signers {2,3}: 7c76b400b178027b9fd3513efdbc7045da23c4315252b6d4e46ddce9af5d0ef7
+  ```
+
+  **Consequence:** ADR-0013's "persist the txid before broadcasting"
+  recovery model only survives multisig if the signing quorum is fixed in
+  advance. This is why ADR-0014 now specifies an explicitly designated
+  quorum inside the signed payout intent (owner decision, 2026-07-31).
+
 ## Not yet verified / explicitly out of scope for Phase 4
 
 - P2SH multisig vault construction end-to-end (spend path) — custody.md #2

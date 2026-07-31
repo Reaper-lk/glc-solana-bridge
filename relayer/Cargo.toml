@@ -38,6 +38,9 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # message_hash fingerprint in claim_artifacts (Phase 4); off-chain only, no
 # SBF constraint applies here (unlike the shared crate).
 sha2 = "0.10"
+# RIPEMD-160 for hash160 (P2SH script hashing, Phase 7b/ADR-0015). Already in
+# the graph via the Solana stack; declared directly for the vault module.
+ripemd = "0.1"
 
 # Solana side (Phase 5). Resolved to 2.3.x — newer than the 2.1.21 Agave
 # line pinned for the on-chain SBF toolchain (Anchor.toml), because exact

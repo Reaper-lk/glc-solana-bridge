@@ -19,7 +19,16 @@ use glc_relayer::withdrawal::config::{RawWithdrawalConfig, WithdrawalConfig};
 use glc_relayer::withdrawal::executor::{PayoutRpc, TxStatus, WithdrawalExecutor};
 
 const DEST: [u8; 20] = [0xAA; 20];
-const VAULT: [u8; 20] = [0xBB; 20];
+
+/// The real 2-of-3 vault `createmultisig` produced on a regtest node during
+/// Phase 7b verification (ADR-0015). Using the genuine script keeps these
+/// tests honest about the address and script shapes the executor must emit.
+const REDEEM: &str = "5221028e7147e643d67093dc8ca6a8fb888f1a452dddc62de991c7ed72080d65a421e42102f1c88ca7176c3ffee952ee6fae697991b257b6d53c3bc88e81cfe99adbcdbee5210256220bb7865197a40c4590ac80f12ef18e9063eac2eff92c4476ec27034042f953ae";
+const VAULT_ADDR: &str = "QY9YcpypWD91BEZ37TjNHYoqrquhcnVBYV";
+
+fn vault() -> glc_relayer::withdrawal::vault::MultisigVault {
+    glc_relayer::withdrawal::vault::MultisigVault::from_redeem_script_hex(REDEEM).unwrap()
+}
 
 // ---------------------------------------------------------------------
 // MockPayoutRpc
@@ -135,8 +144,12 @@ impl PayoutRpc for MockPayoutRpc {
         let mut outs: Vec<(u64, String)> = outputs
             .iter()
             .map(|(addr, v)| {
-                let h = glc_relayer::withdrawal::address::decode_p2pkh_hash160(addr).unwrap();
-                (*v, p2pkh_script_hex(&h))
+                // Destination is P2PKH; change returns to the P2SH vault.
+                let script = match glc_relayer::withdrawal::address::decode_p2pkh_hash160(addr) {
+                    Ok(h) => p2pkh_script_hex(&h),
+                    Err(_) => vault().script_pubkey_hex(),
+                };
+                (*v, script)
             })
             .collect();
         match tamper {
@@ -188,7 +201,11 @@ impl PayoutRpc for MockPayoutRpc {
         })
     }
 
-    async fn sign_raw_transaction(&self, hex: &str) -> Result<(String, bool), RpcError> {
+    async fn sign_raw_transaction(
+        &self,
+        hex: &str,
+        _prevtxs: &[glc_relayer::glc::rpc::PrevTx],
+    ) -> Result<(String, bool), RpcError> {
         let (incomplete, tamper) = {
             let mut s = self.0.lock().unwrap();
             s.sign_calls += 1;
@@ -259,8 +276,9 @@ const DUST: u64 = 5_400;
 
 fn config() -> WithdrawalConfig {
     WithdrawalConfig::validate(RawWithdrawalConfig {
-        vault_address: encode_p2pkh(&VAULT),
-        change_address: encode_p2pkh(&VAULT),
+        vault_redeem_script_hex: REDEEM.into(),
+        vault_address: VAULT_ADDR.into(),
+        change_address: VAULT_ADDR.into(),
         fee_rate_per_kb: RATE,
         dust_threshold_atomic: DUST,
         vault_min_confirmations: 1,
@@ -278,7 +296,7 @@ fn utxo(seed: u8, vout: i64, amount: u64) -> ObservedUtxo {
         txid: [seed; 32],
         vout,
         amount_atomic: amount,
-        script_pubkey_hex: p2pkh_script_hex(&VAULT),
+        script_pubkey_hex: vault().script_pubkey_hex(),
         confirmations: 10,
     }
 }

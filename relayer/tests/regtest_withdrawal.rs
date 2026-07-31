@@ -93,6 +93,15 @@ impl RegtestNode {
         c
     }
 
+    /// Like `cli` but tolerates failure — used for imports, which raise a
+    /// method error when the address is already known.
+    fn try_cli(&self, args: &[&str]) -> Option<String> {
+        let o = self.cli_cmd().args(args).output().ok()?;
+        o.status
+            .success()
+            .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    }
+
     fn cli(&self, args: &[&str]) -> String {
         let out = self.cli_cmd().args(args).output().expect("goldcoin-cli");
         assert!(
@@ -153,8 +162,9 @@ fn compact_outpoints(listunspent_json: &str) -> String {
     serde_json::Value::Array(items).to_string()
 }
 
-fn config(vault: &str, change: &str, depth: i64) -> WithdrawalConfig {
+fn config(vault: &str, redeem: &str, change: &str, depth: i64) -> WithdrawalConfig {
     WithdrawalConfig::validate(RawWithdrawalConfig {
+        vault_redeem_script_hex: redeem.to_string(),
         vault_address: vault.to_string(),
         change_address: change.to_string(),
         fee_rate_per_kb: 100_000, // 0.001 GLC/kB — comfortably above min relay
@@ -189,6 +199,7 @@ struct Fixture {
     _dir: tempfile::TempDir,
     db_path: PathBuf,
     vault: String,
+    redeem: String,
     dest: String,
 }
 
@@ -204,7 +215,32 @@ impl Fixture {
     /// real property of wallet-held custody, not a test artifact — see
     /// ADR-0013's security notes.
     fn setup(node: RegtestNode, count: usize) -> Self {
-        let vault = node.cli(&["getnewaddress"]);
+        // A real P2SH 2-of-3 vault (ADR-0015), not the Phase 6 single-key
+        // stand-in. The node wallet holds all three keys here so the
+        // regtest signer can complete a quorum in one call; production
+        // splits them across operators (7b follow-on).
+        let signers: Vec<String> = (0..3).map(|_| node.cli(&["getnewaddress"])).collect();
+        let pubkeys: Vec<String> = signers
+            .iter()
+            .map(|a| {
+                let v: serde_json::Value =
+                    serde_json::from_str(&node.cli(&["validateaddress", a])).unwrap();
+                v["pubkey"].as_str().unwrap().to_string()
+            })
+            .collect();
+        let ms: serde_json::Value = serde_json::from_str(&node.cli(&[
+            "createmultisig",
+            "2",
+            &serde_json::to_string(&pubkeys).unwrap(),
+        ]))
+        .unwrap();
+        let vault = ms["address"].as_str().unwrap().to_string();
+        let redeem = ms["redeemScript"].as_str().unwrap().to_string();
+        // Without these the vault is invisible to listunspent, and with only
+        // the address imported its outputs stay unsolvable (verified).
+        let _ = node.try_cli(&["importaddress", &vault, "vault", "false"]);
+        let _ = node.try_cli(&["importaddress", &redeem, "vault-redeem", "false", "true"]);
+
         let dest = node.cli(&["getnewaddress"]);
         let miner = node.cli(&["getnewaddress"]);
         node.cli(&["generatetoaddress", "130", &miner]);
@@ -228,6 +264,7 @@ impl Fixture {
             _dir: dir,
             db_path,
             vault,
+            redeem,
             dest,
         }
     }
@@ -237,7 +274,7 @@ impl Fixture {
         WithdrawalExecutor::new(
             Db::open(&self.db_path).unwrap(),
             RealPayoutRpc::new(client),
-            config(&self.vault, &self.vault, depth),
+            config(&self.vault, &self.redeem, &self.vault, depth),
         )
     }
 
@@ -293,7 +330,7 @@ async fn real_payout_reaches_the_destination_and_completes() {
     assert_eq!(
         f.state(1),
         WithdrawalState::Confirming,
-        "broadcast to a real node"
+        "payout signed and broadcast to a real node from a real P2SH multisig vault"
     );
     let txid = f.txid(1).expect("txid durable before broadcast");
 

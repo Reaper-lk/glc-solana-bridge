@@ -165,6 +165,7 @@ fn solana_config_from_env(program_id_bytes: [u8; 32]) -> anyhow::Result<SolanaCo
 /// stated explicitly, and the commitment must be exactly `finalized`.
 fn withdrawal_config_from_env() -> anyhow::Result<WithdrawalConfig> {
     let raw = RawWithdrawalConfig {
+        vault_redeem_script_hex: env_required("GLC_VAULT_REDEEM_SCRIPT_HEX")?,
         vault_address: env_required("GLC_VAULT_ADDRESS")?,
         change_address: env_required("GLC_VAULT_CHANGE_ADDRESS")?,
         fee_rate_per_kb: env_required_u64("GLC_PAYOUT_FEE_RATE_PER_KB")?,

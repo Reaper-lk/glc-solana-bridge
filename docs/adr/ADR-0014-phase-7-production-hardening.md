@@ -93,7 +93,7 @@ Further, the pieces already exist:
 Completion therefore slots into existing structure using the existing
 ed25519-precompile verification machinery. It is additive, not a migration.
 
-### F4 — The P2SH multisig spend path is unverified
+### F4 — The P2SH multisig spend path is unverified  *(CLOSED in 7b)*
 
 `docs/goldcoin-rpc-notes.md` lists P2SH multisig vault construction under
 "Not yet verified / explicitly out of scope." What *is* verified is that
@@ -107,6 +107,13 @@ non-standard ports, boolean-only `getblock` verbosity, absent
 estimation). **No production vault design may be finalised on the
 assumption that P2SH multisig spending behaves as it does in Bitcoin.** A
 real M-of-N spend must be executed on regtest first.
+
+**Resolved 2026-07-31 (Phase 7b).** A real 2-of-3 P2SH spend was executed
+against a live regtest node with independently-held keys: partial signing
+returns `complete: false`, the partial is rejected by the network (`-26`), a
+second independent signature completes it, and the payout confirms. Full
+observations are recorded in `goldcoin-rpc-notes.md`. Three of them changed
+this design and are captured in §8.8 below.
 
 ---
 
@@ -531,6 +538,56 @@ against its own node before signing.
   written and filed.
 
 ---
+
+### 8.8 Designated signing quorum (owner decision, 2026-07-31)
+
+Verifying F4 surfaced a direct contradiction with the shipped Phase 6
+recovery model, which ADR-0014 had not anticipated.
+
+**The problem.** ADR-0013 persists a payout's txid *before* broadcasting it,
+and that durable txid is the only mechanism for reconciling a lost broadcast
+response. With a single-key vault the txid is known the moment the
+transaction is built. With M-of-N it is not: measured on a real node, the
+same inputs and outputs signed by different quorums produce different txids
+(signing *order* is irrelevant; signing *set* is not). If two overlapping
+quorums each complete, two valid transactions exist spending the same
+inputs — only one can confirm, and the executor may have persisted the
+other.
+
+**Decision: the signing quorum is designated explicitly inside the signed
+payout intent.** The intent names exactly which M validators will sign, so
+the resulting txid is determined before any signature is collected and the
+Phase 5/6 "persist the txid before broadcast" model survives unchanged.
+
+**Reassignment is explicit, never implicit.** If a designated signer is
+unavailable, the executor does not silently fall back to another quorum. A
+**new** intent is issued, carrying an incremented `quorum_attempt`, which
+produces a different commitment and therefore a different set of signatures.
+The superseded intent is recorded, not overwritten, so the reassignment is
+auditable; and because the attempt counter is part of the committed bytes, a
+signature gathered for one quorum can never be replayed into another.
+
+Options rejected:
+
+- *First-M-to-respond*: simpler collection, but erodes the durable-txid
+  invariant that Phases 5 and 6 were built and mutation-tested around, and
+  admits a window in which two quorums both complete.
+- *Deterministic quorum by rule* (e.g. lowest M indices to respond within a
+  timeout): avoids negotiation but makes failover semantics subtle and
+  leaves the txid undetermined until the timeout resolves.
+
+### 8.9 Consequences for the Phase 6 executor
+
+Three shipped behaviours are incompatible with a production vault and must
+change in 7b:
+
+1. `RealPayoutRpc::list_unspent` filters on `spendable`. For a vault the
+   local node cannot solve alone this is always false, so the executor would
+   see an empty vault and never pay out. The correct filter is `solvable`.
+2. `sign_raw_transaction` is called as `signrawtransaction(hex)`. Signing
+   for a P2SH vault requires explicit `prevtxs` carrying the `redeemScript`.
+3. The vault is configured as a single P2PKH address. It becomes a multisig
+   descriptor: redeem script, M, N, and the ordered signer pubkeys.
 
 ## 9. Withdrawal completion (closes D1)
 

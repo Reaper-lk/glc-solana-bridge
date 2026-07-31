@@ -353,10 +353,39 @@ async fn deposit_to_mint_to_burn_to_goldcoin_payout() {
 
     // ---------- Goldcoin: vault + funds ----------
     let miner = gold.cli(&["getnewaddress"]);
-    let vault = gold.cli(&["getnewaddress"]);
+    // A real P2SH 2-of-3 vault (Phase 7b, ADR-0015). The deposit side still
+    // pays a P2PKH vault output — Phase 4 matches P2PKH only (owner
+    // decision U5) — so the deposit vault and the payout vault are distinct
+    // addresses, which is also how a real deployment separates them.
+    let deposit_vault = gold.cli(&["getnewaddress"]);
+    let signers: Vec<String> = (0..3).map(|_| gold.cli(&["getnewaddress"])).collect();
+    let pubkeys: Vec<String> = signers
+        .iter()
+        .map(|a| {
+            let v: serde_json::Value =
+                serde_json::from_str(&gold.cli(&["validateaddress", a])).unwrap();
+            v["pubkey"].as_str().unwrap().to_string()
+        })
+        .collect();
+    let ms: serde_json::Value = serde_json::from_str(&gold.cli(&[
+        "createmultisig",
+        "2",
+        &serde_json::to_string(&pubkeys).unwrap(),
+    ]))
+    .unwrap();
+    let vault = ms["address"].as_str().unwrap().to_string();
+    let vault_redeem = ms["redeemScript"].as_str().unwrap().to_string();
+    let _ = gold.try_cli(&["importaddress", &vault, "vault", "false"]);
+    let _ = gold.try_cli(&[
+        "importaddress",
+        &vault_redeem,
+        "vault-redeem",
+        "false",
+        "true",
+    ]);
     let payout_dest = gold.cli(&["getnewaddress"]);
     gold.mine(130, &miner);
-    let vault_script = gold.script_pubkey_of(&vault);
+    let vault_script = gold.script_pubkey_of(&deposit_vault);
 
     // ---------- Solana: initialize + wrapped mint ----------
     let validators: Vec<Keypair> = (0..3).map(|_| Keypair::new()).collect();
@@ -447,7 +476,7 @@ async fn deposit_to_mint_to_burn_to_goldcoin_payout() {
     // ---------- STEP 1: real Goldcoin deposit ----------
     let deposit_glc = 40.0_f64;
     let deposit_atomic = 40_00000000u64;
-    let deposit_txid = gold.send_deposit(&vault, deposit_glc, &user.pubkey().to_bytes());
+    let deposit_txid = gold.send_deposit(&deposit_vault, deposit_glc, &user.pubkey().to_bytes());
     gold.mine(3, &miner);
 
     // ---------- STEP 2: indexer -> ReadyForSignature ----------
@@ -587,8 +616,13 @@ async fn deposit_to_mint_to_burn_to_goldcoin_payout() {
     assert_eq!(found[0].amount_atomic, burn_atomic);
     assert_eq!(found[0].glc_address, payout_dest);
 
+    // Fund the P2SH payout vault so the executor has spendable inputs.
+    gold.cli(&["sendtoaddress", &vault, "60.0"]);
+    gold.mine(3, &miner);
+
     // ---------- STEP 6: executor -> real Goldcoin payout ----------
     let w_config = WithdrawalConfig::validate(RawWithdrawalConfig {
+        vault_redeem_script_hex: vault_redeem.clone(),
         vault_address: vault.clone(),
         change_address: vault.clone(),
         fee_rate_per_kb: 100_000,

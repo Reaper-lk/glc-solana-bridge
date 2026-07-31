@@ -100,11 +100,12 @@ fn checksum(payload: &[u8]) -> [u8; 4] {
     c
 }
 
-/// Decodes a regtest P2PKH address to its 20-byte hash160.
+/// Decodes any base58check address into `(version_byte, 20-byte payload)`.
 ///
-/// Fails closed on every malformed input: the payout destination comes from
-/// user-supplied on-chain bytes and is never guessed at.
-pub fn decode_p2pkh_hash160(addr: &str) -> Result<[u8; 20], AddressError> {
+/// Version-agnostic on purpose: P2PKH and P2SH differ only in that byte, and
+/// the Phase 7b vault (ADR-0015) needs the P2SH form. Callers decide which
+/// versions they accept — this never guesses.
+pub fn base58check_decode(addr: &str) -> Result<(u8, [u8; 20]), AddressError> {
     let raw = base58_decode(addr)?;
     if raw.len() != 25 {
         return Err(AddressError::WrongLength(raw.len()));
@@ -113,23 +114,37 @@ pub fn decode_p2pkh_hash160(addr: &str) -> Result<[u8; 20], AddressError> {
     if checksum(payload) != given {
         return Err(AddressError::BadChecksum);
     }
-    if payload[0] != P2PKH_VERSION_REGTEST {
-        return Err(AddressError::UnsupportedVersion(payload[0]));
-    }
     let mut h = [0u8; 20];
     h.copy_from_slice(&payload[1..21]);
+    Ok((payload[0], h))
+}
+
+/// Encodes `(version, payload)` as a base58check address.
+pub fn base58check_encode(version: u8, hash160: &[u8; 20]) -> String {
+    let mut payload = Vec::with_capacity(25);
+    payload.push(version);
+    payload.extend_from_slice(hash160);
+    let c = checksum(&payload);
+    payload.extend_from_slice(&c);
+    base58_encode(&payload)
+}
+
+/// Decodes a regtest P2PKH address to its 20-byte hash160.
+///
+/// Fails closed on every malformed input: the payout destination comes from
+/// user-supplied on-chain bytes and is never guessed at.
+pub fn decode_p2pkh_hash160(addr: &str) -> Result<[u8; 20], AddressError> {
+    let (version, h) = base58check_decode(addr)?;
+    if version != P2PKH_VERSION_REGTEST {
+        return Err(AddressError::UnsupportedVersion(version));
+    }
     Ok(h)
 }
 
 /// Encodes a hash160 back to a regtest P2PKH address (used by tests and by
 /// change-address verification).
 pub fn encode_p2pkh(hash160: &[u8; 20]) -> String {
-    let mut payload = Vec::with_capacity(25);
-    payload.push(P2PKH_VERSION_REGTEST);
-    payload.extend_from_slice(hash160);
-    let c = checksum(&payload);
-    payload.extend_from_slice(&c);
-    base58_encode(&payload)
+    base58check_encode(P2PKH_VERSION_REGTEST, hash160)
 }
 
 /// The canonical P2PKH `scriptPubKey` for a hash160:

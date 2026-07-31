@@ -21,3 +21,4 @@ pub mod coin;
 pub mod config;
 pub mod discovery;
 pub mod executor;
+pub mod vault;
