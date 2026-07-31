@@ -34,6 +34,7 @@ use solana_sdk::transaction::Transaction;
 use glc_relayer::glc::db::{Db, DepositState, NewBlock, NewCandidate, NewClaimArtifact};
 use glc_relayer::glc::deposit::build_claim_message;
 use glc_relayer::orchestrator::Orchestrator;
+use glc_relayer::p2p::collector::InProcessCollector;
 use glc_relayer::solana::instruction as glc_ix;
 use glc_relayer::solana::rpc::RealSolanaRpc;
 
@@ -415,7 +416,13 @@ async fn deposit_is_signed_aggregated_submitted_and_really_minted_on_a_local_val
     // Run the REAL orchestrator against the REAL validator.
     let rpc = RealSolanaRpc::new(validator.rpc_url.clone(), CommitmentLevel::Confirmed);
     let db = Db::open(&db_path).unwrap();
-    let mut orch = Orchestrator::new(db, rpc, program_id, submitter, validator_keys);
+    let mut orch = Orchestrator::new(
+        db,
+        rpc,
+        program_id,
+        submitter,
+        InProcessCollector::new(validator_keys),
+    );
 
     let mut minted = false;
     for _ in 0..40 {
