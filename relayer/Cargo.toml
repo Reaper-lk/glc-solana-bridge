@@ -72,13 +72,14 @@ spl-token = "6"
 # is large against a deny.toml already strained by solana-client. Verified
 # before adoption: resolves under MSRV 1.85 and cargo-deny passes on both
 # workspaces with these added.
-# TLS is deliberately NOT enabled yet: tonic's `tls` feature pulls
-# rustls-pemfile, which carries an unmaintained advisory
-# (RUSTSEC-2025-0134) with no safe upgrade. Phase 7c ships the protocol and
-# the signer service; mTLS lands with the transport hardening that actually
-# uses it, and its dependency cost is re-evaluated then rather than carried
-# unused now.
-tonic = { version = "0.12", default-features = false, features = ["codegen", "prost", "transport"] }
+# tonic 0.13 with `tls-ring`, NOT 0.12 with `tls`: the 0.12 TLS stack pulls
+# rustls-pemfile, which carries an unmaintained advisory (RUSTSEC-2025-0134)
+# with no safe upgrade available. 0.13 drops it, so mTLS is enabled here
+# with no deny.toml exception. Verified before adoption, and pinned by a
+# TARGETED `cargo update -p tonic -p tonic-build` — a bare `cargo update`
+# drags darling/icu_* past the 1.85 MSRV, which has bitten this workspace
+# repeatedly.
+tonic = { version = "0.13", features = ["tls-ring"] }
 prost = "0.13"
 # Types-only crate, ALREADY in the tree via solana-pubsub-client — declaring
 # it directly adds nothing new to the dependency graph. Needed because
@@ -87,7 +88,7 @@ prost = "0.13"
 solana-account-decoder-client-types = "2.3"
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-build = "0.13"
 # Ships its own protoc. Without this the build needs a system protobuf
 # compiler, which the CI runners do not have and every contributor would
 # otherwise have to install by hand — a build that only works on machines
@@ -95,4 +96,15 @@ tonic-build = "0.12"
 protoc-bin-vendored = "3"
 
 [dev-dependencies]
+# Test-only certificate authority, so the mTLS transport is verified against
+# real certificates rather than assumed to work (Phase 7d).
+# Pinned below 0.14.8, which raises its MSRV to 1.88 — this workspace builds
+# on 1.85, and a bare `cargo update` silently drags it (and darling/icu_*)
+# past that. Never used outside tests: no production path mints certificates.
+rcgen = "=0.14.7"
+rusqlite = { version = "0.31", features = ["bundled"] }
 tempfile = "3"
+# Lets the transport tests bind port 0 and serve on the resulting listener,
+# so they run concurrently without racing over a hardcoded port. Already in
+# the tree via tonic.
+tokio-stream = { version = "0.1.19", features = ["net"] }

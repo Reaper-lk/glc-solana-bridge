@@ -24,6 +24,7 @@ use tonic::{Request, Response, Status};
 use super::policy::{
     self, Action, Decision, LocalView, Refusal, SeenSet, SigningIdentity, SigningRequest,
 };
+use super::ratelimit::RateLimiter;
 
 pub mod pb {
     tonic::include_proto!("glc.federation.v1");
@@ -69,6 +70,7 @@ pub struct SignerService<V: LocalView + Send + Sync + 'static> {
     keypair: Keypair,
     view: V,
     seen: Arc<Mutex<SeenSet>>,
+    limiter: Arc<Mutex<RateLimiter>>,
 }
 
 impl<V: LocalView + Send + Sync + 'static> SignerService<V> {
@@ -78,15 +80,47 @@ impl<V: LocalView + Send + Sync + 'static> SignerService<V> {
     /// more than one validator identity in a process is precisely the
     /// bootstrap topology Phase 7c exists to retire.
     pub fn new(keypair: Keypair, view: V) -> Self {
+        Self::with_rate_limits(
+            keypair,
+            view,
+            super::ratelimit::REFILL_PER_SECOND,
+            super::ratelimit::BURST,
+        )
+    }
+
+    /// Same, with explicit limits.
+    ///
+    /// Exists so tests can pin the limiter's behaviour instead of racing the
+    /// refill clock — a test that floods the real server at production
+    /// limits passes or fails depending on how fast the machine is, which is
+    /// not a test of anything.
+    pub fn with_rate_limits(keypair: Keypair, view: V, refill_per_second: f64, burst: f64) -> Self {
         SignerService {
             keypair,
             view,
             seen: Arc::new(Mutex::new(SeenSet::new())),
+            limiter: Arc::new(Mutex::new(RateLimiter::with_limits(
+                refill_per_second,
+                burst,
+            ))),
         }
     }
 
     pub fn validator_pubkey(&self) -> [u8; 32] {
         self.keypair.pubkey().to_bytes()
+    }
+
+    /// Charges one request against `peer`'s allowance.
+    ///
+    /// Separate from [`Self::handle`] and applied *before* it, so an
+    /// over-limit peer is turned away without the service doing the
+    /// re-derivation work that makes signing expensive.
+    pub fn check_rate_limit(&self, peer: &str) -> Result<(), Refusal> {
+        if self.limiter.lock().unwrap().check(peer) {
+            Ok(())
+        } else {
+            Err(Refusal::RateLimited)
+        }
     }
 
     /// Evaluates and, if the policy allows, signs. Exposed directly so the
@@ -130,16 +164,61 @@ impl<V: LocalView + Send + Sync + 'static> SignerService<V> {
     }
 }
 
+/// A stable key for the peer behind a request, for rate-limiting purposes.
+///
+/// Prefers the mTLS client certificate: it is the federation-issued identity
+/// and survives NAT, proxies, and reconnection, whereas an address does not.
+/// The certificate is only *fingerprinted*, never parsed — no X.509 parser
+/// is on the request path, and authenticating the certificate is already
+/// TLS's job, done before this code runs.
+///
+/// Falls back to the remote **address without its port**, since a per-port
+/// key would mint a fresh bucket for every new connection and limit nothing.
+fn peer_key<T>(request: &Request<T>) -> String {
+    use sha2::{Digest, Sha256};
+    if let Some(certs) = request.peer_certs() {
+        if let Some(leaf) = certs.first() {
+            let digest = Sha256::digest(&**leaf);
+            return format!("cert:{}", hex_prefix(&digest));
+        }
+    }
+    match request.remote_addr() {
+        Some(addr) => format!("addr:{}", addr.ip()),
+        // No certificate and no address: one shared bucket, which is
+        // deliberately the most restrictive outcome rather than a bypass.
+        None => "unidentified".to_string(),
+    }
+}
+
+fn hex_prefix(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().take(16).fold(String::new(), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
+
 #[tonic::async_trait]
 impl<V: LocalView + Send + Sync + 'static> FederationSigner for SignerService<V> {
     async fn sign(&self, request: Request<SignRequest>) -> Result<Response<SignResponse>, Status> {
+        let peer = peer_key(&request);
+        // Charged before `handle`, so an over-limit peer never reaches the
+        // expensive re-derivation path.
+        if let Err(refusal) = self.check_rate_limit(&peer) {
+            tracing::warn!(%peer, "rate-limited a federation signing request");
+            // `resource_exhausted`, deliberately NOT `failed_precondition`:
+            // the collector treats the latter as a genuine disagreement and
+            // stops retrying. Being throttled is transient and a later tick
+            // should try again.
+            return Err(Status::resource_exhausted(refusal.to_string()));
+        }
         match self.handle(request.into_inner()) {
             Ok(resp) => Ok(Response::new(resp)),
             // A refusal is a first-class, logged outcome: it means this
             // validator's view disagrees with a peer's, which is either a
             // bug or an attack — never routine.
             Err(refusal) => {
-                tracing::warn!(%refusal, "refused a federation signing request");
+                tracing::warn!(%peer, %refusal, "refused a federation signing request");
                 Err(Status::failed_precondition(refusal.to_string()))
             }
         }
@@ -322,6 +401,7 @@ mod tests {
                 );
                 Arc::new(Mutex::new(seen))
             },
+            limiter: Arc::new(Mutex::new(RateLimiter::new())),
         };
         assert_eq!(
             s2.handle(mint_request(vec![9], 7, b"second".to_vec(), TXID, 1))
@@ -392,6 +472,68 @@ mod tests {
             ),
             "attempt 1 is a different identity the validator has not derived"
         );
+    }
+
+    #[test]
+    fn a_peer_exceeding_its_allowance_is_rate_limited() {
+        let s = service(b"canonical");
+        let mut refused = 0;
+        // Well past the burst allowance.
+        for _ in 0..(super::super::ratelimit::BURST as usize + 5) {
+            if s.check_rate_limit("addr:10.0.0.1").is_err() {
+                refused += 1;
+            }
+        }
+        assert!(
+            refused >= 5,
+            "the limit must actually bite, got {refused} refusals"
+        );
+        assert_eq!(
+            s.check_rate_limit("addr:10.0.0.1"),
+            Err(Refusal::RateLimited)
+        );
+    }
+
+    #[test]
+    fn rate_limiting_is_per_peer_so_one_peer_cannot_starve_the_federation() {
+        let s = service(b"canonical");
+        for _ in 0..(super::super::ratelimit::BURST as usize + 5) {
+            let _ = s.check_rate_limit("addr:10.0.0.1");
+        }
+        assert!(s.check_rate_limit("addr:10.0.0.1").is_err());
+        assert!(
+            s.check_rate_limit("addr:10.0.0.2").is_ok(),
+            "an unrelated peer must still be served"
+        );
+    }
+
+    #[test]
+    fn rate_limiting_does_not_consume_the_signing_path() {
+        // Being throttled must not record anything in the seen-set, or a
+        // throttled request could poison a later legitimate one.
+        let s = service(b"canonical");
+        for _ in 0..(super::super::ratelimit::BURST as usize + 5) {
+            let _ = s.check_rate_limit("addr:10.0.0.1");
+        }
+        assert!(s.seen.lock().unwrap().is_empty());
+        // And the signing path itself still works for a fresh request.
+        assert!(s
+            .handle(mint_request(vec![1], 7, b"canonical".to_vec(), TXID, 1))
+            .is_ok());
+    }
+
+    #[test]
+    fn a_peer_key_without_a_certificate_or_address_is_not_a_bypass() {
+        // A request carrying neither must land in a bucket, not skip the
+        // limiter — the most restrictive outcome, not the most permissive.
+        let req = Request::new(mint_request(vec![1], 7, b"m".to_vec(), TXID, 1));
+        assert_eq!(peer_key(&req), "unidentified");
+
+        let s = service(b"canonical");
+        for _ in 0..(super::super::ratelimit::BURST as usize + 5) {
+            let _ = s.check_rate_limit("unidentified");
+        }
+        assert!(s.check_rate_limit("unidentified").is_err());
     }
 
     #[test]

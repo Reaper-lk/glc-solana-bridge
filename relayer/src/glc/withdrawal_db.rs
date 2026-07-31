@@ -397,6 +397,13 @@ pub struct SignablePayout {
     /// The freshly recomputed commitment — equal to the stored one, else
     /// this value would never have been returned.
     pub commitment_hash: [u8; 32],
+    /// The freshly **recomputed** canonical intent, not the stored blob.
+    ///
+    /// These are the bytes a validator attests to when a peer asks it to
+    /// authorize this payout (Phase 7d): handing back the recomputed
+    /// preimage rather than the persisted one is what keeps the signer's
+    /// answer derived from its own state.
+    pub intent_bytes: Vec<u8>,
 }
 
 /// The canonical payout intent (ADR-0013, extended to v2 by ADR-0015).
@@ -1221,6 +1228,7 @@ impl Db {
             quorum_attempt: stored_quorum_attempt,
             inputs,
             commitment_hash: to_array32(&stored_commitment),
+            intent_bytes: recomputed_intent,
         })
     }
 
