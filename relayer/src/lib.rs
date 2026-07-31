@@ -10,3 +10,4 @@ pub mod orchestrator;
 pub mod p2p;
 pub mod signer;
 pub mod solana;
+pub mod withdrawal;

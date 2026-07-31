@@ -29,6 +29,10 @@ OPEN blocks deployment.
 | **Threshold exceeds transaction capacity** — a single tx fits ~4 (legacy) / ~7 (v0+ALT) signatures | Liveness-only bound (mints stall, never mint wrongly); documented in ADR-0010; vote-accumulation fallback (ADR-0005) if a larger M is ever needed |
 | **Admin rotates validator set to attacker keys** — governance key is an indirect mint capability | Unchanged interim risk since Phase 1: rotation is visible on-chain, epoch-bumping, and pause-independent; resolved by custody decisions #1/#7 (threshold-gated + timelocked governance) |
 | **Key material leakage** | No keys in repo at any phase; signer code isolated in relayer; `.gitignore` guards; TSS/vault signing out of scope until custody decided |
+| **Double payout of one withdrawal** | Four layers (ADR-0013): one payout row per withdrawal (schema PK); an outpoint funds at most one payout (`UNIQUE(txid,vout)`); a pre-signing guard sequence that refuses already-signed/confirmed/completed payouts and drifted reservations; and the Goldcoin UTXO set itself, where a spent input cannot be re-spent (RPC -25) and an identical rebroadcast is a no-op (RPC -27). Only the last is a true security boundary. Every guard is mutation-tested (6) |
+| **Payout built from a reversible burn** | Withdrawal discovery is hard-required to run at Solana `finalized` commitment; any other value is a startup error (6, owner decision D5) |
+| **Vault drained by the node wallet itself** | OPEN, Phase 6 limitation: the regtest vault address lives in the node wallet, which will spend vault UTXOs for unrelated sends (verified). Database reservations cannot prevent this. Operational rule: the vault wallet must not be used for anything else. Resolved properly only by custody #2/#3 |
+| **Withdrawal completion state lost with the relayer database** | OPEN, Phase 6 limitation: on-chain `WithdrawalRequest.status` is never advanced (no write-back instruction exists), so a relayer with no database cannot distinguish paid from unpaid withdrawals from chain state alone (6, owner decision D1) |
 | **Dependency/supply chain** | cargo-deny in CI on both workspaces (Phase 0); on-chain workspace structurally isolated from network deps (ADR-0001) |
 
 ## Standing invariants (testable from Phase 2 on)
@@ -40,3 +44,11 @@ OPEN blocks deployment.
    claim bytes. (Holds from Phase 3: the only mint path verifies threshold
    signatures over the canonical message via the ed25519 precompile;
    the admin-signed test path was deleted.)
+5. A withdrawal is paid at most once. (Holds from Phase 6: one payout row
+   per withdrawal and one payout per outpoint are schema constraints; the
+   Goldcoin UTXO set is the final arbiter — ADR-0013.)
+6. A payout output equals the burned amount exactly — the vault absorbs the
+   fee, so a user never receives less than they burned (6, owner decision
+   D3; enforced in the pre-signing guards).
+7. A signed payout's bytes and txid are durable before any broadcast, so a
+   lost broadcast response is always reconcilable and never re-derived.

@@ -47,11 +47,58 @@ pub enum DbError {
          recovery does not apply"
     )]
     NotIntegrityHalted { deposit_id: i64, found: String },
+
+    // ---- Withdrawal side (Phase 6, ADR-0013) ----
+    #[error("unknown withdrawal state {0:?} in database row")]
+    UnknownWithdrawalState(String),
+    #[error("no withdrawal request {0} in database")]
+    WithdrawalNotFound(i64),
+    #[error("no payout row for withdrawal {0} — cannot verify or sign")]
+    MissingPayout(i64),
+    #[error(
+        "payout integrity mismatch for withdrawal {withdrawal_index}: recomputed canonical payout \
+         no longer matches the stored commitment (field: {field})"
+    )]
+    PayoutIntegrityMismatch {
+        withdrawal_index: i64,
+        field: &'static str,
+    },
+    #[error(
+        "withdrawal {withdrawal_index} reservation is no longer valid ({reason}) — refusing to sign"
+    )]
+    ReservationInvalid {
+        withdrawal_index: i64,
+        reason: &'static str,
+    },
+    #[error("withdrawal {0} already has a completed payout — refusing to sign again")]
+    PayoutAlreadyCompleted(i64),
+    #[error("withdrawal {0} already has a confirmed payout transaction — refusing to sign again")]
+    PayoutAlreadyConfirmed(i64),
+    #[error("insufficient spendable vault funds: need {required} atomic, have {available}")]
+    InsufficientVaultFunds { required: u64, available: u64 },
+    #[error("operator recovery of withdrawal {0} requires a non-empty operator note")]
+    WithdrawalOperatorNoteRequired(i64),
+    #[error(
+        "withdrawal {withdrawal_index} cannot be recovered directly to {to_state}: an operator may \
+         only return an integrity-halted withdrawal to Validated or Failed"
+    )]
+    InvalidWithdrawalRecoveryTarget {
+        withdrawal_index: i64,
+        to_state: &'static str,
+    },
+    #[error(
+        "withdrawal {withdrawal_index} is in state {found}, not IntegrityHalted — operator \
+         integrity recovery does not apply"
+    )]
+    NotWithdrawalIntegrityHalted {
+        withdrawal_index: i64,
+        found: String,
+    },
 }
 
 /// Current schema version this build understands. Bumping this must be
 /// paired with a migration step in [`Db::run_migrations`].
-const CURRENT_SCHEMA_VERSION: i64 = 3;
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 /// The eight states of the deposit lifecycle (ADR-0011, extended by
 /// ADR-0012 with `IntegrityHalted`). `Submitted`/`Minted` are written from
@@ -251,7 +298,7 @@ fn diff_claim_fields(recomputed: &[u8], stored: &[u8]) -> Option<String> {
 }
 
 pub struct Db {
-    conn: Connection,
+    pub(super) conn: Connection,
 }
 
 impl Db {
@@ -303,6 +350,7 @@ impl Db {
                 1 => apply_v1_schema(&tx)?,
                 2 => apply_v2_schema(&tx)?,
                 3 => apply_v3_schema(&tx)?,
+                4 => super::withdrawal_db::apply_v4_schema(&tx)?,
                 other => unreachable!("no migration defined for schema version {other}"),
             }
         }

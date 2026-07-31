@@ -30,6 +30,10 @@ use glc_relayer::orchestrator::{Orchestrator, OrchestratorError};
 use glc_relayer::signer;
 use glc_relayer::solana::config::{RawSolanaConfig, SolanaConfig};
 use glc_relayer::solana::rpc::RealSolanaRpc;
+use glc_relayer::withdrawal::adapter::RealPayoutRpc;
+use glc_relayer::withdrawal::config::{RawWithdrawalConfig, WithdrawalConfig};
+use glc_relayer::withdrawal::discovery;
+use glc_relayer::withdrawal::executor::{ExecutorError, WithdrawalExecutor};
 
 fn env_required(name: &str) -> anyhow::Result<String> {
     std::env::var(name)
@@ -153,6 +157,121 @@ fn solana_config_from_env(program_id_bytes: [u8; 32]) -> anyhow::Result<SolanaCo
     };
 
     SolanaConfig::validate(raw).map_err(|e| anyhow::anyhow!("invalid Solana configuration: {e}"))
+}
+
+/// Assembles [`WithdrawalConfig`] (Phase 6, ADR-0013) from environment
+/// variables. Nothing here has a silent default: the fee rate (D4), the
+/// confirmation depth (D7) and the discovery commitment (D5) must all be
+/// stated explicitly, and the commitment must be exactly `finalized`.
+fn withdrawal_config_from_env() -> anyhow::Result<WithdrawalConfig> {
+    let raw = RawWithdrawalConfig {
+        vault_address: env_required("GLC_VAULT_ADDRESS")?,
+        change_address: env_required("GLC_VAULT_CHANGE_ADDRESS")?,
+        fee_rate_per_kb: env_required_u64("GLC_PAYOUT_FEE_RATE_PER_KB")?,
+        dust_threshold_atomic: env_required_u64("GLC_PAYOUT_DUST_THRESHOLD_ATOMIC")?,
+        vault_min_confirmations: env_required_u64("GLC_VAULT_MIN_CONFIRMATIONS")? as i64,
+        confirmation_depth: env_required_u64("GLC_WITHDRAWAL_CONFIRMATION_DEPTH")? as i64,
+        max_inputs_per_payout: env_required_u64("GLC_PAYOUT_MAX_INPUTS")? as usize,
+        reservation_timeout_secs: env_required_u64("GLC_PAYOUT_RESERVATION_TIMEOUT_SECS")? as i64,
+        discovery_commitment: env_required("GLC_WITHDRAWAL_DISCOVERY_COMMITMENT")?,
+        poll_interval_ms: env_optional_u64("GLC_WITHDRAWAL_POLL_INTERVAL_MS", 5_000)?,
+    };
+    WithdrawalConfig::validate(raw)
+        .map_err(|e| anyhow::anyhow!("invalid withdrawal configuration: {e}"))
+}
+
+/// The withdrawal executor's tick loop (Phase 6), the third long-running
+/// service alongside the indexer and the mint orchestrator.
+///
+/// Discovery and execution share one task on purpose: the executor is
+/// single-threaded by design (owner decision D8), so scanning Solana and
+/// driving payouts are strictly sequential and no two ticks can ever
+/// overlap on the same vault.
+#[allow(clippy::too_many_arguments)]
+async fn run_withdrawal_loop(
+    mut executor: WithdrawalExecutor<RealPayoutRpc>,
+    solana_rpc: RealSolanaRpc,
+    program_id: Pubkey,
+    config: WithdrawalConfig,
+    poll_interval: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                tracing::info!("withdrawal loop: shutdown signal received, exiting");
+                return Ok(());
+            }
+            result = withdrawal_tick(&mut executor, &solana_rpc, &program_id, &config) => {
+                match result {
+                    Ok(()) => tokio::time::sleep(poll_interval).await,
+                    Err(WithdrawalTickError::Executor(ExecutorError::Db(e))) => {
+                        tracing::error!(error = %e, "withdrawal database error — exiting");
+                        return Err(e.into());
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "withdrawal tick failed; retrying next tick");
+                        tokio::time::sleep(poll_interval).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum WithdrawalTickError {
+    #[error("withdrawal discovery failed: {0}")]
+    Discovery(#[from] glc_relayer::solana::rpc::SolanaRpcError),
+    #[error(transparent)]
+    Executor(#[from] ExecutorError),
+}
+
+/// One discovery + execution pass. A discovery failure is NOT fatal and does
+/// not skip execution of already-known withdrawals: a Solana outage must not
+/// strand payouts that were discovered before it started.
+async fn withdrawal_tick(
+    executor: &mut WithdrawalExecutor<RealPayoutRpc>,
+    solana_rpc: &RealSolanaRpc,
+    program_id: &Pubkey,
+    config: &WithdrawalConfig,
+) -> Result<(), WithdrawalTickError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    match discovery::scan_withdrawals(solana_rpc, program_id, config.discovery_commitment, now, 0)
+        .await
+    {
+        Ok(found) => {
+            let n = executor.ingest_discovered(&found)?;
+            if n > 0 {
+                tracing::info!(new_withdrawals = n, "observed new withdrawal requests");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "withdrawal discovery failed; continuing with known work");
+        }
+    }
+
+    let report = executor.tick().await?;
+    if report.completed > 0 || report.signed > 0 || report.halted > 0 || report.failed > 0 {
+        tracing::info!(
+            validated = report.validated,
+            awaiting_funds = report.awaiting_funds,
+            built = report.built,
+            signed = report.signed,
+            broadcast = report.broadcast,
+            confirming = report.confirming,
+            completed = report.completed,
+            halted = report.halted,
+            failed = report.failed,
+            orphaned = report.orphaned,
+            "withdrawal tick"
+        );
+    }
+    Ok(())
 }
 
 /// The Goldcoin indexer's tick loop (Phase 4), run as an independent task
@@ -279,6 +398,7 @@ async fn main() -> anyhow::Result<()> {
 
     let db = Db::open(&config.db_path)?;
     tracing::info!(schema_version = db.schema_version()?, "database ready");
+    let rpc_for_payouts = config.rpc.clone();
     let rpc = RpcClient::new(&config.rpc)?;
     let poll_interval = Duration::from_millis(config.poll_interval_ms);
     let unavailable_interval = Duration::from_millis(config.node_unavailable_retry_interval_ms);
@@ -315,6 +435,20 @@ async fn main() -> anyhow::Result<()> {
         validator_keys,
     );
 
+    // Third service: the Goldcoin withdrawal executor (Phase 6, ADR-0013).
+    let withdrawal_config = withdrawal_config_from_env()?;
+    tracing::info!(
+        vault_address = %withdrawal_config.vault_address,
+        confirmation_depth = withdrawal_config.confirmation_depth,
+        fee_rate_per_kb = withdrawal_config.fee_rate_per_kb,
+        "glc-relayer: starting Goldcoin withdrawal executor (regtest custody — ADR-0013)"
+    );
+    let withdrawal_poll_interval = Duration::from_millis(withdrawal_config.poll_interval_ms);
+    let payout_rpc = RealPayoutRpc::new(RpcClient::new(&rpc_for_payouts)?);
+    let withdrawal_executor =
+        WithdrawalExecutor::new(Db::open(&db_path)?, payout_rpc, withdrawal_config.clone());
+    let discovery_rpc = RealSolanaRpc::new(solana_config.rpc_url.clone(), solana_config.commitment);
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut indexer_task = tokio::spawn(run_indexer_loop(
         indexer,
@@ -325,6 +459,14 @@ async fn main() -> anyhow::Result<()> {
     let mut orchestrator_task = tokio::spawn(run_orchestrator_loop(
         orchestrator,
         orchestrator_poll_interval,
+        shutdown_rx.clone(),
+    ));
+    let mut withdrawal_task = tokio::spawn(run_withdrawal_loop(
+        withdrawal_executor,
+        discovery_rpc,
+        solana_config.program_id,
+        withdrawal_config,
+        withdrawal_poll_interval,
         shutdown_rx,
     ));
 
@@ -334,22 +476,29 @@ async fn main() -> anyhow::Result<()> {
     // after its sibling has already exited.
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
-            tracing::info!("shutdown signal received, stopping both loops");
+            tracing::info!("shutdown signal received, stopping all three services");
             let _ = shutdown_tx.send(true);
-            let (indexer_result, orchestrator_result) = tokio::join!(indexer_task, orchestrator_task);
-            indexer_result??;
-            orchestrator_result??;
+            let (i, o, w) = tokio::join!(indexer_task, orchestrator_task, withdrawal_task);
+            i??;
+            o??;
+            w??;
         }
         result = &mut indexer_task => {
-            tracing::error!("indexer loop exited, stopping orchestrator loop");
+            tracing::error!("indexer loop exited, stopping the other services");
             let _ = shutdown_tx.send(true);
-            let _ = orchestrator_task.await;
+            let _ = tokio::join!(orchestrator_task, withdrawal_task);
             result??;
         }
         result = &mut orchestrator_task => {
-            tracing::error!("orchestrator loop exited, stopping indexer loop");
+            tracing::error!("orchestrator loop exited, stopping the other services");
             let _ = shutdown_tx.send(true);
-            let _ = indexer_task.await;
+            let _ = tokio::join!(indexer_task, withdrawal_task);
+            result??;
+        }
+        result = &mut withdrawal_task => {
+            tracing::error!("withdrawal loop exited, stopping the other services");
+            let _ = shutdown_tx.send(true);
+            let _ = tokio::join!(indexer_task, orchestrator_task);
             result??;
         }
     }

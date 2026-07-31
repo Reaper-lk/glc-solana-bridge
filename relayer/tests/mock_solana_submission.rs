@@ -119,6 +119,21 @@ impl SolanaRpc for MockRpc {
         Ok(state.accounts.get(pubkey).cloned())
     }
 
+    async fn get_program_accounts_sized(
+        &self,
+        program_id: &Pubkey,
+        data_len: u64,
+        _commitment: solana_sdk::commitment_config::CommitmentLevel,
+    ) -> Result<Vec<(Pubkey, Account)>, SolanaRpcError> {
+        let state = self.0.lock().unwrap();
+        Ok(state
+            .accounts
+            .iter()
+            .filter(|(_, a)| a.owner == *program_id && a.data.len() as u64 == data_len)
+            .map(|(k, a)| (*k, a.clone()))
+            .collect())
+    }
+
     async fn get_latest_blockhash(&self) -> Result<Hash, SolanaRpcError> {
         Ok(Hash::default())
     }
