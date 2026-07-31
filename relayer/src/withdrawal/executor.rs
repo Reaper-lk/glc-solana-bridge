@@ -87,9 +87,17 @@ pub trait PayoutRpc {
         hex: &str,
     ) -> impl std::future::Future<Output = Result<DecodedTx, RpcError>> + Send;
 
+    /// Signs, supplying the previous outputs with their `redeemScript`.
+    ///
+    /// `prevtxs` is required, not optional: verified against a real node,
+    /// the bare `signrawtransaction(hex)` form cannot sign a P2SH multisig
+    /// input (ADR-0015). A partial result returns `complete: false`, and a
+    /// partial transaction is rejected by the network, so an incomplete
+    /// signature can never move funds.
     fn sign_raw_transaction(
         &self,
         hex: &str,
+        prevtxs: &[crate::glc::rpc::PrevTx],
     ) -> impl std::future::Future<Output = Result<(String, bool), RpcError>> + Send;
 
     fn send_raw_transaction(
@@ -303,6 +311,24 @@ impl<R: PayoutRpc> WithdrawalExecutor<R> {
         Ok(())
     }
 
+    /// Designates which M of the vault's N signers will sign this payout.
+    ///
+    /// Deterministic by withdrawal index, so every validator independently
+    /// derives the same designation without negotiating, and so a replay
+    /// produces the same quorum — and therefore the same txid (ADR-0015 §2).
+    /// Reassignment when a designated signer is unavailable is explicit and
+    /// audited (`Db::reassign_payout_quorum`), never an implicit fallback.
+    fn designate_quorum(&self, index: i64) -> Vec<u8> {
+        let n = self.config.vault.signer_count();
+        let m = self.config.vault.threshold;
+        let start = (index.unsigned_abs() as usize) % n;
+        let mut picked: Vec<u8> = (0..m).map(|k| ((start + k) % n) as u8).collect();
+        // Ascending order is part of the canonical encoding, so a quorum has
+        // exactly one representation.
+        picked.sort_unstable();
+        picked
+    }
+
     async fn build(
         &mut self,
         index: i64,
@@ -391,7 +417,10 @@ impl<R: PayoutRpc> WithdrawalExecutor<R> {
         let plan = PayoutPlan {
             dest_hash160: w.glc_address_hash160,
             payout_atomic: w.amount_atomic, // D3: exactly the burned amount
-            change_hash160: change_h160,
+            // Change returns to the P2SH vault, so its script is
+            // `a914..87`, never the P2PKH shape (ADR-0015).
+            change_script_hex: (selection.change_atomic > 0)
+                .then(|| self.config.vault.script_pubkey_hex()),
             change_atomic: selection.change_atomic,
             fee_atomic: selection.fee_atomic,
             inputs: selection.inputs.clone(),
@@ -414,18 +443,32 @@ impl<R: PayoutRpc> WithdrawalExecutor<R> {
             return Ok(());
         }
 
+        // ADR-0015: the signing quorum is designated NOW, before any
+        // signature exists, so the resulting txid is deterministic and the
+        // ADR-0013 persist-txid-before-broadcast model still holds.
+        let quorum = self.designate_quorum(index);
+        self.config
+            .vault
+            .validate_quorum(&quorum)
+            .map_err(|e| ExecutorError::Rpc(RpcError::Malformed(e.to_string())))?;
         let intent = canonical_payout_intent(
             w.protocol_version,
             index,
+            &self.config.vault.script_hash160,
             &w.glc_address_hash160,
             w.amount_atomic,
             selection.fee_atomic,
             selection.change_atomic,
             &change_h160.unwrap_or([0u8; 20]),
+            0,
+            &quorum,
             &selection.inputs,
         );
         self.db.create_payout(&NewPayout {
             withdrawal_index: index,
+            vault_script_hash: self.config.vault.script_hash160,
+            quorum_indices: quorum,
+            quorum_attempt: 0,
             commitment_hash: payout_commitment(&intent),
             intent_bytes: intent,
             fee_atomic: selection.fee_atomic,
@@ -466,14 +509,29 @@ impl<R: PayoutRpc> WithdrawalExecutor<R> {
             }
         };
 
+        // Every input needs its previous output and the vault's redeem
+        // script for a P2SH signature to be constructible at all.
+        let prevtxs: Vec<crate::glc::rpc::PrevTx> = signable
+            .inputs
+            .iter()
+            .map(|u| crate::glc::rpc::PrevTx {
+                txid: u.txid_hex.clone(),
+                vout: u.vout,
+                script_pub_key: self.config.vault.script_pubkey_hex(),
+                redeem_script: self.config.vault.redeem_script_hex(),
+            })
+            .collect();
         let (signed_hex, complete) = self
             .rpc
-            .sign_raw_transaction(&signable.unsigned_tx_hex)
+            .sign_raw_transaction(&signable.unsigned_tx_hex, &prevtxs)
             .await
             .map_err(classify)?;
         if !complete {
-            // signrawtransaction reports incomplete when an input is
-            // unspendable or already gone — a conflict, not a retry.
+            // Incomplete means the designated quorum has not fully signed,
+            // or an input is gone. Either way the bytes cannot move funds
+            // (the network rejects partials), and silently retrying with a
+            // different quorum is exactly what ADR-0015 forbids — that is
+            // an explicit, audited reassignment.
             self.db.transition_withdrawal(
                 index,
                 WithdrawalState::IntegrityHalted,

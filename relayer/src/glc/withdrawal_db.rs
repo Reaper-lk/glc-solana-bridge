@@ -23,6 +23,38 @@ use sha2::{Digest, Sha256};
 use super::db::{Db, DbError};
 use super::hex;
 
+/// v5 (Phase 7b, ADR-0015): the designated signing quorum and the vault the
+/// payout is bound to.
+///
+/// `quorum_attempt` makes an explicit reassignment produce a different
+/// commitment; `superseded_at` records that a previous attempt existed
+/// rather than overwriting it, so reassignment is auditable.
+pub(super) fn apply_v5_schema(tx: &rusqlite::Transaction) -> Result<(), DbError> {
+    tx.execute_batch(
+        "
+        ALTER TABLE withdrawal_payouts ADD COLUMN vault_script_hash BLOB;
+        ALTER TABLE withdrawal_payouts ADD COLUMN quorum_attempt INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE withdrawal_payouts ADD COLUMN quorum_indices BLOB;
+
+        -- Append-only record of superseded quorum designations.
+        CREATE TABLE withdrawal_quorum_history (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            withdrawal_index INTEGER NOT NULL
+                             REFERENCES withdrawal_requests(withdrawal_index),
+            quorum_attempt   INTEGER NOT NULL,
+            quorum_indices   BLOB NOT NULL,
+            commitment_hash  BLOB NOT NULL,
+            superseded_at    INTEGER NOT NULL,
+            reason           TEXT NOT NULL,
+            UNIQUE (withdrawal_index, quorum_attempt)
+        );
+        CREATE INDEX idx_withdrawal_quorum_history_index
+            ON withdrawal_quorum_history(withdrawal_index);
+        ",
+    )?;
+    Ok(())
+}
+
 /// v4 (Phase 6, ADR-0013): the withdrawal executor's persistent state.
 pub(super) fn apply_v4_schema(tx: &rusqlite::Transaction) -> Result<(), DbError> {
     tx.execute_batch(
@@ -300,6 +332,15 @@ pub struct ObservedUtxo {
 #[derive(Debug, Clone)]
 pub struct NewPayout {
     pub withdrawal_index: i64,
+    /// The vault this payout spends from; binds the intent to one exact
+    /// redeem script (ADR-0015).
+    pub vault_script_hash: [u8; 20],
+    /// Designated signers, as ascending indices into the vault's ordered
+    /// signer list. Fixed before any signature is collected so the txid is
+    /// deterministic in advance.
+    pub quorum_indices: Vec<u8>,
+    /// Increments on every explicit reassignment.
+    pub quorum_attempt: u32,
     pub commitment_hash: [u8; 32],
     /// The canonical intent preimage the commitment covers. Stored so a
     /// mismatch can be attributed to specific field(s) and so the stored
@@ -318,6 +359,9 @@ pub struct NewPayout {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PayoutRow {
     pub withdrawal_index: i64,
+    /// Designated signers and the reassignment counter (ADR-0015).
+    pub quorum_indices: Vec<u8>,
+    pub quorum_attempt: u32,
     pub commitment_hash: [u8; 32],
     pub fee_atomic: u64,
     pub payout_atomic: u64,
@@ -344,41 +388,75 @@ pub struct SignablePayout {
     pub change_atomic: u64,
     pub change_address: Option<String>,
     pub glc_address_hash160: [u8; 20],
+    /// The vault this payout spends from.
+    pub vault_script_hash: [u8; 20],
+    /// The designated signers, ascending. Only these may contribute.
+    pub quorum_indices: Vec<u8>,
+    pub quorum_attempt: u32,
     pub inputs: Vec<VaultUtxo>,
     /// The freshly recomputed commitment — equal to the stored one, else
     /// this value would never have been returned.
     pub commitment_hash: [u8; 32],
 }
 
-/// The canonical payout intent (ADR-0013). Domain-separated and
-/// deterministic; this is the byte string the commitment hashes.
+/// The canonical payout intent (ADR-0013, extended to v2 by ADR-0015).
+///
+/// Domain-separated and deterministic; this is the byte string the
+/// commitment hashes.
 ///
 /// Layout (all integers little-endian):
 /// `b"GLC_BRIDGE_PAYOUT"`(17) ‖ protocol_version(1) ‖ withdrawal_index(8)
-/// ‖ dest_hash160(20) ‖ payout(8) ‖ fee(8) ‖ change(8) ‖ change_hash160(20)
+/// ‖ vault_script_hash(20) ‖ dest_hash160(20)
+/// ‖ payout(8) ‖ fee(8) ‖ change(8) ‖ change_hash160(20)
+/// ‖ quorum_attempt(4) ‖ quorum_count(1) ‖ quorum_indices(1 each)
 /// ‖ input_count(4) ‖ [ txid(32) ‖ vout(4) ‖ amount(8) ]*
+///
+/// # Why the quorum is inside the commitment (ADR-0015 §2)
+///
+/// Verified on a real node: with M-of-N multisig, the same inputs and
+/// outputs signed by *different quorums* produce *different txids* (signing
+/// order is irrelevant; signing set is not). ADR-0013's recovery model
+/// persists the txid **before** broadcasting, so the quorum must be fixed
+/// before any signature is collected — otherwise the txid is unknowable in
+/// advance and two overlapping quorums could each produce a valid, distinct
+/// transaction spending the same inputs.
+///
+/// `vault_script_hash` pins the exact redeem script, which fixes the signer
+/// list and its order, so a one-byte index per designated signer is
+/// unambiguous. `quorum_attempt` makes an explicit reassignment produce a
+/// different commitment, so signatures gathered for a superseded quorum can
+/// never be replayed into its replacement.
 pub const PAYOUT_DOMAIN_TAG: &[u8; 17] = b"GLC_BRIDGE_PAYOUT";
 
 #[allow(clippy::too_many_arguments)]
 pub fn canonical_payout_intent(
     protocol_version: u8,
     withdrawal_index: i64,
+    vault_script_hash: &[u8; 20],
     dest_hash160: &[u8; 20],
     payout_atomic: u64,
     fee_atomic: u64,
     change_atomic: u64,
     change_hash160: &[u8; 20],
+    quorum_attempt: u32,
+    quorum_indices: &[u8],
     inputs: &[VaultUtxo],
 ) -> Vec<u8> {
-    let mut m = Vec::with_capacity(17 + 1 + 8 + 20 + 24 + 20 + 4 + inputs.len() * 44);
+    let mut m = Vec::with_capacity(
+        17 + 1 + 8 + 40 + 24 + 20 + 9 + quorum_indices.len() + inputs.len() * 44,
+    );
     m.extend_from_slice(PAYOUT_DOMAIN_TAG);
     m.push(protocol_version);
     m.extend_from_slice(&withdrawal_index.to_le_bytes());
+    m.extend_from_slice(vault_script_hash);
     m.extend_from_slice(dest_hash160);
     m.extend_from_slice(&payout_atomic.to_le_bytes());
     m.extend_from_slice(&fee_atomic.to_le_bytes());
     m.extend_from_slice(&change_atomic.to_le_bytes());
     m.extend_from_slice(change_hash160);
+    m.extend_from_slice(&quorum_attempt.to_le_bytes());
+    m.push(quorum_indices.len() as u8);
+    m.extend_from_slice(quorum_indices);
     m.extend_from_slice(&(inputs.len() as u32).to_le_bytes());
     for i in inputs {
         m.extend_from_slice(&i.txid);
@@ -399,19 +477,24 @@ const PAYOUT_FIELD_LAYOUT: &[(&str, usize, usize)] = &[
     ("domain_tag", 0, 17),
     ("protocol_version", 17, 18),
     ("withdrawal_index", 18, 26),
-    ("dest_hash160", 26, 46),
-    ("payout_atomic", 46, 54),
-    ("fee_atomic", 54, 62),
-    ("change_atomic", 62, 70),
-    ("change_hash160", 70, 90),
-    ("input_count", 90, 94),
+    ("vault_script_hash", 26, 46),
+    ("dest_hash160", 46, 66),
+    ("payout_atomic", 66, 74),
+    ("fee_atomic", 74, 82),
+    ("change_atomic", 82, 90),
+    ("change_hash160", 90, 110),
+    ("quorum_attempt", 110, 114),
 ];
+
+/// Length of the fixed-size prefix of a canonical payout intent. Everything
+/// after it (quorum indices, then inputs) is variable-length.
+pub const PAYOUT_INTENT_FIXED_LEN: usize = 114;
 
 /// Names the intent field(s) in which `recomputed` and `stored` differ.
 /// Returns `Some("inputs")` when only the variable-length input list
 /// differs, and `None` when attribution is impossible.
 pub fn diff_payout_fields(recomputed: &[u8], stored: &[u8]) -> Option<String> {
-    const FIXED: usize = 94;
+    const FIXED: usize = PAYOUT_INTENT_FIXED_LEN;
     if recomputed.len() < FIXED || stored.len() < FIXED {
         return None;
     }
@@ -421,7 +504,9 @@ pub fn diff_payout_fields(recomputed: &[u8], stored: &[u8]) -> Option<String> {
         .map(|(n, _, _)| *n)
         .collect();
     if recomputed[FIXED..] != stored[FIXED..] {
-        differing.push("inputs");
+        // The tail carries the designated quorum then the input set; a
+        // change in either is a different payout.
+        differing.push("quorum_or_inputs");
     }
     if differing.is_empty() {
         None
@@ -741,8 +826,9 @@ impl Db {
         tx.execute(
             "INSERT INTO withdrawal_payouts
                 (withdrawal_index, commitment_hash, intent_bytes, fee_atomic, payout_atomic,
-                 change_atomic, change_address, unsigned_tx_hex, built_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 change_atomic, change_address, unsigned_tx_hex, built_at,
+                 vault_script_hash, quorum_attempt, quorum_indices)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 p.withdrawal_index,
                 p.commitment_hash.as_slice(),
@@ -752,7 +838,10 @@ impl Db {
                 p.change_atomic.to_le_bytes().as_slice(),
                 p.change_address,
                 p.unsigned_tx_hex,
-                p.built_at
+                p.built_at,
+                p.vault_script_hash.as_slice(),
+                p.quorum_attempt,
+                p.quorum_indices.as_slice(),
             ],
         )?;
         for (i, u) in p.inputs.iter().enumerate() {
@@ -777,7 +866,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT withdrawal_index, commitment_hash, fee_atomic, payout_atomic, change_atomic,
                     change_address, unsigned_tx_hex, signed_tx_hex, txid_hex, mined_block_hash,
-                    mined_height, confirmations, completed_at
+                    mined_height, confirmations, completed_at, quorum_indices, quorum_attempt
              FROM withdrawal_payouts WHERE withdrawal_index = ?1",
         )?;
         let row = stmt.query_row(params![index], row_to_payout).optional()?;
@@ -867,6 +956,9 @@ impl Db {
             confirmations,
             completed_at,
             stored_intent,
+            stored_vault_hash,
+            stored_quorum_attempt,
+            stored_quorum,
         ): (
             Vec<u8>,
             Vec<u8>,
@@ -878,11 +970,15 @@ impl Db {
             i64,
             Option<i64>,
             Vec<u8>,
+            Vec<u8>,
+            u32,
+            Vec<u8>,
         ) = tx
             .query_row(
                 "SELECT commitment_hash, fee_atomic, payout_atomic, change_atomic,
                         change_address, unsigned_tx_hex, signed_tx_hex, confirmations,
-                        completed_at, intent_bytes
+                        completed_at, intent_bytes, vault_script_hash, quorum_attempt,
+                        quorum_indices
                  FROM withdrawal_payouts WHERE withdrawal_index = ?1",
                 params![index],
                 |r| {
@@ -897,6 +993,9 @@ impl Db {
                         r.get(7)?,
                         r.get(8)?,
                         r.get(9)?,
+                        r.get(10)?,
+                        r.get(11)?,
+                        r.get(12)?,
                     ))
                 },
             )
@@ -1044,11 +1143,14 @@ impl Db {
         let recomputed_intent = canonical_payout_intent(
             protocol_version,
             index,
+            &to_array20(&stored_vault_hash),
             &dest_hash160,
             payout_atomic,
             fee_atomic,
             change_atomic,
             &change_hash160,
+            stored_quorum_attempt,
+            &stored_quorum,
             &inputs,
         );
         let recomputed_hash = payout_commitment(&recomputed_intent);
@@ -1114,6 +1216,9 @@ impl Db {
             change_atomic,
             change_address,
             glc_address_hash160: dest_hash160,
+            vault_script_hash: to_array20(&stored_vault_hash),
+            quorum_indices: stored_quorum,
+            quorum_attempt: stored_quorum_attempt,
             inputs,
             commitment_hash: to_array32(&stored_commitment),
         })
@@ -1223,6 +1328,99 @@ impl Db {
         Ok(())
     }
 
+    /// Reassigns a payout's designated signing quorum (ADR-0015 §3).
+    ///
+    /// Explicit and auditable by construction: the superseded designation is
+    /// appended to `withdrawal_quorum_history` rather than overwritten, and
+    /// `quorum_attempt` increments so the new intent commits to different
+    /// bytes. Signatures gathered for the old quorum therefore cannot be
+    /// replayed into the new one.
+    ///
+    /// Refuses once the payout has been signed: at that point the txid is
+    /// durable and reconciliation depends on it, so the correct response to
+    /// a stuck signed payout is rebroadcast, never re-designation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reassign_payout_quorum(
+        &mut self,
+        index: i64,
+        new_quorum: &[u8],
+        new_commitment: &[u8; 32],
+        new_intent: &[u8],
+        new_unsigned_tx_hex: &str,
+        reason: &str,
+        at: i64,
+    ) -> Result<u32, DbError> {
+        if reason.trim().is_empty() {
+            return Err(DbError::WithdrawalOperatorNoteRequired(index));
+        }
+        let tx = self.conn.transaction()?;
+        let (signed, attempt, old_quorum, old_commitment): (Option<String>, u32, Vec<u8>, Vec<u8>) =
+            tx.query_row(
+                "SELECT signed_tx_hex, quorum_attempt, quorum_indices, commitment_hash
+                 FROM withdrawal_payouts WHERE withdrawal_index = ?1",
+                params![index],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?
+            .ok_or(DbError::MissingPayout(index))?;
+        if signed.is_some() {
+            return Err(DbError::ReservationInvalid {
+                withdrawal_index: index,
+                reason: "payout is already signed; its txid is durable and must be rebroadcast, not re-designated",
+            });
+        }
+        let next = attempt.checked_add(1).ok_or(DbError::ReservationInvalid {
+            withdrawal_index: index,
+            reason: "quorum attempt counter overflow",
+        })?;
+
+        tx.execute(
+            "INSERT INTO withdrawal_quorum_history
+                (withdrawal_index, quorum_attempt, quorum_indices, commitment_hash,
+                 superseded_at, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![index, attempt, old_quorum, old_commitment, at, reason],
+        )?;
+        tx.execute(
+            "UPDATE withdrawal_payouts
+                SET quorum_indices = ?1, quorum_attempt = ?2, commitment_hash = ?3,
+                    intent_bytes = ?4, unsigned_tx_hex = ?5
+              WHERE withdrawal_index = ?6",
+            params![
+                new_quorum,
+                next,
+                new_commitment.as_slice(),
+                new_intent,
+                new_unsigned_tx_hex,
+                index
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO withdrawal_state_log (withdrawal_index, from_state, to_state, at, reason)
+             VALUES (?1, ?2, ?2, ?3, ?4)",
+            params![
+                index,
+                WithdrawalState::Signing.as_str(),
+                at,
+                format!("quorum reassigned to attempt {next}: {reason}")
+            ],
+        )?;
+        tx.commit()?;
+        Ok(next)
+    }
+
+    /// Every superseded quorum designation, oldest first.
+    pub fn quorum_history(&self, index: i64) -> Result<Vec<(u32, Vec<u8>, String)>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT quorum_attempt, quorum_indices, reason FROM withdrawal_quorum_history
+             WHERE withdrawal_index = ?1 ORDER BY quorum_attempt",
+        )?;
+        let rows = stmt
+            .query_map(params![index], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// **The only sanctioned exit from a withdrawal `IntegrityHalted`.**
     ///
     /// Called from no automatic path. Requires a non-empty operator note,
@@ -1285,16 +1483,27 @@ impl Db {
 /// The change address's hash160, or all-zeroes when there is no change
 /// output. Reads from the payout row so the recomputation in
 /// `verify_and_load_signable_payout` uses persisted state only.
+///
+/// Version-agnostic: change returns to the vault, which is P2SH from Phase
+/// 7b (ADR-0015), so decoding it as P2PKH would fail. An undecodable stored
+/// address is an integrity failure and is surfaced as one — an earlier
+/// version silently substituted zeroes here, which turned a real
+/// misconfiguration into an unexplained commitment mismatch.
 fn change_hash160_of(tx: &rusqlite::Transaction, index: i64) -> Result<[u8; 20], DbError> {
     let addr: Option<String> = tx.query_row(
         "SELECT change_address FROM withdrawal_payouts WHERE withdrawal_index = ?1",
         params![index],
         |r| r.get(0),
     )?;
-    Ok(match addr {
-        None => [0u8; 20],
-        Some(a) => crate::withdrawal::address::decode_p2pkh_hash160(&a).unwrap_or([0u8; 20]),
-    })
+    match addr {
+        None => Ok([0u8; 20]),
+        Some(a) => crate::withdrawal::address::base58check_decode(&a)
+            .map(|(_version, h)| h)
+            .map_err(|_| DbError::PayoutIntegrityMismatch {
+                withdrawal_index: index,
+                field: "change_address_undecodable",
+            }),
+    }
 }
 
 fn row_to_withdrawal(r: &rusqlite::Row) -> rusqlite::Result<WithdrawalRow> {
@@ -1344,6 +1553,8 @@ fn row_to_payout(r: &rusqlite::Row) -> rusqlite::Result<PayoutRow> {
     let mined: Option<Vec<u8>> = r.get(9)?;
     Ok(PayoutRow {
         withdrawal_index: r.get(0)?,
+        quorum_indices: r.get::<_, Option<Vec<u8>>>(13)?.unwrap_or_default(),
+        quorum_attempt: r.get(14)?,
         commitment_hash: to_array32(&commitment),
         fee_atomic: u64_from(&fee),
         payout_atomic: u64_from(&payout),
@@ -1366,6 +1577,9 @@ mod tests {
 
     const DEST: [u8; 20] = [0xAA; 20];
     const CHANGE: [u8; 20] = [0xBB; 20];
+    const VAULT_HASH: [u8; 20] = [0xCC; 20];
+    /// A 2-of-3 vault's designated quorum, ascending (ADR-0015).
+    const QUORUM: &[u8] = &[0, 2];
 
     fn mem_db() -> Db {
         Db::open(std::path::Path::new(":memory:")).unwrap()
@@ -1420,11 +1634,25 @@ mod tests {
 
         let fee = 20_000u64;
         let change = inputs[0].amount_atomic - amount - fee;
-        let intent =
-            canonical_payout_intent(1, index, &DEST, amount, fee, change, &CHANGE, &inputs);
+        let intent = canonical_payout_intent(
+            1,
+            index,
+            &VAULT_HASH,
+            &DEST,
+            amount,
+            fee,
+            change,
+            &CHANGE,
+            0,
+            QUORUM,
+            &inputs,
+        );
         let commitment = payout_commitment(&intent);
         db.create_payout(&NewPayout {
             withdrawal_index: index,
+            vault_script_hash: VAULT_HASH,
+            quorum_indices: QUORUM.to_vec(),
+            quorum_attempt: 0,
             commitment_hash: commitment,
             intent_bytes: intent.clone(),
             fee_atomic: fee,
@@ -1470,15 +1698,16 @@ mod tests {
     }
 
     #[test]
-    fn schema_is_at_v4_and_withdrawal_tables_exist() {
+    fn schema_is_at_v5_and_withdrawal_tables_exist() {
         let db = mem_db();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 5);
         for t in [
             "withdrawal_requests",
             "withdrawal_payouts",
             "vault_utxos",
             "withdrawal_payout_inputs",
             "withdrawal_state_log",
+            "withdrawal_quorum_history",
         ] {
             db.raw()
                 .prepare(&format!("SELECT * FROM {t} LIMIT 1"))
@@ -1548,8 +1777,11 @@ mod tests {
         let (inputs, commitment) = ready_to_sign(&mut db, 1, 500_000);
         let dup = NewPayout {
             withdrawal_index: 1,
+            vault_script_hash: VAULT_HASH,
+            quorum_indices: QUORUM.to_vec(),
+            quorum_attempt: 0,
             commitment_hash: commitment,
-            intent_bytes: vec![0u8; 94],
+            intent_bytes: vec![0u8; 114],
             fee_atomic: 1,
             payout_atomic: 1,
             change_atomic: 0,
@@ -1572,8 +1804,11 @@ mod tests {
         db.observe_withdrawal(&new_withdrawal(2, 100)).unwrap();
         let p = NewPayout {
             withdrawal_index: 2,
+            vault_script_hash: VAULT_HASH,
+            quorum_indices: QUORUM.to_vec(),
+            quorum_attempt: 0,
             commitment_hash: [7u8; 32],
-            intent_bytes: vec![0u8; 94],
+            intent_bytes: vec![0u8; 114],
             fee_atomic: 1,
             payout_atomic: 100,
             change_atomic: 0,
@@ -2017,39 +2252,252 @@ mod tests {
         ));
     }
 
+    // -----------------------------------------------------------------
+    // Designated signing quorum and reassignment (Phase 7b, ADR-0015)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn the_signable_payout_carries_the_designated_quorum() {
+        // The signer must know exactly who is authorised to contribute,
+        // because the txid depends on the signing set.
+        let mut db = mem_db();
+        ready_to_sign(&mut db, 1, 500_000);
+        let s = db.verify_and_load_signable_payout(1, 2_000).unwrap();
+        assert_eq!(s.quorum_indices, QUORUM);
+        assert_eq!(s.quorum_attempt, 0);
+        assert_eq!(s.vault_script_hash, VAULT_HASH);
+    }
+
+    #[test]
+    fn a_mutated_quorum_is_caught_before_signing() {
+        // Swapping the designated signers changes which transaction would
+        // result, so it must never pass the pre-signing guards.
+        let mut db = mem_db();
+        ready_to_sign(&mut db, 1, 500_000);
+        db.raw()
+            .execute(
+                "UPDATE withdrawal_payouts SET quorum_indices = ?1 WHERE withdrawal_index = 1",
+                params![vec![1u8, 2u8].as_slice()],
+            )
+            .unwrap();
+        assert!(matches!(
+            db.verify_and_load_signable_payout(1, 2_000).unwrap_err(),
+            DbError::PayoutIntegrityMismatch { .. }
+        ));
+        assert_halted(&db, 1, "commitment_mismatch");
+    }
+
+    #[test]
+    fn a_mutated_vault_binding_is_caught_before_signing() {
+        let mut db = mem_db();
+        ready_to_sign(&mut db, 1, 500_000);
+        db.raw()
+            .execute(
+                "UPDATE withdrawal_payouts SET vault_script_hash = ?1 WHERE withdrawal_index = 1",
+                params![[0xEEu8; 20].as_slice()],
+            )
+            .unwrap();
+        assert!(db.verify_and_load_signable_payout(1, 2_000).is_err());
+        assert_halted(&db, 1, "commitment_mismatch");
+    }
+
+    #[test]
+    fn a_bumped_attempt_counter_alone_is_caught_before_signing() {
+        // The attempt is inside the commitment, so a silent bump — without
+        // a matching intent — must not pass.
+        let mut db = mem_db();
+        ready_to_sign(&mut db, 1, 500_000);
+        db.raw()
+            .execute(
+                "UPDATE withdrawal_payouts SET quorum_attempt = 1 WHERE withdrawal_index = 1",
+                [],
+            )
+            .unwrap();
+        assert!(db.verify_and_load_signable_payout(1, 2_000).is_err());
+        assert_halted(&db, 1, "commitment_mismatch");
+    }
+
+    /// Rebuilds a coherent intent for a new quorum, as the executor would.
+    fn reassign(db: &mut Db, index: i64, new_quorum: &[u8], reason: &str) -> u32 {
+        let inputs = db.payout_inputs(index).unwrap();
+        let p = db.get_payout(index).unwrap().unwrap();
+        let w = db.get_withdrawal(index).unwrap().unwrap();
+        let attempt = p.quorum_attempt + 1;
+        let intent = canonical_payout_intent(
+            w.protocol_version,
+            index,
+            &VAULT_HASH,
+            &w.glc_address_hash160,
+            p.payout_atomic,
+            p.fee_atomic,
+            p.change_atomic,
+            &CHANGE,
+            attempt,
+            new_quorum,
+            &inputs,
+        );
+        db.reassign_payout_quorum(
+            index,
+            new_quorum,
+            &payout_commitment(&intent),
+            &intent,
+            "0100rebuilt",
+            reason,
+            5_000,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn reassignment_produces_a_new_attempt_that_still_verifies() {
+        let mut db = mem_db();
+        ready_to_sign(&mut db, 1, 500_000);
+        let next = reassign(&mut db, 1, &[1, 2], "signer 0 unavailable");
+        assert_eq!(next, 1);
+
+        let s = db.verify_and_load_signable_payout(1, 6_000).unwrap();
+        assert_eq!(s.quorum_indices, vec![1, 2], "the new quorum is in force");
+        assert_eq!(s.quorum_attempt, 1);
+    }
+
+    #[test]
+    fn reassignment_is_recorded_not_overwritten() {
+        let mut db = mem_db();
+        let (_, commitment) = {
+            ready_to_sign(&mut db, 1, 500_000);
+            let p = db.get_payout(1).unwrap().unwrap();
+            (p.quorum_attempt, p.commitment_hash)
+        };
+        reassign(&mut db, 1, &[1, 2], "signer 0 offline");
+        reassign(&mut db, 1, &[0, 1], "signer 2 offline");
+
+        let history = db.quorum_history(1).unwrap();
+        assert_eq!(history.len(), 2, "every superseded designation is kept");
+        assert_eq!(history[0].0, 0);
+        assert_eq!(history[0].1, QUORUM);
+        assert_eq!(history[0].2, "signer 0 offline");
+        assert_eq!(history[1].0, 1);
+        assert_eq!(history[1].1, vec![1, 2]);
+        // The original commitment is preserved in the audit trail.
+        assert_eq!(
+            db.raw()
+                .query_row(
+                    "SELECT commitment_hash FROM withdrawal_quorum_history
+                     WHERE withdrawal_index = 1 AND quorum_attempt = 0",
+                    [],
+                    |r| r.get::<_, Vec<u8>>(0)
+                )
+                .unwrap(),
+            commitment.to_vec()
+        );
+    }
+
+    #[test]
+    fn reassignment_requires_a_reason() {
+        // A re-designation with no stated cause is not auditable.
+        let mut db = mem_db();
+        ready_to_sign(&mut db, 1, 500_000);
+        assert!(matches!(
+            db.reassign_payout_quorum(1, &[1, 2], &[0u8; 32], &[0u8; 114], "x", "   ", 5_000),
+            Err(DbError::WithdrawalOperatorNoteRequired(1))
+        ));
+    }
+
+    #[test]
+    fn a_signed_payout_can_never_be_re_designated() {
+        // Once signed, the txid is durable and reconciliation depends on it:
+        // the correct response to a stuck payout is rebroadcast, never a new
+        // quorum that would produce a different transaction.
+        let mut db = mem_db();
+        ready_to_sign(&mut db, 1, 500_000);
+        db.verify_and_load_signable_payout(1, 2_000).unwrap();
+        db.record_signed_payout(1, "0100signed", &[0xAB; 32], 3_000)
+            .unwrap();
+        assert!(matches!(
+            db.reassign_payout_quorum(
+                1,
+                &[1, 2],
+                &[0u8; 32],
+                &[0u8; 114],
+                "x",
+                "signer went offline",
+                5_000
+            ),
+            Err(DbError::ReservationInvalid { .. })
+        ));
+        assert_eq!(db.quorum_history(1).unwrap().len(), 0);
+    }
+
     #[test]
     fn canonical_intent_layout_is_pinned() {
         let inputs = vec![utxo(1, 3, 42)];
-        let m = canonical_payout_intent(1, 7, &DEST, 500, 20, 480, &CHANGE, &inputs);
+        let m = canonical_payout_intent(
+            1,
+            7,
+            &VAULT_HASH,
+            &DEST,
+            500,
+            20,
+            480,
+            &CHANGE,
+            0,
+            QUORUM,
+            &inputs,
+        );
         assert_eq!(&m[0..17], PAYOUT_DOMAIN_TAG);
         assert_eq!(m[17], 1);
         assert_eq!(&m[18..26], &7i64.to_le_bytes());
-        assert_eq!(&m[26..46], &DEST);
-        assert_eq!(&m[46..54], &500u64.to_le_bytes());
-        assert_eq!(&m[54..62], &20u64.to_le_bytes());
-        assert_eq!(&m[62..70], &480u64.to_le_bytes());
-        assert_eq!(&m[70..90], &CHANGE);
-        assert_eq!(&m[90..94], &1u32.to_le_bytes());
-        assert_eq!(&m[94..126], &[1u8; 32]);
-        assert_eq!(&m[126..130], &3u32.to_le_bytes());
-        assert_eq!(&m[130..138], &42u64.to_le_bytes());
-        assert_eq!(m.len(), 94 + 44);
+        assert_eq!(&m[26..46], &VAULT_HASH);
+        assert_eq!(&m[46..66], &DEST);
+        assert_eq!(&m[66..74], &500u64.to_le_bytes());
+        assert_eq!(&m[74..82], &20u64.to_le_bytes());
+        assert_eq!(&m[82..90], &480u64.to_le_bytes());
+        assert_eq!(&m[90..110], &CHANGE);
+        assert_eq!(&m[110..114], &0u32.to_le_bytes(), "quorum_attempt");
+        assert_eq!(m[114], 2, "quorum_count");
+        assert_eq!(&m[115..117], QUORUM, "quorum indices, ascending");
+        assert_eq!(&m[117..121], &1u32.to_le_bytes(), "input_count");
+        assert_eq!(&m[121..153], &[1u8; 32]);
+        assert_eq!(m.len(), PAYOUT_INTENT_FIXED_LEN + 1 + 2 + 4 + 44);
     }
 
     #[test]
     fn diff_names_the_field_that_drifted() {
         let inputs = vec![utxo(1, 0, 42)];
-        let base = canonical_payout_intent(1, 7, &DEST, 500, 20, 480, &CHANGE, &inputs);
-        let fee_changed = canonical_payout_intent(1, 7, &DEST, 500, 21, 480, &CHANGE, &inputs);
+        let mk = |fee: u64, q: &[u8], ins: &[VaultUtxo], attempt: u32| {
+            canonical_payout_intent(
+                1,
+                7,
+                &VAULT_HASH,
+                &DEST,
+                500,
+                fee,
+                480,
+                &CHANGE,
+                attempt,
+                q,
+                ins,
+            )
+        };
+        let base = mk(20, QUORUM, &inputs, 0);
         assert_eq!(
-            diff_payout_fields(&fee_changed, &base).as_deref(),
+            diff_payout_fields(&mk(21, QUORUM, &inputs, 0), &base).as_deref(),
             Some("fee_atomic")
         );
-        let inputs2 = vec![utxo(2, 0, 42)];
-        let inputs_changed = canonical_payout_intent(1, 7, &DEST, 500, 20, 480, &CHANGE, &inputs2);
         assert_eq!(
-            diff_payout_fields(&inputs_changed, &base).as_deref(),
-            Some("inputs")
+            diff_payout_fields(&mk(20, QUORUM, &inputs, 1), &base).as_deref(),
+            Some("quorum_attempt"),
+            "a reassignment must be visible as its own field"
+        );
+        let inputs2 = vec![utxo(2, 0, 42)];
+        assert_eq!(
+            diff_payout_fields(&mk(20, QUORUM, &inputs2, 0), &base).as_deref(),
+            Some("quorum_or_inputs")
+        );
+        assert_eq!(
+            diff_payout_fields(&mk(20, &[1, 2], &inputs, 0), &base).as_deref(),
+            Some("quorum_or_inputs"),
+            "a different designated quorum is a different payout"
         );
         assert_eq!(diff_payout_fields(&base, &base), None);
     }

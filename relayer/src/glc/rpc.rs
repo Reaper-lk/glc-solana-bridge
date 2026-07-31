@@ -272,6 +272,52 @@ impl RpcClient {
         self.call_typed("signrawtransaction", json!([hex])).await
     }
 
+    /// Signs a P2SH multisig input, supplying the previous outputs (with
+    /// their `redeemScript`) and, optionally, explicit private keys.
+    ///
+    /// Required for a vault the wallet cannot solve alone: verified against
+    /// a real node, the bare `signrawtransaction(hex)` form is not
+    /// sufficient for P2SH multisig. A partial result returns
+    /// `complete: false`, and broadcasting a partial is rejected by the
+    /// network (`-26`), so an incomplete signature can never move funds.
+    pub async fn sign_raw_transaction_with_prevtxs(
+        &self,
+        hex: &str,
+        prevtxs: &[PrevTx],
+        private_keys: Option<&[String]>,
+    ) -> Result<SignResult, RpcError> {
+        let params = match private_keys {
+            Some(keys) => json!([hex, prevtxs, keys]),
+            None => json!([hex, prevtxs]),
+        };
+        self.call_typed("signrawtransaction", params).await
+    }
+
+    /// Registers the vault with the node so its outputs become visible.
+    ///
+    /// Both calls are required and both are idempotent-ish: verified that
+    /// without `importaddress` the vault is invisible to `listunspent`, and
+    /// that importing the address alone leaves its outputs `solvable:
+    /// false` until the redeem script is imported too.
+    pub async fn import_vault(
+        &self,
+        address: &str,
+        redeem_script_hex: &str,
+    ) -> Result<(), RpcError> {
+        // A re-import raises a method error rather than succeeding; that is
+        // benign and must not abort startup.
+        let _ = self
+            .call("importaddress", json!([address, "glc-vault", false]))
+            .await;
+        let _ = self
+            .call(
+                "importaddress",
+                json!([redeem_script_hex, "glc-vault-redeem", false, true]),
+            )
+            .await;
+        Ok(())
+    }
+
     /// Broadcasts, normalising the two benign outcomes verified against a
     /// real node:
     ///
@@ -313,6 +359,26 @@ pub struct ListUnspentEntry {
     pub confirmations: i64,
     #[serde(default)]
     pub spendable: bool,
+    /// True when the wallet knows how to construct the input's script — for
+    /// a P2SH vault this means the redeem script has been imported.
+    ///
+    /// This, NOT `spendable`, is the correct filter for a multisig vault:
+    /// verified against a real node, a vault UTXO is `spendable: false`
+    /// whenever the local wallet cannot sign alone, which is the normal
+    /// production case (ADR-0015).
+    #[serde(default)]
+    pub solvable: bool,
+}
+
+/// A previous output a signer needs in order to sign a P2SH input.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PrevTx {
+    pub txid: String,
+    pub vout: i64,
+    #[serde(rename = "scriptPubKey")]
+    pub script_pub_key: String,
+    #[serde(rename = "redeemScript")]
+    pub redeem_script: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -41,7 +41,12 @@ impl PayoutRpc for RealPayoutRpc {
         let entries = self.client.list_unspent(min_conf, addresses).await?;
         entries
             .into_iter()
-            .filter(|e| e.spendable)
+            // `solvable`, not `spendable`: for a P2SH multisig vault the
+            // local wallet usually cannot sign alone, so `spendable` is
+            // false for every vault output and filtering on it would make
+            // the executor see an empty vault and silently never pay out
+            // (verified on a real node — ADR-0015).
+            .filter(|e| e.solvable)
             .map(|e| {
                 let txid = crate::glc::hex::decode_exact::<32>(&e.txid)
                     .map_err(|err| RpcError::Malformed(err.to_string()))?;
@@ -139,8 +144,15 @@ impl PayoutRpc for RealPayoutRpc {
         })
     }
 
-    async fn sign_raw_transaction(&self, hex: &str) -> Result<(String, bool), RpcError> {
-        let r = self.client.sign_raw_transaction(hex).await?;
+    async fn sign_raw_transaction(
+        &self,
+        hex: &str,
+        prevtxs: &[crate::glc::rpc::PrevTx],
+    ) -> Result<(String, bool), RpcError> {
+        let r = self
+            .client
+            .sign_raw_transaction_with_prevtxs(hex, prevtxs, None)
+            .await?;
         Ok((r.hex, r.complete))
     }
 

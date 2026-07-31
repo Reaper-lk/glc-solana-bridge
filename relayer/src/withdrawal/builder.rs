@@ -43,7 +43,13 @@ pub struct DecodedTx {
 pub struct PayoutPlan {
     pub dest_hash160: [u8; 20],
     pub payout_atomic: u64,
-    pub change_hash160: Option<[u8; 20]>,
+    /// The exact `scriptPubKey` change must pay to, as hex.
+    ///
+    /// Carried as a script rather than a hash160 because change returns to
+    /// the vault, which is P2SH (`a914..87`) from Phase 7b onward, not
+    /// P2PKH (`76a914..88ac`). Assuming a script type here would silently
+    /// verify against the wrong script (ADR-0015).
+    pub change_script_hex: Option<String>,
     pub change_atomic: u64,
     pub fee_atomic: u64,
     pub inputs: Vec<VaultUtxo>,
@@ -137,7 +143,7 @@ pub fn verify_payout_tx(tx: &DecodedTx, plan: &PayoutPlan) -> Result<(), VerifyE
     }
 
     // --- change: present iff planned, to a vault-owned script, exact ---
-    let change_script = plan.change_hash160.map(|h| p2pkh_script_hex(&h));
+    let change_script = plan.change_script_hex.clone();
     if plan.change_atomic > 0 {
         let script = change_script.clone().ok_or(VerifyError::UnexpectedChange)?;
         let change = tx
@@ -226,7 +232,7 @@ mod tests {
         PayoutPlan {
             dest_hash160: DEST,
             payout_atomic: 100_000,
-            change_hash160: Some(CHANGE),
+            change_script_hex: Some(p2pkh_script_hex(&CHANGE)),
             change_atomic: 880_000,
             fee_atomic: 20_000,
             inputs: vec![utxo(1, 0, 1_000_000)],
@@ -241,7 +247,7 @@ mod tests {
         if p.change_atomic > 0 {
             outputs.push(DecodedOutput {
                 value_atomic: p.change_atomic,
-                script_pubkey_hex: p2pkh_script_hex(&p.change_hash160.unwrap()),
+                script_pubkey_hex: p.change_script_hex.clone().unwrap(),
             });
         }
         DecodedTx {
@@ -268,7 +274,7 @@ mod tests {
     fn accepts_a_correct_no_change_transaction() {
         let mut p = plan();
         p.change_atomic = 0;
-        p.change_hash160 = None;
+        p.change_script_hex = None;
         p.fee_atomic = 900_000;
         verify_payout_tx(&good_tx(&p), &p).unwrap();
     }
@@ -338,7 +344,7 @@ mod tests {
     fn rejects_a_surprise_change_output_when_none_was_planned() {
         let mut p = plan();
         p.change_atomic = 0;
-        p.change_hash160 = None;
+        p.change_script_hex = None;
         p.fee_atomic = 900_000;
         let mut tx = good_tx(&p);
         tx.outputs.push(DecodedOutput {

@@ -8,7 +8,8 @@
 use solana_sdk::commitment_config::CommitmentLevel;
 use thiserror::Error;
 
-use super::address::{decode_p2pkh_hash160, AddressError};
+use super::address::AddressError;
+use super::vault::{MultisigVault, VaultError};
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WithdrawalConfigError {
@@ -21,6 +22,13 @@ pub enum WithdrawalConfigError {
     },
     #[error("fee_rate_per_kb must be greater than zero — there is no safe default (D4)")]
     ZeroFeeRate,
+    #[error("vault redeem script is unusable: {0}")]
+    InvalidVault(#[from] VaultError),
+    #[error(
+        "change_address must be the vault address itself ({vault}), got {configured} — change \
+         returns to the vault and is verified against the vault script before signing"
+    )]
+    ChangeAddressNotVault { vault: String, configured: String },
     #[error("withdrawal_confirmation_depth must be at least 1 — there is no safe default (D7)")]
     ZeroConfirmationDepth,
     #[error("max_inputs_per_payout must be at least 1")]
@@ -34,7 +42,11 @@ pub enum WithdrawalConfigError {
 
 /// Raw, pre-validation input assembled from environment variables.
 pub struct RawWithdrawalConfig {
-    /// The single-key P2PKH vault address (regtest bootstrap only, D2).
+    /// The vault's P2SH M-of-N redeem script, hex (ADR-0015). The address is
+    /// re-derived from it and cross-checked against `vault_address`.
+    pub vault_redeem_script_hex: String,
+    /// The expected vault address. Checked against the address the redeem
+    /// script actually derives — a mismatch is refused rather than resolved.
     pub vault_address: String,
     /// Where change returns to. May equal `vault_address`.
     pub change_address: String,
@@ -57,6 +69,9 @@ pub struct RawWithdrawalConfig {
 
 #[derive(Debug, Clone)]
 pub struct WithdrawalConfig {
+    /// The validated P2SH multisig vault (ADR-0015). Replaces the Phase 6
+    /// single-key P2PKH vault (D2), which is deleted.
+    pub vault: MultisigVault,
     pub vault_address: String,
     pub vault_hash160: [u8; 20],
     pub change_address: String,
@@ -83,18 +98,23 @@ impl WithdrawalConfig {
                 field: "change_address",
             });
         }
-        let vault_hash160 = decode_p2pkh_hash160(&raw.vault_address).map_err(|source| {
-            WithdrawalConfigError::InvalidAddress {
-                field: "vault_address",
-                source,
-            }
-        })?;
-        let change_hash160 = decode_p2pkh_hash160(&raw.change_address).map_err(|source| {
-            WithdrawalConfigError::InvalidAddress {
-                field: "change_address",
-                source,
-            }
-        })?;
+        // Derive the vault from its redeem script and refuse to proceed if
+        // the configured address disagrees: a stale or transposed address
+        // would otherwise send funds somewhere unrecoverable.
+        let vault = MultisigVault::from_redeem_script_hex(&raw.vault_redeem_script_hex)?;
+        vault.require_address(&raw.vault_address)?;
+        let vault_hash160 = vault.script_hash160;
+        // Change returns to the vault, and the builder verifies the change
+        // output against the vault's own script before signing. Allowing a
+        // different address here would make those two disagree, so the
+        // relationship is enforced rather than assumed.
+        if raw.change_address != vault.address {
+            return Err(WithdrawalConfigError::ChangeAddressNotVault {
+                vault: vault.address.clone(),
+                configured: raw.change_address,
+            });
+        }
+        let change_hash160 = vault.script_hash160;
         if raw.fee_rate_per_kb == 0 {
             return Err(WithdrawalConfigError::ZeroFeeRate);
         }
@@ -114,6 +134,7 @@ impl WithdrawalConfig {
         }
 
         Ok(WithdrawalConfig {
+            vault,
             vault_address: raw.vault_address,
             vault_hash160,
             change_address: raw.change_address,
@@ -135,11 +156,16 @@ mod tests {
     use super::*;
 
     const ADDR: &str = "mimgHRXobzhMFWkXH46awwtiAQLhKRxxbt";
+    /// The real 2-of-3 vault produced by `createmultisig` on a regtest node
+    /// during Phase 7b verification.
+    const REDEEM: &str = "5221028e7147e643d67093dc8ca6a8fb888f1a452dddc62de991c7ed72080d65a421e42102f1c88ca7176c3ffee952ee6fae697991b257b6d53c3bc88e81cfe99adbcdbee5210256220bb7865197a40c4590ac80f12ef18e9063eac2eff92c4476ec27034042f953ae";
+    const VAULT_ADDR: &str = "QY9YcpypWD91BEZ37TjNHYoqrquhcnVBYV";
 
     fn base() -> RawWithdrawalConfig {
         RawWithdrawalConfig {
-            vault_address: ADDR.into(),
-            change_address: ADDR.into(),
+            vault_redeem_script_hex: REDEEM.into(),
+            vault_address: VAULT_ADDR.into(),
+            change_address: VAULT_ADDR.into(),
             fee_rate_per_kb: 10_000,
             dust_threshold_atomic: 5_400,
             vault_min_confirmations: 1,
@@ -155,7 +181,42 @@ mod tests {
     fn accepts_a_well_formed_config() {
         let c = WithdrawalConfig::validate(base()).unwrap();
         assert_eq!(c.discovery_commitment, CommitmentLevel::Finalized);
-        assert_eq!(c.vault_hash160, decode_p2pkh_hash160(ADDR).unwrap());
+        assert_eq!(c.vault.threshold, 2);
+        assert_eq!(c.vault.signer_count(), 3);
+        assert_eq!(c.vault_address, VAULT_ADDR);
+        assert_eq!(c.vault_hash160, c.vault.script_hash160);
+    }
+
+    #[test]
+    fn refuses_a_vault_address_that_disagrees_with_its_redeem_script() {
+        // A stale or transposed address would otherwise send vault funds
+        // somewhere unrecoverable (ADR-0015).
+        let mut r = base();
+        r.vault_address = "QY9YcpypWD91BEZ37TjNHYoqrquhcnVBYW".into();
+        assert!(matches!(
+            WithdrawalConfig::validate(r).unwrap_err(),
+            WithdrawalConfigError::InvalidVault(_)
+        ));
+    }
+
+    #[test]
+    fn refuses_a_change_address_that_is_not_the_vault() {
+        let mut r = base();
+        r.change_address = ADDR.into(); // a P2PKH address, not the vault
+        assert!(matches!(
+            WithdrawalConfig::validate(r).unwrap_err(),
+            WithdrawalConfigError::ChangeAddressNotVault { .. }
+        ));
+    }
+
+    #[test]
+    fn refuses_a_malformed_redeem_script() {
+        let mut r = base();
+        r.vault_redeem_script_hex = "deadbeef".into();
+        assert!(matches!(
+            WithdrawalConfig::validate(r).unwrap_err(),
+            WithdrawalConfigError::InvalidVault(_)
+        ));
     }
 
     #[test]
@@ -208,10 +269,7 @@ mod tests {
         r.change_address = "not-an-address".into();
         assert!(matches!(
             WithdrawalConfig::validate(r).unwrap_err(),
-            WithdrawalConfigError::InvalidAddress {
-                field: "change_address",
-                ..
-            }
+            WithdrawalConfigError::ChangeAddressNotVault { .. }
         ));
     }
 
