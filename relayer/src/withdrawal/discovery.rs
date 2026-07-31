@@ -168,6 +168,58 @@ pub fn decode_withdrawal(
     })
 }
 
+/// Scans the bridge program's accounts and returns every withdrawal that
+/// decodes and validates cleanly, ready for `Db::observe_withdrawal`.
+///
+/// Deliberately a thin adapter around [`decode_withdrawal`]: the validation
+/// logic is unchanged and untouched here. Accounts that fail validation are
+/// logged and skipped rather than aborting the scan — one malformed or
+/// hostile account must not stall every other pending payout. A skipped
+/// account is simply never observed, so it can never be paid.
+///
+/// Runs at `finalized` commitment only (owner decision D5); the caller
+/// supplies the level from validated configuration, which cannot hold any
+/// other value.
+pub async fn scan_withdrawals<R: crate::solana::rpc::SolanaRpc>(
+    rpc: &R,
+    program_id: &solana_sdk::pubkey::Pubkey,
+    commitment: solana_sdk::commitment_config::CommitmentLevel,
+    observed_at: i64,
+    observed_at_slot: i64,
+) -> Result<Vec<crate::glc::withdrawal_db::NewWithdrawalRequest>, crate::solana::rpc::SolanaRpcError>
+{
+    let accounts = rpc
+        .get_program_accounts_sized(program_id, WITHDRAWAL_ACCOUNT_LEN as u64, commitment)
+        .await?;
+
+    let mut out = Vec::with_capacity(accounts.len());
+    for (address, account) in accounts {
+        match decode_withdrawal(program_id, &address, &account.owner, &account.data) {
+            Ok(w) => out.push(crate::glc::withdrawal_db::NewWithdrawalRequest {
+                withdrawal_index: w.index as i64,
+                pda: w.pda.to_bytes(),
+                amount_atomic: w.amount_atomic,
+                requester: w.requester.to_bytes(),
+                glc_address: w.glc_address,
+                glc_address_hash160: w.glc_address_hash160,
+                requested_at_slot: w.requested_at_slot as i64,
+                protocol_version: w.protocol_version,
+                observed_at,
+                observed_at_slot,
+            }),
+            Err(e) => {
+                tracing::warn!(
+                    account = %address,
+                    error = %e,
+                    "skipping an account that is not a valid WithdrawalRequest"
+                );
+            }
+        }
+    }
+    out.sort_by_key(|w| w.withdrawal_index);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +346,73 @@ mod tests {
             decode_withdrawal(&pid, &pda, &pid, &data).unwrap_err(),
             DiscoveryError::UnusableAddress(_)
         ));
+    }
+
+    /// The scan must not trust the server-side size filter: an account of
+    /// the right length but wrong owner or wrong PDA is still refused, and
+    /// one bad account must not hide the good ones.
+    #[tokio::test]
+    async fn scan_validates_every_account_and_skips_only_the_bad_ones() {
+        use crate::solana::rpc::{SolanaRpc, SolanaRpcError};
+        use solana_sdk::account::Account;
+        use solana_sdk::commitment_config::CommitmentLevel;
+
+        let pid = Pubkey::new_unique();
+        let (good_pda, good) = build_account(&pid, 2, 500, &addr());
+        let (_, wrong_owner) = build_account(&pid, 3, 500, &addr());
+        let (_, impostor_data) = build_account(&pid, 4, 500, &addr());
+        let impostor_addr = Pubkey::new_unique(); // right length, wrong PDA
+
+        struct Mock(Vec<(Pubkey, Account)>);
+        impl SolanaRpc for Mock {
+            async fn get_account(&self, _: &Pubkey) -> Result<Option<Account>, SolanaRpcError> {
+                unreachable!()
+            }
+            async fn get_latest_blockhash(&self) -> Result<solana_sdk::hash::Hash, SolanaRpcError> {
+                unreachable!()
+            }
+            async fn send_transaction(
+                &self,
+                _: &solana_sdk::transaction::Transaction,
+            ) -> Result<solana_sdk::signature::Signature, SolanaRpcError> {
+                unreachable!()
+            }
+            async fn get_program_accounts_sized(
+                &self,
+                _: &Pubkey,
+                _: u64,
+                _: CommitmentLevel,
+            ) -> Result<Vec<(Pubkey, Account)>, SolanaRpcError> {
+                Ok(self.0.clone())
+            }
+        }
+
+        let acct = |owner: Pubkey, data: Vec<u8>| Account {
+            lamports: 1,
+            data,
+            owner,
+            executable: false,
+            rent_epoch: 0,
+        };
+        let attacker = Pubkey::new_unique();
+        let mock = Mock(vec![
+            (good_pda, acct(pid, good)),
+            (Pubkey::new_unique(), acct(attacker, wrong_owner)),
+            (impostor_addr, acct(pid, impostor_data)),
+        ]);
+
+        let found = scan_withdrawals(&mock, &pid, CommitmentLevel::Finalized, 10, 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "only the genuinely valid account is observed"
+        );
+        assert_eq!(found[0].withdrawal_index, 2);
+        assert_eq!(found[0].pda, good_pda.to_bytes());
+        assert_eq!(found[0].observed_at, 10);
+        assert_eq!(found[0].observed_at_slot, 20);
     }
 
     #[test]

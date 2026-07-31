@@ -164,6 +164,23 @@ impl RegtestNode {
         self.cli(&["sendrawtransaction", signed_hex])
     }
 
+    /// The index of the output paying `vault_script_hex` in `txid`.
+    ///
+    /// Never assume vout 0: `fundrawtransaction` chooses the change
+    /// position, so the vault output's index genuinely varies between runs
+    /// (docs/goldcoin-rpc-notes.md — "output ordering is not fixed").
+    fn vault_vout_of(&self, txid_hex: &str, vault_script_hex: &str) -> i64 {
+        let tx: serde_json::Value =
+            serde_json::from_str(&self.cli(&["getrawtransaction", txid_hex, "true"])).unwrap();
+        tx["vout"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["scriptPubKey"]["hex"].as_str() == Some(vault_script_hex))
+            .map(|o| o["n"].as_i64().unwrap())
+            .expect("the deposit must pay the vault in some output")
+    }
+
     fn invalidate_block(&self, hash: &str) {
         self.cli(&["invalidateblock", hash]);
     }
@@ -417,7 +434,8 @@ async fn one_block_reorg_rollback_against_real_node() {
         other => panic!("expected a detected reorg against the real node, got {other:?}"),
     }
 
-    let history = indexer.db().history_for(&txid, 0).unwrap();
+    let vault_vout = node.vault_vout_of(&txid_hex, &vault_script_hex);
+    let history = indexer.db().history_for(&txid, vault_vout).unwrap();
     assert!(
         history
             .iter()

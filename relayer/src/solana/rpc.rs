@@ -99,6 +99,21 @@ pub trait SolanaRpc {
         &self,
         tx: &Transaction,
     ) -> impl std::future::Future<Output = Result<Signature, SolanaRpcError>> + Send;
+
+    /// Every account owned by `program_id` whose data is exactly `data_len`
+    /// bytes, at the given commitment. Used by the Phase 6 withdrawal
+    /// executor to enumerate `WithdrawalRequest` PDAs (ADR-0013).
+    ///
+    /// The size filter is a cheap server-side narrowing only — it is never
+    /// treated as validation. Every returned account still goes through the
+    /// full `withdrawal::discovery::decode_withdrawal` checks (owner,
+    /// length, PDA re-derivation, canonical bump, address decoding).
+    fn get_program_accounts_sized(
+        &self,
+        program_id: &Pubkey,
+        data_len: u64,
+        commitment: CommitmentLevel,
+    ) -> impl std::future::Future<Output = Result<Vec<(Pubkey, Account)>, SolanaRpcError>> + Send;
 }
 
 pub struct RealSolanaRpc {
@@ -128,6 +143,32 @@ impl SolanaRpc for RealSolanaRpc {
     async fn get_latest_blockhash(&self) -> Result<Hash, SolanaRpcError> {
         self.client
             .get_latest_blockhash()
+            .await
+            .map_err(classify_client_error)
+    }
+
+    async fn get_program_accounts_sized(
+        &self,
+        program_id: &Pubkey,
+        data_len: u64,
+        commitment: CommitmentLevel,
+    ) -> Result<Vec<(Pubkey, Account)>, SolanaRpcError> {
+        use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
+        use solana_client::rpc_filter::RpcFilterType;
+        let config = RpcProgramAccountsConfig {
+            filters: Some(vec![RpcFilterType::DataSize(data_len)]),
+            account_config: RpcAccountInfoConfig {
+                // Base64 is mandatory here, not a preference: the node
+                // rejects base58 (the default) for accounts over 128 bytes,
+                // and a WithdrawalRequest is 180.
+                encoding: Some(solana_account_decoder_client_types::UiAccountEncoding::Base64),
+                commitment: Some(CommitmentConfig { commitment }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        self.client
+            .get_program_accounts_with_config(program_id, config)
             .await
             .map_err(classify_client_error)
     }

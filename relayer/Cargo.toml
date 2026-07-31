@@ -61,6 +61,11 @@ solana-client = "2.1"
 # constant (classic Token program — owner decision U5, Phase 2).
 spl-associated-token-account = "4"
 spl-token = "6"
+# Types-only crate, ALREADY in the tree via solana-pubsub-client — declaring
+# it directly adds nothing new to the dependency graph. Needed because
+# getProgramAccounts defaults to base58 encoding, which the node refuses for
+# accounts over 128 bytes (a WithdrawalRequest is 180).
+solana-account-decoder-client-types = "2.3"
 
 [dev-dependencies]
 tempfile = "3"
