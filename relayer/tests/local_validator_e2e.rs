@@ -192,6 +192,9 @@ fn build_initialize_ix(
     data.push(threshold);
     data.extend_from_slice(&0u64.to_le_bytes()); // min_deposit
     data.extend_from_slice(&0u64.to_le_bytes()); // min_withdrawal
+                                                 // Phase 7a (ADR-0014): governance timelock. No default exists —
+                                                 // the program rejects zero — so tests state it explicitly.
+    data.extend_from_slice(&3_600i64.to_le_bytes()); // governance_timelock_seconds
 
     Instruction {
         program_id: *program_id,

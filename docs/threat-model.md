@@ -27,7 +27,7 @@ OPEN blocks deployment.
 | **No emergency stop** | `paused` flag in `BridgeConfig` (done, Phase 1), checked by the mint & burn paths from Phase 2 on; interim pause authority = admin key, final authority/quorum OPEN (custody.md #7) |
 | **Ed25519 introspection sharp edges** — instruction-sysvar verification is historically bug-prone | Fixed relative position, self-referential-offset-only entries, exact message equality, full bounds checks; parser unit-tested against malformed payloads (ADR-0010). Focused external review still required before deployment |
 | **Threshold exceeds transaction capacity** — a single tx fits ~4 (legacy) / ~7 (v0+ALT) signatures | Liveness-only bound (mints stall, never mint wrongly); documented in ADR-0010; vote-accumulation fallback (ADR-0005) if a larger M is ever needed |
-| **Admin rotates validator set to attacker keys** — governance key is an indirect mint capability | Unchanged interim risk since Phase 1: rotation is visible on-chain, epoch-bumping, and pause-independent; resolved by custody decisions #1/#7 (threshold-gated + timelocked governance) |
+| **Admin rotates validator set to attacker keys** — governance key was an indirect mint capability | **CLOSED (7a, ADR-0014).** `update_validator_set` is deleted; rotation requires an M-of-N federation proof over a canonical governance message plus a configured timelock, and execution is permissionless once matured. No single key can move the federation. Residual: the admin key still gates pause and its own handover (custody #7 remains open) — neither confers a mint capability |
 | **Key material leakage** | No keys in repo at any phase; signer code isolated in relayer; `.gitignore` guards; TSS/vault signing out of scope until custody decided |
 | **Double payout of one withdrawal** | Four layers (ADR-0013): one payout row per withdrawal (schema PK); an outpoint funds at most one payout (`UNIQUE(txid,vout)`); a pre-signing guard sequence that refuses already-signed/confirmed/completed payouts and drifted reservations; and the Goldcoin UTXO set itself, where a spent input cannot be re-spent (RPC -25) and an identical rebroadcast is a no-op (RPC -27). Only the last is a true security boundary. Every guard is mutation-tested (6) |
 | **Payout built from a reversible burn** | Withdrawal discovery is hard-required to run at Solana `finalized` commitment; any other value is a startup error (6, owner decision D5) |
@@ -52,3 +52,6 @@ OPEN blocks deployment.
    D3; enforced in the pre-signing guards).
 7. A signed payout's bytes and txid are durable before any broadcast, so a
    lost broadcast response is always reconcilable and never re-derived.
+8. The validator set changes only via an M-of-N-approved proposal that has
+   sat through a configured timelock (7a, ADR-0014). No single key — admin
+   included — can rotate the federation.

@@ -374,6 +374,9 @@ async fn deposit_to_mint_to_burn_to_goldcoin_payout() {
     init_data.push(threshold);
     init_data.extend_from_slice(&0u64.to_le_bytes()); // min_deposit
     init_data.extend_from_slice(&0u64.to_le_bytes()); // min_withdrawal
+                                                      // Phase 7a (ADR-0014): governance timelock. No default exists —
+                                                      // the program rejects zero — so tests state it explicitly.
+    init_data.extend_from_slice(&3_600i64.to_le_bytes()); // governance_timelock_seconds
     let init_ix = Instruction {
         program_id,
         accounts: vec![

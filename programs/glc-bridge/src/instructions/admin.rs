@@ -1,5 +1,11 @@
-//! Admin-gated governance instructions: pause, validator-set rotation, and
-//! the two-step admin handover.
+//! Admin-gated instructions: pause and the two-step admin handover.
+//!
+//! **Validator-set rotation is NOT here.** It moved to
+//! [`crate::instructions::governance`] in Phase 7a (ADR-0014), behind a
+//! threshold-gated timelock, because the validator set is the mint
+//! authority and a single key able to rotate it was an indirect
+//! infinite-mint capability. Do not reintroduce an admin-gated rotation
+//! path.
 //!
 //! Every context checks `bridge_config.admin == admin.key()` (or, for
 //! `accept_admin`, the stored `pending_admin`) with a custom error, and
@@ -9,13 +15,10 @@
 
 use anchor_lang::prelude::*;
 
-use crate::constants::{SEED_BRIDGE_CONFIG, SEED_VALIDATOR_SET};
+use crate::constants::SEED_BRIDGE_CONFIG;
 use crate::errors::BridgeError;
-use crate::events::{
-    AdminTransferInitiated, AdminTransferred, PauseStateChanged, ValidatorSetUpdated,
-};
-use crate::state::{BridgeConfig, ValidatorSet};
-use crate::validation::validate_validator_set;
+use crate::events::{AdminTransferInitiated, AdminTransferred, PauseStateChanged};
+use crate::state::BridgeConfig;
 
 #[derive(Accounts)]
 pub struct AdminConfig<'info> {
@@ -27,23 +30,6 @@ pub struct AdminConfig<'info> {
         constraint = bridge_config.admin == admin.key() @ BridgeError::UnauthorizedAdmin
     )]
     pub bridge_config: Account<'info, BridgeConfig>,
-}
-
-#[derive(Accounts)]
-pub struct UpdateValidatorSet<'info> {
-    pub admin: Signer<'info>,
-    #[account(
-        seeds = [SEED_BRIDGE_CONFIG],
-        bump = bridge_config.bump,
-        constraint = bridge_config.admin == admin.key() @ BridgeError::UnauthorizedAdmin
-    )]
-    pub bridge_config: Account<'info, BridgeConfig>,
-    #[account(
-        mut,
-        seeds = [SEED_VALIDATOR_SET],
-        bump = validator_set.bump
-    )]
-    pub validator_set: Account<'info, ValidatorSet>,
 }
 
 #[derive(Accounts)]
@@ -65,33 +51,6 @@ pub fn set_paused(ctx: Context<AdminConfig>, paused: bool) -> Result<()> {
     require!(config.paused != paused, BridgeError::PauseStateUnchanged);
     config.paused = paused;
     emit!(PauseStateChanged { paused });
-    Ok(())
-}
-
-/// Replaces the federation set/threshold under the same invariants as
-/// `initialize` and advances the epoch, invalidating any Phase 3 proofs
-/// signed under the previous set.
-pub fn update_validator_set(
-    ctx: Context<UpdateValidatorSet>,
-    validators: Vec<Pubkey>,
-    threshold: u8,
-) -> Result<()> {
-    validate_validator_set(&validators, threshold)?;
-
-    let set = &mut ctx.accounts.validator_set;
-    set.epoch = set
-        .epoch
-        .checked_add(1)
-        .ok_or(BridgeError::ArithmeticOverflow)?;
-    set.threshold = threshold;
-    let validator_count = validators.len() as u8;
-    set.validators = validators;
-
-    emit!(ValidatorSetUpdated {
-        epoch: set.epoch,
-        threshold,
-        validator_count,
-    });
     Ok(())
 }
 

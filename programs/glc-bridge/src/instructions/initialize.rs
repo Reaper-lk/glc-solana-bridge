@@ -71,8 +71,18 @@ pub fn initialize(
     threshold: u8,
     min_deposit: u64,
     min_withdrawal: u64,
+    governance_timelock_seconds: i64,
 ) -> Result<()> {
     validate_validator_set(&validators, threshold)?;
+    // No built-in default (ADR-0014): a governance timelock of zero would
+    // make a threshold-approved rotation instantaneous, removing the public
+    // window that is the entire point of the delay. The safe value is an
+    // operational decision, so the program refuses to start without one
+    // rather than choosing on the operator's behalf.
+    require!(
+        governance_timelock_seconds > 0,
+        BridgeError::ZeroGovernanceTimelock
+    );
 
     let config = &mut ctx.accounts.bridge_config;
     config.protocol_version = PROTOCOL_VERSION;
@@ -87,7 +97,8 @@ pub fn initialize(
     // sentinel until `create_wrapped_mint`.
     config.wrapped_mint = Pubkey::default();
     config.mint_authority_bump = 0;
-    config.reserved = [0u8; 31];
+    config.governance_timelock_seconds = governance_timelock_seconds;
+    config.reserved = [0u8; 23];
 
     let validator_count = validators.len() as u8;
     let set = &mut ctx.accounts.validator_set;

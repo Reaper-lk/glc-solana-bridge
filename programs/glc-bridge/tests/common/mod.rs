@@ -122,6 +122,38 @@ pub fn initialize_ix(
             threshold,
             min_deposit: 1_000,
             min_withdrawal: 2_000,
+            governance_timelock_seconds: DEFAULT_TEST_TIMELOCK,
+        }
+        .data(),
+    }
+}
+
+/// `initialize_ix` with an explicit timelock, for tests that exercise the
+/// zero-timelock rejection.
+pub fn initialize_ix_with_timelock(
+    authority: &Pubkey,
+    program_data: Pubkey,
+    validators: Vec<Pubkey>,
+    threshold: u8,
+    governance_timelock_seconds: i64,
+) -> Instruction {
+    Instruction {
+        program_id: glc_bridge::ID,
+        accounts: glc_bridge::accounts::Initialize {
+            authority: *authority,
+            bridge_config: config_pda(),
+            validator_set: validator_set_pda(),
+            program: glc_bridge::ID,
+            program_data,
+            system_program: solana_sdk::system_program::id(),
+        }
+        .to_account_metas(None),
+        data: glc_bridge::instruction::Initialize {
+            validators,
+            threshold,
+            min_deposit: 1_000,
+            min_withdrawal: 2_000,
+            governance_timelock_seconds,
         }
         .data(),
     }
@@ -221,25 +253,120 @@ pub fn set_paused_ix(admin: &Pubkey, paused: bool) -> Instruction {
     }
 }
 
-pub fn update_validator_set_ix(
-    admin: &Pubkey,
+/// Timelock used by the shared test fixtures. Deliberately non-zero: the
+/// program refuses a zero timelock, and tests that need to execute warp the
+/// clock forward rather than configuring the delay away.
+pub const DEFAULT_TEST_TIMELOCK: i64 = 3_600;
+
+pub fn governance_action_pda() -> Pubkey {
+    Pubkey::find_program_address(&[b"governance_action"], &glc_bridge::ID).0
+}
+
+pub fn get_pending_action(svm: &LiteSVM) -> Option<glc_bridge::state::PendingGovernanceAction> {
+    let account = svm.get_account(&governance_action_pda())?;
+    if account.data.is_empty() {
+        return None;
+    }
+    glc_bridge::state::PendingGovernanceAction::try_deserialize(&mut account.data.as_slice()).ok()
+}
+
+/// The canonical bytes validators sign to approve a rotation.
+pub fn rotation_message(epoch: u64, validators: &[Pubkey], threshold: u8) -> Vec<u8> {
+    let raw: Vec<[u8; 32]> = validators.iter().map(|v| v.to_bytes()).collect();
+    let commitment = anchor_lang::solana_program::hash::hash(
+        &glc_bridge_shared::governance::rotation_params(threshold, &raw),
+    )
+    .to_bytes();
+    glc_bridge_shared::governance::governance_message(
+        glc_bridge::constants::PROTOCOL_VERSION,
+        &glc_bridge::ID.to_bytes(),
+        epoch,
+        glc_bridge_shared::governance::ACTION_PROPOSE_ROTATION,
+        &commitment,
+    )
+    .to_vec()
+}
+
+/// The canonical bytes validators sign to approve a cancellation.
+pub fn cancel_message(epoch: u64, pending_action: u8, pending_eta: i64) -> Vec<u8> {
+    let commitment = anchor_lang::solana_program::hash::hash(
+        &glc_bridge_shared::governance::cancel_params(pending_action, pending_eta),
+    )
+    .to_bytes();
+    glc_bridge_shared::governance::governance_message(
+        glc_bridge::constants::PROTOCOL_VERSION,
+        &glc_bridge::ID.to_bytes(),
+        epoch,
+        glc_bridge_shared::governance::ACTION_CANCEL_ROTATION,
+        &commitment,
+    )
+    .to_vec()
+}
+
+pub fn propose_rotation_ix(
+    proposer: &Pubkey,
     validators: Vec<Pubkey>,
     threshold: u8,
 ) -> Instruction {
     Instruction {
         program_id: glc_bridge::ID,
-        accounts: glc_bridge::accounts::UpdateValidatorSet {
-            admin: *admin,
+        accounts: glc_bridge::accounts::ProposeGovernanceAction {
+            proposer: *proposer,
             bridge_config: config_pda(),
             validator_set: validator_set_pda(),
+            pending_action: governance_action_pda(),
+            instructions_sysvar: anchor_lang::solana_program::sysvar::instructions::ID,
+            system_program: solana_sdk::system_program::id(),
         }
         .to_account_metas(None),
-        data: glc_bridge::instruction::UpdateValidatorSet {
+        data: glc_bridge::instruction::ProposeValidatorRotation {
             validators,
             threshold,
         }
         .data(),
     }
+}
+
+pub fn execute_rotation_ix(executor: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: glc_bridge::ID,
+        accounts: glc_bridge::accounts::ExecuteGovernanceAction {
+            executor: *executor,
+            bridge_config: config_pda(),
+            validator_set: validator_set_pda(),
+            pending_action: governance_action_pda(),
+        }
+        .to_account_metas(None),
+        data: glc_bridge::instruction::ExecuteValidatorRotation {}.data(),
+    }
+}
+
+pub fn cancel_rotation_ix(canceller: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: glc_bridge::ID,
+        accounts: glc_bridge::accounts::CancelGovernanceAction {
+            canceller: *canceller,
+            bridge_config: config_pda(),
+            validator_set: validator_set_pda(),
+            pending_action: governance_action_pda(),
+            instructions_sysvar: anchor_lang::solana_program::sysvar::instructions::ID,
+        }
+        .to_account_metas(None),
+        data: glc_bridge::instruction::CancelValidatorRotation {}.data(),
+    }
+}
+
+/// Moves the validator clock forward so a timelock can elapse.
+///
+/// Also expires the blockhash: time passing means new blocks, and without
+/// this an otherwise-identical retry is rejected as a duplicate transaction
+/// (`AlreadyProcessed`) before the program ever runs — which would silently
+/// mask whatever the test was actually asserting.
+pub fn warp_seconds(svm: &mut LiteSVM, seconds: i64) {
+    let mut clock = svm.get_sysvar::<anchor_lang::solana_program::clock::Clock>();
+    clock.unix_timestamp += seconds;
+    svm.set_sysvar(&clock);
+    svm.expire_blockhash();
 }
 
 pub fn transfer_admin_ix(admin: &Pubkey, new_admin: Pubkey) -> Instruction {

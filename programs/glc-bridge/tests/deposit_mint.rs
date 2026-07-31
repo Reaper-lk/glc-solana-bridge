@@ -360,14 +360,24 @@ fn epoch_rotation_invalidates_proofs_even_with_unchanged_keys() {
     let epoch0_proof = ed25519_proof_ix(&f.signers(&[0, 1, 2]), &epoch0_message);
 
     // Rotate to the IDENTICAL set and threshold: epoch 0 -> 1, keys unchanged.
+    // Rotation now runs through the Phase 7a governance flow (ADR-0014):
+    // threshold-approved proposal, timelock, then permissionless execution.
     let same_keys: Vec<Pubkey> = f.validators.iter().map(|k| k.pubkey()).collect();
+    let gov_msg = rotation_message(0, &same_keys, 3);
+    let gov_ixs = vec![
+        ed25519_proof_ix(&f.signers(&[0, 1, 2]), &gov_msg),
+        propose_rotation_ix(&f.authority.pubkey(), same_keys.clone(), 3),
+    ];
+    send_ixs(&mut f.svm, &gov_ixs, &f.authority, &[])
+        .expect("same-membership rotation proposal succeeds");
+    warp_seconds(&mut f.svm, DEFAULT_TEST_TIMELOCK);
     send(
         &mut f.svm,
-        update_validator_set_ix(&f.authority.pubkey(), same_keys.clone(), 3),
+        execute_rotation_ix(&f.authority.pubkey()),
         &f.authority,
         &[],
     )
-    .expect("same-membership rotation succeeds");
+    .expect("same-membership rotation executes");
     let set = get_validator_set(&f.svm);
     assert_eq!(set.epoch, 1);
     assert_eq!(set.validators, same_keys);

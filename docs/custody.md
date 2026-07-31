@@ -23,6 +23,14 @@ decided. See ADR-0008.
 
 ## Decision log
 
+- **2026-07-31 — Governance hardening delivered (Phase 7a, ADR-0014).**
+  Validator-set rotation no longer has an admin-gated path: it requires an
+  M-of-N federation proof plus a configured timelock. This removes the
+  single-key indirect mint capability that had stood open since Phase 1.
+  Items #1 (federation composition) and #7 (pause authority/quorum) remain
+  OPEN — pause and admin handover are still gated by the interim admin key,
+  neither of which confers a mint capability.
+
 - **2026-07-30 — #9 (partial) Withdrawal payout policy, Phase 6 only**
   (owner decisions D3/D4/D6, ADR-0013). Deterministic coin selection
   (exact-match → smallest-covering → greedy largest-first, tie-broken on
