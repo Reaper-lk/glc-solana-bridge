@@ -27,7 +27,7 @@ use glc_relayer::glc::db::Db;
 use glc_relayer::glc::indexer::{Indexer, TickOutcome};
 use glc_relayer::glc::rpc::RpcClient;
 use glc_relayer::orchestrator::{Orchestrator, OrchestratorError};
-use glc_relayer::signer;
+use glc_relayer::p2p::collector::{GrpcCollector, PeerEndpoint};
 use glc_relayer::solana::config::{RawSolanaConfig, SolanaConfig};
 use glc_relayer::solana::rpc::RealSolanaRpc;
 use glc_relayer::withdrawal::adapter::RealPayoutRpc;
@@ -275,6 +275,36 @@ async fn withdrawal_tick(
     Ok(())
 }
 
+/// Parses `GLC_FEDERATION_PEERS`: comma-separated `base58pubkey@uri`.
+///
+/// The pubkey is the validator identity the endpoint must answer as; a
+/// response claiming a different identity is discarded by the collector, so
+/// a compromised endpoint cannot impersonate another federation member.
+fn parse_federation_peers(raw: &str) -> anyhow::Result<Vec<PeerEndpoint>> {
+    let peers: Vec<PeerEndpoint> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|entry| {
+            let (pk, uri) = entry.split_once('@').ok_or_else(|| {
+                anyhow::anyhow!("federation peer {entry:?} must be formatted pubkey@uri")
+            })?;
+            Ok(PeerEndpoint {
+                validator_pubkey: pk
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("peer {pk:?} is not a valid pubkey: {e}"))?,
+                uri: uri.to_string(),
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
+    if peers.is_empty() {
+        return Err(anyhow::anyhow!(
+            "GLC_FEDERATION_PEERS must list at least one federation peer"
+        ));
+    }
+    Ok(peers)
+}
+
 /// The Goldcoin indexer's tick loop (Phase 4), run as an independent task
 /// alongside the orchestrator's so a stall or restart of one side never
 /// blocks the other.
@@ -339,7 +369,7 @@ async fn run_indexer_loop(
 /// connection (`Db::open` enables WAL mode + a busy timeout for exactly
 /// this overlap).
 async fn run_orchestrator_loop(
-    mut orchestrator: Orchestrator<RealSolanaRpc>,
+    mut orchestrator: Orchestrator<RealSolanaRpc, GrpcCollector>,
     poll_interval: Duration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
@@ -425,7 +455,11 @@ async fn main() -> anyhow::Result<()> {
             solana_config.submitter_keypair_path.display()
         )
     })?;
-    let validator_keys = signer::load_validator_keypairs(&solana_config.validator_keypair_paths)?;
+    // Phase 7c (ADR-0016): this process holds NO validator key. Signatures
+    // are requested from federation peers, each of which independently
+    // re-derives the message before signing. The peer set is configured
+    // as `pubkey@uri` pairs.
+    let peers = parse_federation_peers(&env_required("GLC_FEDERATION_PEERS")?)?;
     let solana_rpc = RealSolanaRpc::new(solana_config.rpc_url.clone(), solana_config.commitment);
     let orchestrator_poll_interval = Duration::from_millis(solana_config.poll_interval_ms);
     let orchestrator = Orchestrator::new(
@@ -433,7 +467,7 @@ async fn main() -> anyhow::Result<()> {
         solana_rpc,
         solana_config.program_id,
         submitter,
-        validator_keys,
+        GrpcCollector::new(peers),
     );
 
     // Third service: the Goldcoin withdrawal executor (Phase 6, ADR-0013).

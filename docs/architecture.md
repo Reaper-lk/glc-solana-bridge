@@ -59,5 +59,7 @@ Goldcoin L1 (unmodified) ──JSON-RPC──▶ relayer (×N validators) ──
 | 5 | Relayer orchestration + p2p signature aggregation (no vault signing) |
 | 6 | Goldcoin withdrawal executor (ADR-0013): withdrawal discovery, persistent UTXO reservation, deterministic coin selection, verified payout construction, guarded signing, idempotent broadcast, confirmation tracking and reconciliation. Regtest only; single-key wallet-held vault (test custody). Completion tracked off-chain — no on-chain status write-back. |
 | 7a | Threshold-gated + timelocked governance (ADR-0014): `update_validator_set` deleted; `propose`/`execute`/`cancel_validator_rotation` reuse the ADR-0010 proof path. Closes the standing "admin key is an indirect mint capability" risk. |
-| 7b–7e | Vault custody, federation networking, on-chain withdrawal completion, multi-relayer coordination, operations and rollout — designed in ADR-0014, not yet implemented |
+| 7b | Goldcoin vault custody (ADR-0015): real P2SH M-of-N verified on regtest, designated signing quorum inside the payout intent, auditable reassignment. |
+| 7c | Federation signature exchange (ADR-0016): gRPC protocol and signer service, independent re-derivation before signing, one key per process; the plural key loader is deleted and the orchestrator holds none. |
+| 7d–7e | On-chain withdrawal completion, multi-relayer coordination, operations and rollout — designed in ADR-0014, not yet implemented |
 | — | Audits, devnet/mainnet: gated on `custody.md`, outside this plan |

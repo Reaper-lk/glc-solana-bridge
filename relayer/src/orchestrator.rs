@@ -22,7 +22,7 @@
 //! safeguard (`Db::verify_and_load_signable_message`) fresh every time.
 
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{Keypair, Signer};
+use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::transaction::Transaction;
 use thiserror::Error;
 
@@ -72,12 +72,35 @@ pub struct TickReport {
 /// `glc::indexer`'s `INNER_RETRY_ATTEMPTS`).
 const INNER_RETRY_ATTEMPTS: u32 = 3;
 
-pub struct Orchestrator<R: SolanaRpc> {
+/// Collects federation signatures over a canonical message.
+///
+/// The orchestrator holds **no validator keys** (Phase 7c, ADR-0016): it
+/// asks peers, each of which independently re-derives the message before
+/// signing (`p2p::policy`). A trait so the mint pipeline stays testable
+/// without standing up a network, mirroring `SolanaRpc` and `PayoutRpc`.
+pub trait SignatureCollector {
+    /// Requests signatures over `message` for the deposit `(txid, vout)` at
+    /// `epoch`, returning whatever the federation actually produced.
+    ///
+    /// Returning fewer than threshold is normal and not an error: the
+    /// caller retries on a later tick. Peers that refuse are reported by
+    /// the transport as refusals, which are alarms rather than failures of
+    /// this call.
+    fn collect_mint_signatures(
+        &self,
+        epoch: u64,
+        message: &[u8],
+        txid: [u8; 32],
+        vout: u32,
+    ) -> impl std::future::Future<Output = Vec<(Pubkey, Signature)>> + Send;
+}
+
+pub struct Orchestrator<R: SolanaRpc, C: SignatureCollector> {
     db: Db,
     rpc: R,
     program_id: Pubkey,
     submitter: Keypair,
-    validator_keys: Vec<Keypair>,
+    collector: C,
 }
 
 fn now_unix() -> i64 {
@@ -87,20 +110,17 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-impl<R: SolanaRpc> Orchestrator<R> {
-    pub fn new(
-        db: Db,
-        rpc: R,
-        program_id: Pubkey,
-        submitter: Keypair,
-        validator_keys: Vec<Keypair>,
-    ) -> Self {
+impl<R: SolanaRpc, C: SignatureCollector> Orchestrator<R, C> {
+    /// Note the absence of any validator key parameter: this process signs
+    /// nothing with a federation identity. `submitter` pays fees only and
+    /// confers no authority (owner decision R4).
+    pub fn new(db: Db, rpc: R, program_id: Pubkey, submitter: Keypair, collector: C) -> Self {
         Orchestrator {
             db,
             rpc,
             program_id,
             submitter,
-            validator_keys,
+            collector,
         }
     }
 
@@ -186,7 +206,18 @@ impl<R: SolanaRpc> Orchestrator<R> {
             return Ok(DepositOutcome::IntegrityHalted);
         }
 
-        let sigs = signer::sign_with_all(&self.validator_keys, &claim.message);
+        // Signatures come from peers, each of which re-derives these exact
+        // bytes from its own chain observations before signing. This
+        // process holds no validator key (ADR-0016).
+        let sigs = self
+            .collector
+            .collect_mint_signatures(
+                claim.validator_epoch,
+                &claim.message,
+                claim.txid,
+                claim.vout,
+            )
+            .await;
 
         let (validator_set_pda, _) = instruction::validator_set_pda(&self.program_id);
         let validator_set_account = Self::call(|| self.rpc.get_account(&validator_set_pda))

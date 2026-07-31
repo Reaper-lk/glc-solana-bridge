@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+// Federation signature exchange (Phase 7c, ADR-0016).
+//
+// This service moves SIGNATURES, never truth. A responder never trusts the
+// requester's description of the world: it independently re-derives the
+// canonical bytes from its OWN chain observations and refuses to sign
+// anything that does not match byte for byte. A compromised requester
+// therefore cannot induce a signature over anything the responder has not
+// itself verified.
+package glc.federation.v1;
+
+service FederationSigner {
+  // Requests this validator's signature over a canonical message it must
+  // independently re-derive and agree with.
+  rpc Sign(SignRequest) returns (SignResponse);
+
+  // Liveness and identity probe, used to decide quorum availability BEFORE
+  // designating one (ADR-0015: reassignment must be explicit, so the
+  // executor prefers to designate a quorum it believes is reachable).
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// What is being asked for. Action discriminants match the on-chain
+// canonical-message action bytes so a signature can never be repurposed
+// across action types.
+enum Action {
+  ACTION_UNSPECIFIED = 0;   // never valid
+  ACTION_MINT_DEPOSIT = 1;  // shared::claim::ACTION_MINT_DEPOSIT
+  ACTION_PAYOUT = 2;        // Goldcoin vault payout (ADR-0015 intent)
+  ACTION_GOVERNANCE = 3;    // shared::governance
+}
+
+message SignRequest {
+  // Unique per request; makes a retry distinguishable from a fresh ask.
+  bytes request_id = 1;
+  Action action = 2;
+  // The validator-set epoch the requester believes is current. A responder
+  // whose own view disagrees refuses rather than signing under a stale
+  // federation.
+  uint64 epoch = 3;
+  // The exact bytes the requester wants signed. CHECKED, never trusted:
+  // the responder re-derives them and compares.
+  bytes canonical_message = 4;
+  // Identifiers letting the responder locate the same facts in its own
+  // state in order to re-derive `canonical_message`.
+  Context context = 5;
+  // Unix seconds after which this request must be refused.
+  int64 expiry_unix = 6;
+}
+
+// Enough identity to re-derive, never enough to be believed.
+message Context {
+  // Mint: the Goldcoin deposit identity.
+  bytes txid = 1;
+  uint32 vout = 2;
+  // Payout: the on-chain withdrawal index and its designated quorum
+  // attempt (ADR-0015) — a responder must not sign for a superseded
+  // designation.
+  uint64 withdrawal_index = 3;
+  uint32 quorum_attempt = 4;
+}
+
+message SignResponse {
+  bytes request_id = 1;
+  // The responder's validator identity (ed25519 public key).
+  bytes validator_pubkey = 2;
+  bytes signature = 3;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bytes validator_pubkey = 1;
+  // The epoch this validator currently observes. Divergence between peers
+  // is an alarm, not noise.
+  uint64 observed_epoch = 2;
+}

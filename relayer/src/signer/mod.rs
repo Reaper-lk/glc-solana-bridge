@@ -1,20 +1,16 @@
 //! Key management & claim signing (Phase 5, ADR-0012).
 //!
-//! # ⚠️ Single-process bootstrap topology — NOT the production design
+//! # One key per process (Phase 7c, ADR-0016)
 //!
-//! Owner decision R2: for Phase 5 only, one relayer process loads and holds
-//! MULTIPLE validators' ed25519 keypairs directly, signing claims with all
-//! of them itself. This exists to prove the full mint pipeline end-to-end
-//! (a single process can reach threshold on its own, so the local-validator
-//! e2e test doesn't first require a working multi-process p2p network).
+//! Phase 5's bootstrap topology (owner decision R2) is **retired**. One
+//! process no longer loads several validators' keys and signs with all of
+//! them: `load_validator_keypairs` is deleted, and the only loader here
+//! returns exactly one identity.
 //!
-//! **This is test/bootstrap architecture only.** A real federation must
-//! never operate this way: each validator's private key must be held by
-//! that validator alone, on their own infrastructure. The real design —
-//! each relayer holding exactly one key, exchanging signatures with peers
-//! over the network (`p2p` module, still a placeholder) — is a later
-//! phase's work. Do not deploy this module's multi-key loading path beyond
-//! a controlled test/bootstrap environment.
+//! A validator's key now lives solely inside its own signer service
+//! (`p2p::service::SignerService`), which runs as a separate process. The
+//! mint orchestrator and withdrawal executor hold no key material at all —
+//! they request signatures over gRPC and aggregate the responses.
 //!
 //! Keys are loaded once at startup from operator-configured file paths
 //! (standard Solana CLI keypair JSON, the `[u8; 64]` array format —
@@ -45,45 +41,36 @@ pub enum SignerError {
     NoKeypairs,
 }
 
-/// Loads every configured validator keypair file. Fails closed: any
-/// unreadable or malformed file aborts startup rather than silently
-/// signing with a partial set (a partial set could still be enough to
-/// reach threshold with a WRONG membership, which must never happen
-/// silently).
-pub fn load_validator_keypairs(paths: &[impl AsRef<Path>]) -> Result<Vec<Keypair>, SignerError> {
-    if paths.is_empty() {
-        return Err(SignerError::NoKeypairs);
-    }
-    paths
-        .iter()
-        .map(|p| {
-            let path = p.as_ref();
-            solana_sdk::signature::read_keypair_file(path).map_err(|e| {
-                // read_keypair_file returns a boxed dyn error covering both
-                // I/O and malformed-content failures; std::io::Error is the
-                // closest faithful wrapper without pulling its dynamic error
-                // type into this module's public API.
-                SignerError::KeypairFile {
-                    path: path.display().to_string(),
-                    source: std::io::Error::other(e.to_string()),
-                }
-            })
-        })
-        .collect()
+/// Loads **the** validator keypair for this process.
+///
+/// Singular by design: there is deliberately no function here that loads a
+/// set of validator keys. Holding more than one federation identity in one
+/// process is the bootstrap topology Phase 7c retires, and removing the
+/// plural loader is what makes that structural rather than advisory.
+///
+/// Fails closed: an unreadable or malformed file aborts startup rather than
+/// letting the process run without the identity it is supposed to have.
+pub fn load_validator_keypair(path: impl AsRef<Path>) -> Result<Keypair, SignerError> {
+    let path = path.as_ref();
+    solana_sdk::signature::read_keypair_file(path).map_err(|e| {
+        // read_keypair_file returns a boxed dyn error covering both I/O and
+        // malformed-content failures; std::io::Error is the closest faithful
+        // wrapper without pulling its dynamic error type into this module's
+        // public API.
+        SignerError::KeypairFile {
+            path: path.display().to_string(),
+            source: std::io::Error::other(e.to_string()),
+        }
+    })
 }
 
-/// Signs `message` — which MUST be freshly obtained from
-/// [`crate::glc::db::Db::verify_and_load_signable_message`], never cached —
-/// with every configured key, returning one `(pubkey, signature)` pair per
-/// key. Pure and I/O-free: the actual instruction-building/aggregation step
-/// is [`aggregate`].
-pub fn sign_with_all(
-    keys: &[Keypair],
-    message: &[u8],
-) -> Vec<(solana_sdk::pubkey::Pubkey, Signature)> {
-    keys.iter()
-        .map(|k| (k.pubkey(), k.sign_message(message)))
-        .collect()
+/// Signs `message` with this validator's single key.
+///
+/// `message` MUST be freshly obtained from
+/// [`crate::glc::db::Db::verify_and_load_signable_message`], never cached.
+/// Pure and I/O-free; aggregating signatures from peers is [`aggregate`].
+pub fn sign_one(key: &Keypair, message: &[u8]) -> (solana_sdk::pubkey::Pubkey, Signature) {
+    (key.pubkey(), key.sign_message(message))
 }
 
 #[cfg(test)]
@@ -101,40 +88,25 @@ mod tests {
     }
 
     #[test]
-    fn loads_multiple_real_keypair_files() {
+    fn loads_the_single_validator_keypair() {
         let dir = tempfile::tempdir().unwrap();
-        let k1 = Keypair::new();
-        let k2 = Keypair::new();
-        let p1 = write_keypair_file(&dir, "v1.json", &k1);
-        let p2 = write_keypair_file(&dir, "v2.json", &k2);
-        let loaded = load_validator_keypairs(&[p1, p2]).unwrap();
-        assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].pubkey(), k1.pubkey());
-        assert_eq!(loaded[1].pubkey(), k2.pubkey());
-    }
-
-    #[test]
-    fn rejects_empty_key_list() {
-        let empty: Vec<std::path::PathBuf> = vec![];
-        let err = load_validator_keypairs(&empty).unwrap_err();
-        assert!(matches!(err, SignerError::NoKeypairs));
+        let k = Keypair::new();
+        let p = write_keypair_file(&dir, "v1.json", &k);
+        assert_eq!(load_validator_keypair(p).unwrap().pubkey(), k.pubkey());
     }
 
     #[test]
     fn rejects_missing_file() {
-        let err = load_validator_keypairs(&["/nonexistent/path/does/not/exist.json"]).unwrap_err();
+        let err = load_validator_keypair("/nonexistent/path/does/not/exist.json").unwrap_err();
         assert!(matches!(err, SignerError::KeypairFile { .. }));
     }
 
     #[test]
-    fn sign_with_all_produces_one_signature_per_key_over_the_same_message() {
-        let keys = vec![Keypair::new(), Keypair::new(), Keypair::new()];
+    fn sign_one_produces_a_verifying_signature() {
+        let key = Keypair::new();
         let message = b"exact bytes to sign, nothing cached";
-        let sigs = sign_with_all(&keys, message);
-        assert_eq!(sigs.len(), 3);
-        for (i, (pubkey, sig)) in sigs.iter().enumerate() {
-            assert_eq!(*pubkey, keys[i].pubkey());
-            assert!(sig.verify(pubkey.as_ref(), message));
-        }
+        let (pubkey, sig) = sign_one(&key, message);
+        assert_eq!(pubkey, key.pubkey());
+        assert!(sig.verify(pubkey.as_ref(), message));
     }
 }

@@ -26,6 +26,7 @@ use solana_sdk::transaction::Transaction;
 use glc_relayer::glc::db::{Db, DbError, DepositState, NewBlock, NewCandidate, NewClaimArtifact};
 use glc_relayer::glc::deposit::build_claim_message;
 use glc_relayer::orchestrator::Orchestrator;
+use glc_relayer::p2p::collector::InProcessCollector;
 use glc_relayer::solana::instruction;
 use glc_relayer::solana::rpc::{SolanaRpc, SolanaRpcError};
 
@@ -389,17 +390,19 @@ fn build_harness(validator_key_count: usize, threshold: u8) -> Harness {
 }
 
 impl Harness {
-    fn orchestrator(&self) -> Orchestrator<MockRpc> {
+    fn orchestrator(&self) -> Orchestrator<MockRpc, InProcessCollector> {
         let db = Db::open(&self.db_path).unwrap();
         Orchestrator::new(
             db,
             self.rpc.clone(),
             self.fixture.program_id,
             Keypair::try_from(self.submitter.to_bytes().as_slice()).unwrap(),
-            self.validator_keys
-                .iter()
-                .map(|k| Keypair::try_from(k.to_bytes().as_slice()).unwrap())
-                .collect(),
+            InProcessCollector::new(
+                self.validator_keys
+                    .iter()
+                    .map(|k| Keypair::try_from(k.to_bytes().as_slice()).unwrap())
+                    .collect(),
+            ),
         )
     }
 

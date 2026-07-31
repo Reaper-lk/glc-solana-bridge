@@ -64,11 +64,30 @@ solana-client = "2.1"
 # constant (classic Token program — owner decision U5, Phase 2).
 spl-associated-token-account = "4"
 spl-token = "6"
+
+# Federation signature exchange (Phase 7c, ADR-0016). gRPC over TLS between
+# a fixed, known set of <=16 mutually-authenticated operators. libp2p was
+# rejected in ADR-0014 6.1: its value (discovery, NAT traversal, transport
+# agility) is unneeded for a static peer set, while its dependency surface
+# is large against a deny.toml already strained by solana-client. Verified
+# before adoption: resolves under MSRV 1.85 and cargo-deny passes on both
+# workspaces with these added.
+# TLS is deliberately NOT enabled yet: tonic's `tls` feature pulls
+# rustls-pemfile, which carries an unmaintained advisory
+# (RUSTSEC-2025-0134) with no safe upgrade. Phase 7c ships the protocol and
+# the signer service; mTLS lands with the transport hardening that actually
+# uses it, and its dependency cost is re-evaluated then rather than carried
+# unused now.
+tonic = { version = "0.12", default-features = false, features = ["codegen", "prost", "transport"] }
+prost = "0.13"
 # Types-only crate, ALREADY in the tree via solana-pubsub-client — declaring
 # it directly adds nothing new to the dependency graph. Needed because
 # getProgramAccounts defaults to base58 encoding, which the node refuses for
 # accounts over 128 bytes (a WithdrawalRequest is 180).
 solana-account-decoder-client-types = "2.3"
+
+[build-dependencies]
+tonic-build = "0.12"
 
 [dev-dependencies]
 tempfile = "3"

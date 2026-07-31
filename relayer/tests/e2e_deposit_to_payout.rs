@@ -41,6 +41,7 @@ use glc_relayer::glc::indexer::Indexer;
 use glc_relayer::glc::rpc::RpcClient as GlcRpcClient;
 use glc_relayer::glc::withdrawal_db::WithdrawalState;
 use glc_relayer::orchestrator::Orchestrator;
+use glc_relayer::p2p::collector::InProcessCollector;
 use glc_relayer::solana::instruction as glc_ix;
 use glc_relayer::solana::rpc::RealSolanaRpc;
 use glc_relayer::withdrawal::adapter::RealPayoutRpc;
@@ -534,10 +535,14 @@ async fn deposit_to_mint_to_burn_to_goldcoin_payout() {
         RealSolanaRpc::new(sol.url.clone(), CommitmentLevel::Confirmed),
         program_id,
         Keypair::try_from(submitter.to_bytes().as_slice()).unwrap(),
-        validators
-            .iter()
-            .map(|k| Keypair::try_from(k.to_bytes().as_slice()).unwrap())
-            .collect(),
+        // Test-only in-process signing; production wiring uses GrpcCollector
+        // and the orchestrator holds no keys (ADR-0016).
+        InProcessCollector::new(
+            validators
+                .iter()
+                .map(|k| Keypair::try_from(k.to_bytes().as_slice()).unwrap())
+                .collect(),
+        ),
     );
     let mut minted = false;
     for _ in 0..40 {
