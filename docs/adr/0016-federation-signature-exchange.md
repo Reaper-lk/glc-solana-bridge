@@ -84,6 +84,16 @@ a `SignatureCollector`. Holding several federation identities in one process
 is now something that would have to be built deliberately rather than
 something that happens by default.
 
+### 8. The build ships its own protobuf compiler
+
+`tonic-build` needs `protoc`. Relying on a system install made the build
+pass locally and fail in CI, where no protobuf compiler exists. The build
+script uses `protoc-bin-vendored` unless `PROTOC` is explicitly set, so the
+build is self-contained: no contributor or runner needs a toolchain that
+happens to be present. A build that only works on machines with the right
+tools installed is not a reproducible build, which matters for the verified
+builds ADR-0014 §12 requires before launch.
+
 ## Consequences
 
 - The mint path no longer signs locally; a validator that has not itself

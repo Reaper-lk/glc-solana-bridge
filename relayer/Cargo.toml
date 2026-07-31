@@ -88,6 +88,11 @@ solana-account-decoder-client-types = "2.3"
 
 [build-dependencies]
 tonic-build = "0.12"
+# Ships its own protoc. Without this the build needs a system protobuf
+# compiler, which the CI runners do not have and every contributor would
+# otherwise have to install by hand — a build that only works on machines
+# that happen to have the right toolchain is not a reproducible build.
+protoc-bin-vendored = "3"
 
 [dev-dependencies]
 tempfile = "3"
