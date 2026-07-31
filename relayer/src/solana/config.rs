@@ -4,6 +4,15 @@
 //! startup, with no silent defaults for security-relevant parameters
 //! (owner decision R3 — the confirmation commitment level has no built-in
 //! default and must be configured explicitly).
+//!
+//! # No validator keypair paths here (Phase 7d)
+//!
+//! `validator_keypair_paths` is **removed**. The relayer holds no validator
+//! key, so requiring it to be configured with paths to them was worse than
+//! redundant: it invited operators to place federation key material in the
+//! relayer's environment, which is exactly the topology Phase 7c retired.
+//! A validator key is configured only for `signer-server`, in its own
+//! process, via `GLC_SIGNER_VALIDATOR_KEYPAIR_PATH` (singular).
 
 use std::path::PathBuf;
 
@@ -17,10 +26,6 @@ pub enum SolanaConfigError {
     Empty { field: &'static str },
     #[error("{field} must be a valid base58 Solana pubkey: {reason}")]
     InvalidPubkey { field: &'static str, reason: String },
-    #[error(
-        "no validator keypair paths configured — at least one is required (owner decision R2)"
-    )]
-    NoValidatorKeypairs,
     #[error("commitment level must be one of processed|confirmed|finalized, got {0:?}")]
     InvalidCommitment(String),
 }
@@ -32,9 +37,6 @@ pub struct RawSolanaConfig {
     pub program_id: String,
     /// Pays every mint_wrapped transaction's fees (owner decision R4).
     pub submitter_keypair_path: PathBuf,
-    /// One file per validator identity — see `signer` module's
-    /// bootstrap-topology warning (owner decision R2).
-    pub validator_keypair_paths: Vec<PathBuf>,
     /// No default (owner decision R3) — required.
     pub commitment: String,
     pub poll_interval_ms: u64,
@@ -45,9 +47,22 @@ pub struct SolanaConfig {
     pub rpc_url: String,
     pub program_id: Pubkey,
     pub submitter_keypair_path: PathBuf,
-    pub validator_keypair_paths: Vec<PathBuf>,
     pub commitment: CommitmentLevel,
     pub poll_interval_ms: u64,
+}
+
+/// Parses a commitment level. There is deliberately no default: the level a
+/// deployment confirms at is a security decision (owner decision R3).
+///
+/// Shared by [`SolanaConfig::validate`] and `signer-server`, so the two
+/// processes cannot come to disagree about what `finalized` means.
+pub fn parse_commitment(s: &str) -> Result<CommitmentLevel, SolanaConfigError> {
+    match s {
+        "processed" => Ok(CommitmentLevel::Processed),
+        "confirmed" => Ok(CommitmentLevel::Confirmed),
+        "finalized" => Ok(CommitmentLevel::Finalized),
+        other => Err(SolanaConfigError::InvalidCommitment(other.to_string())),
+    }
 }
 
 impl SolanaConfig {
@@ -64,21 +79,12 @@ impl SolanaConfig {
                         reason: e.to_string(),
                     }
                 })?;
-        if raw.validator_keypair_paths.is_empty() {
-            return Err(SolanaConfigError::NoValidatorKeypairs);
-        }
-        let commitment = match raw.commitment.as_str() {
-            "processed" => CommitmentLevel::Processed,
-            "confirmed" => CommitmentLevel::Confirmed,
-            "finalized" => CommitmentLevel::Finalized,
-            other => return Err(SolanaConfigError::InvalidCommitment(other.to_string())),
-        };
+        let commitment = parse_commitment(&raw.commitment)?;
 
         Ok(SolanaConfig {
             rpc_url: raw.rpc_url,
             program_id,
             submitter_keypair_path: raw.submitter_keypair_path,
-            validator_keypair_paths: raw.validator_keypair_paths,
             commitment,
             poll_interval_ms: raw.poll_interval_ms,
         })
@@ -94,7 +100,6 @@ mod tests {
             rpc_url: "http://127.0.0.1:8899".into(),
             program_id: Pubkey::new_unique().to_string(),
             submitter_keypair_path: PathBuf::from("/tmp/submitter.json"),
-            validator_keypair_paths: vec![PathBuf::from("/tmp/v1.json")],
             commitment: "confirmed".into(),
             poll_interval_ms: 1000,
         }
@@ -127,16 +132,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn rejects_no_validator_keypairs() {
-        let mut raw = base_raw();
-        raw.validator_keypair_paths = vec![];
-        assert_eq!(
-            SolanaConfig::validate(raw).unwrap_err(),
-            SolanaConfigError::NoValidatorKeypairs
-        );
     }
 
     #[test]

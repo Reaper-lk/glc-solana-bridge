@@ -51,6 +51,11 @@ pub enum Refusal {
     UnknownPeer,
     #[error("peer exceeded its request rate limit")]
     RateLimited,
+    #[error(
+        "this validator's observation of the chain is stale — refusing to sign rather than \
+         authorize under a federation revision it may no longer be current with"
+    )]
+    StaleView,
 }
 
 /// What a request is asking to sign. Mirrors the wire `Action`, and the
@@ -96,6 +101,21 @@ pub enum SigningIdentity {
 pub trait LocalView {
     /// The validator-set epoch this validator currently observes.
     fn observed_epoch(&self) -> u64;
+
+    /// Whether that observation is recent enough to act on.
+    ///
+    /// A validator whose link to the chain has been down cannot tell a
+    /// *matching* epoch from a *superseded* one: it would keep answering
+    /// with a remembered value and keep agreeing with requesters who quote
+    /// it back. Distinguishing "current" from "last known" is what stops a
+    /// partitioned signer from authorizing under a federation revision it
+    /// has fallen behind.
+    ///
+    /// Defaults to `true` for views that are inherently current — an
+    /// in-memory test view, for instance, cannot be stale.
+    fn view_is_fresh(&self) -> bool {
+        true
+    }
 
     /// The canonical bytes this validator derives for `identity`, or `None`
     /// if it cannot derive them (has not seen the deposit, does not have the
@@ -184,6 +204,13 @@ pub fn evaluate(
         });
     }
 
+    // Before comparing epochs, establish that this validator's epoch is
+    // worth comparing against. A stale view would otherwise let a
+    // partitioned signer agree with anyone quoting its last known value.
+    if !view.view_is_fresh() {
+        return Decision::Refuse(Refusal::StaleView);
+    }
+
     let observed = view.observed_epoch();
     if request.epoch != observed {
         return Decision::Refuse(Refusal::EpochMismatch {
@@ -226,6 +253,20 @@ mod tests {
         }
         fn derive_message(&self, _a: Action, id: &SigningIdentity) -> Option<Vec<u8>> {
             self.messages.get(id).cloned()
+        }
+    }
+
+    /// A view whose chain observation has gone stale.
+    struct StaleView(View);
+    impl LocalView for StaleView {
+        fn observed_epoch(&self) -> u64 {
+            self.0.observed_epoch()
+        }
+        fn view_is_fresh(&self) -> bool {
+            false
+        }
+        fn derive_message(&self, a: Action, id: &SigningIdentity) -> Option<Vec<u8>> {
+            self.0.derive_message(a, id)
         }
     }
 
@@ -404,6 +445,63 @@ mod tests {
         assert_eq!(Action::from_wire(1), Ok(Action::MintDeposit));
         assert_eq!(Action::from_wire(2), Ok(Action::Payout));
         assert_eq!(Action::from_wire(3), Ok(Action::Governance));
+    }
+
+    #[test]
+    fn refuses_when_this_validators_view_of_the_chain_is_stale() {
+        // The request is otherwise perfect — matching epoch, matching bytes.
+        // A signer that has lost its link to the chain must still refuse:
+        // it cannot tell a current epoch from a superseded one.
+        let v = StaleView(view_with(b"canonical".to_vec()));
+        assert_eq!(
+            evaluate(&req(b"canonical".to_vec()), &v, &SeenSet::new(), 500),
+            Decision::Refuse(Refusal::StaleView)
+        );
+    }
+
+    #[test]
+    fn a_stale_view_is_refused_before_any_epoch_or_derivation_work() {
+        // Ordering matters: staleness must not be masked by a coincidentally
+        // matching epoch, and must not cost derivation work either.
+        struct Stale;
+        impl LocalView for Stale {
+            fn observed_epoch(&self) -> u64 {
+                panic!("a stale view must be refused before its epoch is consulted");
+            }
+            fn view_is_fresh(&self) -> bool {
+                false
+            }
+            fn derive_message(&self, _: Action, _: &SigningIdentity) -> Option<Vec<u8>> {
+                panic!("a stale view must be refused before derivation");
+            }
+        }
+        assert_eq!(
+            evaluate(&req(b"canonical".to_vec()), &Stale, &SeenSet::new(), 500),
+            Decision::Refuse(Refusal::StaleView)
+        );
+    }
+
+    #[test]
+    fn an_expired_request_is_refused_even_when_the_view_is_stale() {
+        // Expiry is the cheapest check and stays first; staleness does not
+        // displace it.
+        let v = StaleView(view_with(b"canonical".to_vec()));
+        assert!(matches!(
+            evaluate(&req(b"canonical".to_vec()), &v, &SeenSet::new(), 1_001),
+            Decision::Refuse(Refusal::Expired { .. })
+        ));
+    }
+
+    #[test]
+    fn a_fresh_view_is_the_default_so_existing_views_are_unaffected() {
+        // `view_is_fresh` has a default impl; a view that does not override
+        // it must behave exactly as before this guard existed.
+        let v = view_with(b"canonical".to_vec());
+        assert!(v.view_is_fresh());
+        assert!(matches!(
+            evaluate(&req(b"canonical".to_vec()), &v, &SeenSet::new(), 500),
+            Decision::Sign(_)
+        ));
     }
 
     #[test]

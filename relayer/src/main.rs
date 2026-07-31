@@ -1,11 +1,26 @@
 //! glc-relayer — federated validator daemon.
 //!
-//! Phase 4 wires up the Goldcoin indexer (`glc` module): it follows the
-//! chain, detects vault deposits, tracks confirmations, and produces
-//! unsigned canonical claim artifacts once a deposit reaches
-//! `ReadyForSignature`. It does not sign, aggregate signatures, submit to
-//! Solana, or move any value — those remain Phase 5+ (`signer`, `p2p`,
-//! `solana` modules).
+//! Runs three long-running services against one SQLite file, each on its own
+//! task so a stall on one side never blocks the others:
+//!
+//! 1. the **Goldcoin indexer** (`glc`) — follows the chain, detects vault
+//!    deposits, tracks confirmations, and freezes canonical claim artifacts
+//!    at `ReadyForSignature` (Phase 4);
+//! 2. the **mint orchestrator** (`orchestrator`) — collects federation
+//!    signatures and submits `mint_wrapped` (Phase 5, ADR-0012);
+//! 3. the **withdrawal executor** (`withdrawal`) — pays out on Goldcoin
+//!    (Phase 6, ADR-0013).
+//!
+//! # This process holds no validator key
+//!
+//! It signs nothing with a federation identity. Signatures are requested
+//! from `signer-server` peers over mutually authenticated TLS, each of which
+//! independently re-derives the message from its own chain observations
+//! before signing (ADR-0016). The submitter keypair pays transaction fees
+//! and confers no authority whatsoever (owner decision R4).
+//!
+//! A fully compromised relayer can therefore waste fees and stall progress,
+//! but cannot mint or move value.
 //!
 //! All configuration — including RPC credentials — comes from the
 //! environment, never from a committed file (see `.gitignore` and
@@ -27,7 +42,8 @@ use glc_relayer::glc::db::Db;
 use glc_relayer::glc::indexer::{Indexer, TickOutcome};
 use glc_relayer::glc::rpc::RpcClient;
 use glc_relayer::orchestrator::{Orchestrator, OrchestratorError};
-use glc_relayer::p2p::collector::{GrpcCollector, PeerEndpoint};
+use glc_relayer::p2p::collector::GrpcCollector;
+use glc_relayer::p2p::identity::{parse_peers, TlsMaterial, TlsPaths};
 use glc_relayer::solana::config::{RawSolanaConfig, SolanaConfig};
 use glc_relayer::solana::rpc::RealSolanaRpc;
 use glc_relayer::withdrawal::adapter::RealPayoutRpc;
@@ -138,18 +154,10 @@ fn config_from_env() -> anyhow::Result<IndexerConfig> {
 /// message, and reusing the single parsed source eliminates any chance of
 /// the two drifting apart.
 fn solana_config_from_env(program_id_bytes: [u8; 32]) -> anyhow::Result<SolanaConfig> {
-    let validator_keypair_paths: Vec<PathBuf> = env_required("GLC_SOLANA_VALIDATOR_KEYPAIR_PATHS")?
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .collect();
-
     let raw = RawSolanaConfig {
         rpc_url: env_required("GLC_SOLANA_RPC_URL")?,
         program_id: Pubkey::from(program_id_bytes).to_string(),
         submitter_keypair_path: PathBuf::from(env_required("GLC_SOLANA_SUBMITTER_KEYPAIR_PATH")?),
-        validator_keypair_paths,
         // No built-in default (owner decision R3): the confirmation
         // commitment level must be explicit in configuration.
         commitment: env_required("GLC_SOLANA_COMMITMENT")?,
@@ -275,34 +283,44 @@ async fn withdrawal_tick(
     Ok(())
 }
 
-/// Parses `GLC_FEDERATION_PEERS`: comma-separated `base58pubkey@uri`.
+/// Builds the peer collector from configuration (Phase 7d).
 ///
-/// The pubkey is the validator identity the endpoint must answer as; a
-/// response claiming a different identity is discarded by the collector, so
-/// a compromised endpoint cannot impersonate another federation member.
-fn parse_federation_peers(raw: &str) -> anyhow::Result<Vec<PeerEndpoint>> {
-    let peers: Vec<PeerEndpoint> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|entry| {
-            let (pk, uri) = entry.split_once('@').ok_or_else(|| {
-                anyhow::anyhow!("federation peer {entry:?} must be formatted pubkey@uri")
-            })?;
-            Ok(PeerEndpoint {
-                validator_pubkey: pk
-                    .parse()
-                    .map_err(|e| anyhow::anyhow!("peer {pk:?} is not a valid pubkey: {e}"))?,
-                uri: uri.to_string(),
-            })
-        })
-        .collect::<anyhow::Result<_>>()?;
-    if peers.is_empty() {
-        return Err(anyhow::anyhow!(
-            "GLC_FEDERATION_PEERS must list at least one federation peer"
-        ));
+/// `GLC_FEDERATION_PEERS` is comma-separated `base58pubkey@uri`: the pubkey
+/// is the on-chain validator identity the endpoint must answer as, checked
+/// on every response, so a compromised endpoint cannot impersonate another
+/// federation member even with a valid certificate.
+///
+/// TLS is **required unless explicitly disabled**. `GLC_FEDERATION_TLS=off`
+/// exists for loopback and regtest, and is loud on purpose: without it a
+/// relayer talks to its signers in plaintext, with no transport
+/// authentication at all.
+fn collector_from_env() -> anyhow::Result<GrpcCollector> {
+    let peers = parse_peers(&env_required("GLC_FEDERATION_PEERS")?, None)?;
+
+    if std::env::var("GLC_FEDERATION_TLS").as_deref() == Ok("off") {
+        tracing::warn!(
+            peer_count = peers.len(),
+            "GLC_FEDERATION_TLS=off — federation traffic is UNAUTHENTICATED at the transport \
+             layer; acceptable only for loopback or regtest"
+        );
+        return Ok(GrpcCollector::insecure_without_tls(peers));
     }
-    Ok(peers)
+
+    let tls = TlsMaterial::load(&TlsPaths {
+        ca: PathBuf::from(env_required("GLC_FEDERATION_CA_CERT_PATH")?),
+        cert: PathBuf::from(env_required("GLC_RELAYER_TLS_CERT_PATH")?),
+        key: PathBuf::from(env_required("GLC_RELAYER_TLS_KEY_PATH")?),
+    })?;
+    // Pinned by configuration rather than derived from each peer's URI: a
+    // peer must present a certificate for the federation's name, not merely
+    // for a hostname it happens to control.
+    let domain = env_required("GLC_FEDERATION_TLS_DOMAIN")?;
+    tracing::info!(
+        peer_count = peers.len(),
+        tls_domain = %domain,
+        "federation transport: mutual TLS against the pinned federation CA"
+    );
+    Ok(GrpcCollector::new(peers, tls, domain))
 }
 
 /// The Goldcoin indexer's tick loop (Phase 4), run as an independent task
@@ -441,7 +459,6 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         program_id = %solana_config.program_id,
         commitment = ?solana_config.commitment,
-        validator_count = solana_config.validator_keypair_paths.len(),
         "glc-relayer: starting Solana mint orchestrator (ADR-0012)"
     );
     // A second, independent connection to the same SQLite file (Db::open
@@ -455,11 +472,11 @@ async fn main() -> anyhow::Result<()> {
             solana_config.submitter_keypair_path.display()
         )
     })?;
-    // Phase 7c (ADR-0016): this process holds NO validator key. Signatures
-    // are requested from federation peers, each of which independently
-    // re-derives the message before signing. The peer set is configured
-    // as `pubkey@uri` pairs.
-    let peers = parse_federation_peers(&env_required("GLC_FEDERATION_PEERS")?)?;
+    // Phase 7c/7d (ADR-0016): this process holds NO validator key.
+    // Signatures are requested from `signer-server` peers over mutually
+    // authenticated TLS, each of which independently re-derives the message
+    // before signing. Only signatures cross the network.
+    let collector = collector_from_env()?;
     let solana_rpc = RealSolanaRpc::new(solana_config.rpc_url.clone(), solana_config.commitment);
     let orchestrator_poll_interval = Duration::from_millis(solana_config.poll_interval_ms);
     let orchestrator = Orchestrator::new(
@@ -467,7 +484,7 @@ async fn main() -> anyhow::Result<()> {
         solana_rpc,
         solana_config.program_id,
         submitter,
-        GrpcCollector::new(peers),
+        collector,
     );
 
     // Third service: the Goldcoin withdrawal executor (Phase 6, ADR-0013).
