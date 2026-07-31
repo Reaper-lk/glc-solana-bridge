@@ -20,6 +20,10 @@ pub const SEED_MINT_AUTHORITY: &[u8] = b"mint_authority";
 /// account IS the replay guard.
 pub const SEED_DEPOSIT_CLAIM: &[u8] = b"deposit_claim";
 
+/// Singleton PDA holding the governance action currently inside its
+/// timelock window (Phase 7a, ADR-0014). At most one may be pending.
+pub const SEED_GOVERNANCE_ACTION: &[u8] = b"governance_action";
+
 /// Per-withdrawal record PDA, additionally seeded with a monotonically
 /// increasing withdrawal index from `BridgeConfig`.
 pub const SEED_WITHDRAWAL: &[u8] = b"withdrawal";

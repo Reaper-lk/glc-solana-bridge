@@ -75,3 +75,29 @@ pub struct WithdrawalRequested {
     pub amount: u64,
     pub glc_address: Vec<u8>,
 }
+
+/// A validator rotation was threshold-approved and queued behind the
+/// timelock (Phase 7a, ADR-0014). Emitted so observers can react during the
+/// delay window — the whole purpose of the timelock.
+#[event]
+pub struct GovernanceActionProposed {
+    pub action: u8,
+    pub proposed_under_epoch: u64,
+    pub eta: i64,
+    pub threshold: u8,
+    pub validator_count: u8,
+}
+
+/// A queued governance action was executed after its timelock elapsed.
+#[event]
+pub struct GovernanceActionExecuted {
+    pub action: u8,
+    pub new_epoch: u64,
+}
+
+/// A queued governance action was cancelled before execution.
+#[event]
+pub struct GovernanceActionCancelled {
+    pub action: u8,
+    pub eta: i64,
+}

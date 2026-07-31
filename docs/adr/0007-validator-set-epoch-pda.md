@@ -31,9 +31,17 @@ The federation lives in its own singleton PDA, `ValidatorSet`
   non-empty, ≤ 16, no duplicate keys, no all-zero (default) keys — the
   zero pubkey has no usable signing key, so counting it toward N could make
   the threshold unreachable and stall the bridge — `1 ≤ threshold ≤ len`;
-- Phase 1 rotation authority is the interim single admin key (ADR-0008);
-  threshold-gated + timelocked governance arrives with proof verification in
-  Phase 3 (docs/threat-model.md).
+- Phase 1 rotation authority is the interim single admin key (ADR-0008).
+
+  **Correction (Phase 7a, 2026-07-31):** this ADR originally stated that
+  threshold-gated + timelocked governance would arrive "with proof
+  verification in Phase 3". That did not happen — Phase 3 delivered proof
+  verification for `mint_wrapped` only, and rotation remained gated by the
+  single admin key for four further phases. It was delivered in **Phase 7a**
+  (ADR-0014): `update_validator_set` is deleted, and rotation now requires an
+  M-of-N federation proof plus a timelock. The original wording is left above
+  rather than silently rewritten, so the record shows what was expected
+  versus what shipped.
 
 ## Consequences
 

@@ -66,14 +66,24 @@ pub struct BridgeConfig {
     /// ([`crate::constants::SEED_MINT_AUTHORITY`]), stored at
     /// `create_wrapped_mint` for `invoke_signed`.
     pub mint_authority_bump: u8,
+    /// Delay, in seconds, between proposing a governance action and its
+    /// earliest execution (Phase 7a, ADR-0014). Set at `initialize` with no
+    /// built-in default — the safe value is a live security/ops decision
+    /// (custody.md #7), and the program refuses to run on a zero.
+    ///
+    /// Appended AFTER `mint_authority_bump` and taken out of `reserved`, so
+    /// every pre-existing field keeps its byte offset and the account's
+    /// total size is unchanged (the same discipline ADR-0009 used).
+    pub governance_timelock_seconds: i64,
     /// Expansion space for future fields, so already-initialized deployments
     /// can migrate without moving accounts. Must be all zeroes until a
     /// migration assigns meaning.
-    pub reserved: [u8; 31],
+    pub reserved: [u8; 23],
 }
 
 impl BridgeConfig {
-    /// 8 (discriminator) + 1 + 32 + 33 + 1 + 8 + 8 + 8 + 1 + 32 + 1 + 31 = 164.
+    /// 8 (discriminator) + 1 + 32 + 33 + 1 + 8 + 8 + 8 + 1 + 32 + 1 + 8 + 23
+    /// = 164 — unchanged by Phase 7a, which took its field out of `reserved`.
     pub const SPACE: usize = 8 // Anchor discriminator
         + 1 // protocol_version
         + 32 // admin
@@ -85,7 +95,8 @@ impl BridgeConfig {
         + 1 // bump
         + 32 // wrapped_mint
         + 1 // mint_authority_bump
-        + 31; // reserved
+        + 8 // governance_timelock_seconds
+        + 23; // reserved
 }
 
 /// Singleton federation validator set (PDA:
@@ -132,6 +143,66 @@ impl ValidatorSet {
         + 1 // threshold
         + 1 // bump
         + (4 + 32 * MAX_VALIDATORS) // validators (Vec length prefix + keys)
+        + 32; // reserved
+}
+
+/// A governance action that has been threshold-approved but is still inside
+/// its timelock window (PDA: [`crate::constants::SEED_GOVERNANCE_ACTION`],
+/// Phase 7a, ADR-0014).
+///
+/// A **singleton**: at most one action may be pending at a time. That is
+/// deliberate — it keeps the queue trivially auditable (an observer checks
+/// one address), makes "what is about to happen to this bridge?" a single
+/// account read, and prevents an attacker who briefly holds threshold from
+/// flooding a backlog of actions that all mature later. Replacing a pending
+/// action requires an explicit, threshold-approved cancellation first.
+///
+/// The account is allocated at `MAX_VALIDATORS` capacity so a proposal never
+/// reallocs, exactly as [`ValidatorSet`] is.
+///
+/// Byte layout (borsh, after the 8-byte Anchor discriminator):
+///
+/// | field                  | type          | bytes        |
+/// |------------------------|---------------|--------------|
+/// | `action`               | `u8`          | 1            |
+/// | `proposed_under_epoch` | `u64`         | 8            |
+/// | `eta`                  | `i64`         | 8            |
+/// | `threshold`            | `u8`          | 1            |
+/// | `validators`           | `Vec<Pubkey>` | 4 + 32 × len |
+/// | `bump`                 | `u8`          | 1            |
+/// | `reserved`             | `[u8; 32]`    | 32           |
+#[account]
+pub struct PendingGovernanceAction {
+    /// Action discriminant from `glc_bridge_shared::governance`
+    /// (`ACTION_PROPOSE_ROTATION`). Stored so a future action type cannot be
+    /// executed by a handler that was written for a different one.
+    pub action: u8,
+    /// The validator-set epoch this proposal was signed under. Execution
+    /// requires the epoch to still match: a proposal approved by one
+    /// federation must never be applied by a different one.
+    pub proposed_under_epoch: u64,
+    /// Earliest Unix timestamp at which execution is permitted.
+    pub eta: i64,
+    /// Proposed threshold.
+    pub threshold: u8,
+    /// Proposed validator set, in the exact order it will be stored. Order
+    /// is part of the signed commitment.
+    pub validators: Vec<Pubkey>,
+    /// Canonical PDA bump.
+    pub bump: u8,
+    /// Expansion space. Must be all zeroes until a migration assigns meaning.
+    pub reserved: [u8; 32],
+}
+
+impl PendingGovernanceAction {
+    /// 8 (discriminator) + 1 + 8 + 8 + 1 + (4 + 32×16) + 1 + 32 = 575.
+    pub const SPACE: usize = 8 // Anchor discriminator
+        + 1 // action
+        + 8 // proposed_under_epoch
+        + 8 // eta
+        + 1 // threshold
+        + (4 + 32 * MAX_VALIDATORS) // validators
+        + 1 // bump
         + 32; // reserved
 }
 
@@ -297,7 +368,8 @@ mod space {
             bump: u8::MAX,
             wrapped_mint: Pubkey::new_unique(),
             mint_authority_bump: u8::MAX,
-            reserved: [0u8; 31],
+            governance_timelock_seconds: i64::MAX,
+            reserved: [0u8; 23],
         };
         let serialized = max.try_to_vec().unwrap();
         assert_eq!(8 + serialized.len(), BridgeConfig::SPACE);
@@ -325,7 +397,8 @@ mod space {
             bump: 0xAB,
             wrapped_mint,
             mint_authority_bump: 0xCD,
-            reserved: [0u8; 31],
+            governance_timelock_seconds: 0,
+            reserved: [0u8; 23],
         };
         let bytes = config.try_to_vec().unwrap();
         assert_eq!(bytes[0], 7, "protocol_version at offset 0");
@@ -341,6 +414,22 @@ mod space {
         );
         assert_eq!(bytes[124], 0xCD, "mint_authority_bump at offset 124");
         assert_eq!(bytes.len(), BridgeConfig::SPACE - 8);
+    }
+
+    #[test]
+    fn pending_governance_action_space_matches_serialized_max() {
+        let max = PendingGovernanceAction {
+            action: u8::MAX,
+            proposed_under_epoch: u64::MAX,
+            eta: i64::MAX,
+            threshold: u8::MAX,
+            validators: vec![Pubkey::new_unique(); MAX_VALIDATORS],
+            bump: u8::MAX,
+            reserved: [0u8; 32],
+        };
+        let serialized = max.try_to_vec().unwrap();
+        assert_eq!(8 + serialized.len(), PendingGovernanceAction::SPACE);
+        assert_eq!(PendingGovernanceAction::SPACE, 575);
     }
 
     #[test]

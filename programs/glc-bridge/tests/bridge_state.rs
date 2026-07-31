@@ -31,7 +31,11 @@ fn initialize_happy_path() {
     assert_eq!(config.withdrawal_count, 0);
     assert_eq!(config.min_deposit, 1_000);
     assert_eq!(config.min_withdrawal, 2_000);
-    assert_eq!(config.reserved, [0u8; 31]);
+    assert_eq!(config.reserved, [0u8; 23]);
+    assert_eq!(
+        config.governance_timelock_seconds, DEFAULT_TEST_TIMELOCK,
+        "the governance timelock is stored as configured (ADR-0014)"
+    );
     assert_eq!(config.wrapped_mint, Pubkey::default());
     assert_eq!(config.mint_authority_bump, 0);
     let (expected_config, config_bump) =
@@ -247,99 +251,6 @@ fn set_paused_rejects_non_admin() {
         BridgeError::UnauthorizedAdmin,
     );
     assert!(!get_config(&svm).paused);
-}
-
-// ---------------------------------------------------- update_validator_set --
-
-#[test]
-fn update_validator_set_rotates_and_increments_epoch() {
-    let authority = Keypair::new();
-    let (mut svm, _) = setup_initialized(&authority, 3, 2);
-
-    let next = keys(4);
-    send(
-        &mut svm,
-        update_validator_set_ix(&authority.pubkey(), next.clone(), 4),
-        &authority,
-        &[],
-    )
-    .expect("rotation should succeed");
-
-    let set = get_validator_set(&svm);
-    assert_eq!(set.epoch, 1);
-    assert_eq!(set.threshold, 4);
-    assert_eq!(set.validators, next);
-
-    // A second rotation advances the epoch again.
-    let final_set = keys(2);
-    send(
-        &mut svm,
-        update_validator_set_ix(&authority.pubkey(), final_set.clone(), 1),
-        &authority,
-        &[],
-    )
-    .expect("second rotation should succeed");
-    let set = get_validator_set(&svm);
-    assert_eq!(set.epoch, 2);
-    assert_eq!(set.validators, final_set);
-}
-
-#[test]
-fn update_validator_set_rejects_non_admin() {
-    let authority = Keypair::new();
-    let (mut svm, validators) = setup_initialized(&authority, 3, 2);
-    let intruder = Keypair::new();
-    svm.airdrop(&intruder.pubkey(), 1_000_000_000).unwrap();
-    assert_bridge_error(
-        send(
-            &mut svm,
-            update_validator_set_ix(&intruder.pubkey(), keys(3), 2),
-            &intruder,
-            &[],
-        ),
-        BridgeError::UnauthorizedAdmin,
-    );
-    let set = get_validator_set(&svm);
-    assert_eq!(set.epoch, 0);
-    assert_eq!(set.validators, validators);
-}
-
-#[test]
-fn update_validator_set_enforces_same_invariants_as_initialize() {
-    let authority = Keypair::new();
-    let (mut svm, _) = setup_initialized(&authority, 3, 2);
-    let mut dup = keys(4);
-    dup[3] = dup[1];
-    assert_bridge_error(
-        send(
-            &mut svm,
-            update_validator_set_ix(&authority.pubkey(), dup, 2),
-            &authority,
-            &[],
-        ),
-        BridgeError::DuplicateValidator,
-    );
-    assert_eq!(get_validator_set(&svm).epoch, 0);
-}
-
-#[test]
-fn update_validator_set_rejects_all_zero_validator_key() {
-    let authority = Keypair::new();
-    let (mut svm, validators) = setup_initialized(&authority, 3, 2);
-    let mut next = keys(4);
-    next[0] = Pubkey::default();
-    assert_bridge_error(
-        send(
-            &mut svm,
-            update_validator_set_ix(&authority.pubkey(), next, 2),
-            &authority,
-            &[],
-        ),
-        BridgeError::InvalidValidatorKey,
-    );
-    let set = get_validator_set(&svm);
-    assert_eq!(set.epoch, 0);
-    assert_eq!(set.validators, validators);
 }
 
 // ---------------------------------------------------------- admin handover --

@@ -12,4 +12,5 @@
 
 pub mod claim;
 pub mod crypto;
+pub mod governance;
 pub mod types;

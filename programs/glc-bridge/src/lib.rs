@@ -10,7 +10,7 @@
 //! - [`initialize`](glc_bridge::initialize) — create the two state PDAs;
 //!   only the program upgrade authority may call, exactly once. (Phase 1)
 //! - [`set_paused`](glc_bridge::set_paused),
-//!   [`update_validator_set`](glc_bridge::update_validator_set),
+//!   [`propose_validator_rotation`](glc_bridge::propose_validator_rotation),
 //!   [`transfer_admin`](glc_bridge::transfer_admin) /
 //!   [`accept_admin`](glc_bridge::accept_admin) — admin-gated governance.
 //!   (Phase 1)
@@ -48,8 +48,16 @@ pub mod glc_bridge {
         threshold: u8,
         min_deposit: u64,
         min_withdrawal: u64,
+        governance_timelock_seconds: i64,
     ) -> Result<()> {
-        instructions::initialize(ctx, validators, threshold, min_deposit, min_withdrawal)
+        instructions::initialize(
+            ctx,
+            validators,
+            threshold,
+            min_deposit,
+            min_withdrawal,
+            governance_timelock_seconds,
+        )
     }
 
     /// Admin-only circuit breaker for the value-moving paths (Phase 2+).
@@ -57,13 +65,27 @@ pub mod glc_bridge {
         instructions::set_paused(ctx, paused)
     }
 
-    /// Admin-only validator-set/threshold rotation; advances the epoch.
-    pub fn update_validator_set(
-        ctx: Context<UpdateValidatorSet>,
+    /// Queues a validator-set rotation behind the governance timelock,
+    /// authorized by an M-of-N federation proof (Phase 7a, ADR-0014).
+    /// Replaces the deleted admin-gated `update_validator_set`.
+    pub fn propose_validator_rotation(
+        ctx: Context<ProposeGovernanceAction>,
         validators: Vec<Pubkey>,
         threshold: u8,
     ) -> Result<()> {
-        instructions::update_validator_set(ctx, validators, threshold)
+        instructions::propose_validator_rotation(ctx, validators, threshold)
+    }
+
+    /// Applies a queued rotation once its timelock has elapsed.
+    /// Permissionless: the threshold proof at proposal time was the
+    /// authorization.
+    pub fn execute_validator_rotation(ctx: Context<ExecuteGovernanceAction>) -> Result<()> {
+        instructions::execute_validator_rotation(ctx)
+    }
+
+    /// Cancels the pending governance action; requires a fresh M-of-N proof.
+    pub fn cancel_validator_rotation(ctx: Context<CancelGovernanceAction>) -> Result<()> {
+        instructions::cancel_validator_rotation(ctx)
     }
 
     /// Admin-only step 1 of the two-step admin handover.

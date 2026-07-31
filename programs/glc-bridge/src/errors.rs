@@ -65,4 +65,14 @@ pub enum BridgeError {
     BelowMinimumWithdrawal,
     #[msg("Goldcoin destination address length is invalid")]
     InvalidGlcAddressLength,
+
+    // ---- Governance (Phase 7a, ADR-0014) ----
+    #[msg("Governance timelock must be greater than zero seconds")]
+    ZeroGovernanceTimelock,
+    #[msg("Pending governance action is not of the expected type")]
+    WrongGovernanceAction,
+    #[msg("Governance action is still inside its timelock window")]
+    GovernanceTimelockNotElapsed,
+    #[msg("Pending governance action was approved under a different validator-set epoch")]
+    StaleGovernanceProposal,
 }
