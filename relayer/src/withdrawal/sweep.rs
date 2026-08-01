@@ -120,8 +120,13 @@ impl SweepPlan {
     ///
     /// Layout: tag(16) ‖ version(1) ‖ source_hash160(20) ‖ dest_hash160(20)
     /// ‖ dest_script_len(2 LE) ‖ dest_script ‖ fee(8 LE) ‖ swept(8 LE)
-    /// ‖ input_count(4 LE) ‖ [ txid(32, internal order) ‖ vout(4 LE)
-    /// ‖ amount(8 LE) ] …
+    /// ‖ input_count(4 LE) ‖ [ txid(32, **display order** — the bytes
+    /// `VaultUtxo` stores) ‖ vout(4 LE) ‖ amount(8 LE) ] …
+    ///
+    /// Display order, not internal, because that is what every operator's
+    /// `vault_utxos` row holds; the choice is arbitrary but must be stated,
+    /// since the two differ by a reversal and a silent disagreement would
+    /// make two honest operators derive different commitments.
     pub fn canonical_intent(&self, protocol_version: u8) -> Vec<u8> {
         let mut out =
             Vec::with_capacity(80 + self.dest_script_pubkey.len() + self.inputs.len() * 44);
@@ -255,13 +260,17 @@ pub fn verify_sweep_tx(tx: &Transaction, plan: &SweepPlan) -> Result<(), SweepEr
         if !got.script_sig.is_empty() {
             return Err(SweepError::AlreadySigned(i));
         }
-        if got.prev_txid != want.txid || u64::from(got.prev_vout) != want.vout as u64 {
+        // The transaction carries internal order; the plan carries what the
+        // node displayed. Converting is mandatory — see `internal_txid`.
+        if got.prev_txid != internal_txid(&want.txid)
+            || u64::from(got.prev_vout) != want.vout as u64
+        {
             return Err(SweepError::InputMismatch {
                 index: i,
                 expected: format!("{}:{}", want.txid_hex, want.vout),
                 found: format!(
                     "{}:{}",
-                    crate::glc::hex::encode(&got.prev_txid),
+                    crate::glc::hex::encode(&internal_txid(&got.prev_txid)),
                     got.prev_vout
                 ),
             });
@@ -289,6 +298,25 @@ pub fn verify_sweep_tx(tx: &Transaction, plan: &SweepPlan) -> Result<(), SweepEr
     Ok(())
 }
 
+/// A stored (display-order) txid as it appears **inside a transaction**.
+///
+/// Goldcoin serializes an input's previous-output txid in internal order,
+/// which is the byte reversal of the hex a node displays and of what
+/// `VaultUtxo::txid` holds (decoded straight from `listunspent`). The two
+/// must be converted, never compared directly.
+///
+/// This cost a real defect: [`verify_sweep_tx`] and the signer's input
+/// lookup originally compared them as-is. Every unit fixture built both
+/// sides from the same array, so the tests agreed with each other and with
+/// nothing else — `sweep-execute` would have refused every genuine sweep
+/// with `UnknownInput`. Found by the Phase 7j rehearsal against a real node,
+/// which is precisely what ADR-0014 §8.7 asks a rehearsal to catch.
+pub fn internal_txid(display_order: &[u8; 32]) -> [u8; 32] {
+    let mut t = *display_order;
+    t.reverse();
+    t
+}
+
 /// The `scriptPubKey` for a P2SH destination: `OP_HASH160 <20> OP_EQUAL`.
 ///
 /// A new vault is always P2SH, so the compromise-response path builds its
@@ -313,9 +341,15 @@ mod tests {
     const DUST: u64 = 5_400;
 
     fn utxo(seed: u8, amount: u64) -> VaultUtxo {
+        // Deliberately NOT `[seed; 32]`: a uniform array is a palindrome, so
+        // display and internal order would coincide and every byte-order
+        // assertion in this module would prove nothing.
+        let mut txid = [seed; 32];
+        txid[0] = seed.wrapping_add(1);
+        txid[31] = seed.wrapping_add(2);
         VaultUtxo {
-            txid: [seed; 32],
-            txid_hex: crate::glc::hex::encode(&[seed; 32]),
+            txid,
+            txid_hex: crate::glc::hex::encode(&txid),
             vout: 0,
             amount_atomic: amount,
             script_pubkey_hex: crate::glc::hex::encode(&p2sh_script_pubkey(&SRC)),
@@ -342,7 +376,8 @@ mod tests {
                 .inputs
                 .iter()
                 .map(|u| TxInput {
-                    prev_txid: u.txid,
+                    // Internal order, as a real transaction carries it.
+                    prev_txid: internal_txid(&u.txid),
                     prev_vout: u.vout as u32,
                     script_sig: Vec::new(),
                     sequence: 0xffff_ffff,
@@ -555,10 +590,54 @@ mod tests {
     }
 
     #[test]
+    fn a_transaction_carrying_display_order_txids_is_rejected() {
+        // THE regression. Goldcoin serializes an input's txid in internal
+        // order; `VaultUtxo` stores display order. The first version of this
+        // module compared them directly and every unit fixture built both
+        // sides from one array, so the tests agreed with each other and with
+        // nothing else — `sweep-execute` would have refused every genuine
+        // sweep. Found by the Phase 7j real-node rehearsal.
+        //
+        // This pins the convention against a KNOWN WRONG value rather than
+        // against the fixture, so making both sides drift together cannot
+        // make it pass again.
+        let p = plan(&[utxo(1, 500_000), utxo(2, 700_000)]);
+        let mut tx = tx_for(&p);
+        for (inp, want) in tx.inputs.iter_mut().zip(&p.inputs) {
+            inp.prev_txid = want.txid; // display order — the bug
+        }
+        assert!(
+            matches!(
+                verify_sweep_tx(&tx, &p).unwrap_err(),
+                SweepError::InputMismatch { .. }
+            ),
+            "a transaction whose inputs are in display order is not the planned sweep"
+        );
+    }
+
+    #[test]
+    fn the_two_txid_orders_are_genuinely_different() {
+        // Guards the test above from becoming vacuous: if `utxo()` ever
+        // produced a palindromic txid, display and internal order would
+        // coincide and the regression test would pass for the wrong reason.
+        let u = utxo(1, 500_000);
+        assert_ne!(
+            internal_txid(&u.txid),
+            u.txid,
+            "the fixture txid must not be a palindrome, or the order test proves nothing"
+        );
+        assert_eq!(
+            internal_txid(&internal_txid(&u.txid)),
+            u.txid,
+            "reversal is its own inverse"
+        );
+    }
+
+    #[test]
     fn a_substituted_input_is_rejected() {
         let p = plan(&[utxo(1, 500_000), utxo(2, 700_000)]);
         let mut tx = tx_for(&p);
-        tx.inputs[1].prev_txid = [0xEE; 32];
+        tx.inputs[1].prev_txid = internal_txid(&[0xEE; 32]);
         assert!(matches!(
             verify_sweep_tx(&tx, &p).unwrap_err(),
             SweepError::InputMismatch { index: 1, .. }
