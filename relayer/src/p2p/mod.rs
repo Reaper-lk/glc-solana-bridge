@@ -38,13 +38,17 @@
 //! | [`ratelimit`] | per-peer request limits, so one peer cannot starve the rest |
 //! | [`payout_view`] | what this validator will sign for a vault payout (7e) |
 //! | [`completion_view`] | what this validator will attest a completion for (7f) |
+//! | [`governance_view`] | what this validator will sign for governance — operator-staged, not derived (7i-0) |
+//! | [`sweep_view`] | what this validator will sign for a vault sweep — operator-staged, plus its own UTXO view (7i-0) |
 
 pub mod aggregation;
 pub mod collector;
 pub mod completion_view;
+pub mod governance_view;
 pub mod identity;
 pub mod payout_view;
 pub mod policy;
 pub mod ratelimit;
 pub mod service;
+pub mod sweep_view;
 pub mod view;

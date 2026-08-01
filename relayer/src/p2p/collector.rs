@@ -391,6 +391,125 @@ impl GrpcCollector {
         PartialRound { partials, round }
     }
 
+    /// Collects **vault sweep partials** from the federation (Phase 7i-0).
+    ///
+    /// Unlike a payout, a sweep has no designated quorum: it is not derived
+    /// from a withdrawal index, so there is nothing to designate from. Every
+    /// vault signer is asked, and the first `threshold` that answer are the
+    /// quorum — which is sound here because the operators, not the protocol,
+    /// decide a sweep, and any M of them suffice.
+    ///
+    /// Refusals are **ordinary**, as with governance: a signer whose
+    /// operator has not staged this exact sweep is behaving as designed.
+    pub async fn collect_sweep_partials(
+        &self,
+        epoch: u64,
+        unsigned_tx_hex: &str,
+        signers: &[DesignatedSigner],
+        threshold: usize,
+    ) -> PartialRound {
+        let mut round = Round::new();
+        let mut partials = Vec::with_capacity(threshold);
+        let deadline = tokio::time::Instant::now() + ROUND_TIMEOUT;
+
+        for d in signers {
+            if partials.len() >= threshold {
+                break;
+            }
+            let Some(peer) = self
+                .peers
+                .iter()
+                .find(|p| p.validator_pubkey == d.validator_pubkey)
+            else {
+                round.record(
+                    d.validator_pubkey,
+                    PeerOutcome::Unavailable("vault signer is not a configured peer".to_string()),
+                );
+                continue;
+            };
+            if tokio::time::Instant::now() >= deadline {
+                round.record(
+                    d.validator_pubkey,
+                    PeerOutcome::Unavailable("round timeout".to_string()),
+                );
+                continue;
+            }
+
+            let req = pb::SweepSignRequest {
+                request_id: Self::next_request_id(),
+                epoch,
+                unsigned_tx_hex: unsigned_tx_hex.to_string(),
+                expiry_unix: crate::p2p::service::now_unix() + REQUEST_TTL_SECONDS,
+            };
+            match self.ask_sweep(peer, req, d).await {
+                Ok(partial) => {
+                    round.record(
+                        d.validator_pubkey,
+                        PeerOutcome::Signed(Signature::default()),
+                    );
+                    partials.push(partial);
+                }
+                Err(outcome) => {
+                    if let PeerOutcome::Refused(why) = &outcome {
+                        tracing::info!(
+                            peer = %d.validator_pubkey,
+                            reason = %why,
+                            "peer has not approved this vault sweep"
+                        );
+                    }
+                    round.record(d.validator_pubkey, outcome);
+                }
+            }
+        }
+
+        tracing::warn!(
+            collected = partials.len(),
+            threshold,
+            summary = %round.summary(),
+            "VAULT SWEEP partial-signature collection round"
+        );
+        PartialRound { partials, round }
+    }
+
+    async fn ask_sweep(
+        &self,
+        peer: &PeerEndpoint,
+        req: pb::SweepSignRequest,
+        signer: &DesignatedSigner,
+    ) -> Result<PartialSignature, PeerOutcome> {
+        let mut client = self
+            .connect(&peer.uri)
+            .await
+            .map_err(PeerOutcome::Unavailable)?;
+
+        let resp = match tokio::time::timeout(PER_PEER_TIMEOUT, client.sign_sweep(req)).await {
+            Err(_) => return Err(PeerOutcome::Unavailable("per-peer timeout".to_string())),
+            Ok(Err(status)) => {
+                return Err(if status.code() == tonic::Code::FailedPrecondition {
+                    PeerOutcome::Refused(status.message().to_string())
+                } else {
+                    PeerOutcome::Unavailable(status.to_string())
+                })
+            }
+            Ok(Ok(r)) => r.into_inner(),
+        };
+
+        // The same two-cryptosystem identity check the payout path makes, by
+        // reusing its acceptor: the response shapes are identical, and a
+        // second copy of this logic is a second place for it to drift.
+        Self::accept_payout(
+            &peer.validator_pubkey,
+            signer,
+            pb::PayoutSignResponse {
+                request_id: resp.request_id,
+                validator_pubkey: resp.validator_pubkey,
+                vault_pubkey: resp.vault_pubkey,
+                signatures: resp.signatures,
+            },
+        )
+        .map_err(PeerOutcome::Unavailable)
+    }
+
     /// Collects **completion attestations** from the federation (Phase 7f,
     /// ADR-0018).
     ///
@@ -453,6 +572,103 @@ impl GrpcCollector {
             "completion attestation collection round"
         );
         round
+    }
+
+    /// Collects **governance signatures** from the federation (Phase 7i-0).
+    ///
+    /// Asks everyone, because governance has no designated quorum: any M
+    /// operators who have each staged an approval may authorise the action.
+    /// Refusals here are ordinary — a validator whose operator has not
+    /// approved this specific proposal is *supposed* to say no.
+    pub async fn collect_governance_signatures(
+        &self,
+        epoch: u64,
+        action: u8,
+        params_commitment: &[u8; 32],
+        message: &[u8],
+    ) -> Round {
+        let identities: Vec<Pubkey> = self.peers.iter().map(|p| p.validator_pubkey).collect();
+        let mut round = Round::new();
+        let deadline = tokio::time::Instant::now() + ROUND_TIMEOUT;
+        let threshold = self.peers.len();
+        let seed = u64::from(action)
+            ^ u64::from_le_bytes(params_commitment[..8].try_into().unwrap_or([0u8; 8]));
+
+        for pubkey in ask_order(&identities, seed) {
+            if round.reached(threshold) {
+                break;
+            }
+            let Some(peer) = self.peers.iter().find(|p| p.validator_pubkey == pubkey) else {
+                continue;
+            };
+            if tokio::time::Instant::now() >= deadline {
+                round.record(
+                    pubkey,
+                    PeerOutcome::Unavailable("round timeout".to_string()),
+                );
+                continue;
+            }
+            let req = pb::GovernanceSignRequest {
+                request_id: Self::next_request_id(),
+                epoch,
+                action: u32::from(action),
+                params_commitment: params_commitment.to_vec(),
+                expiry_unix: crate::p2p::service::now_unix() + REQUEST_TTL_SECONDS,
+            };
+            let outcome = self.ask_governance(peer, req, message).await;
+            if let PeerOutcome::Refused(why) = &outcome {
+                // NOT an alarm here, unlike everywhere else: a validator
+                // whose operator has not approved this proposal is behaving
+                // exactly as designed.
+                tracing::info!(
+                    peer = %pubkey,
+                    action,
+                    reason = %why,
+                    "peer has not approved this governance action"
+                );
+            }
+            round.record(pubkey, outcome);
+        }
+        tracing::info!(
+            action,
+            summary = %round.summary(),
+            "governance signature collection round"
+        );
+        round
+    }
+
+    async fn ask_governance(
+        &self,
+        peer: &PeerEndpoint,
+        req: pb::GovernanceSignRequest,
+        message: &[u8],
+    ) -> PeerOutcome {
+        let mut client = match self.connect(&peer.uri).await {
+            Ok(c) => c,
+            Err(e) => return PeerOutcome::Unavailable(e),
+        };
+        match tokio::time::timeout(PER_PEER_TIMEOUT, client.sign_governance(req)).await {
+            Err(_) => PeerOutcome::Unavailable("per-peer timeout".to_string()),
+            Ok(Err(status)) => {
+                if status.code() == tonic::Code::FailedPrecondition {
+                    PeerOutcome::Refused(status.message().to_string())
+                } else {
+                    PeerOutcome::Unavailable(status.to_string())
+                }
+            }
+            Ok(Ok(resp)) => {
+                let r = resp.into_inner();
+                let as_sign = pb::SignResponse {
+                    request_id: r.request_id,
+                    validator_pubkey: r.validator_pubkey,
+                    signature: r.signature,
+                };
+                match Self::accept(&peer.validator_pubkey, message, as_sign) {
+                    Ok((_, sig)) => PeerOutcome::Signed(sig),
+                    Err(why) => PeerOutcome::Unavailable(why),
+                }
+            }
+        }
     }
 
     async fn ask_completion(

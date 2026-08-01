@@ -22,11 +22,13 @@ use solana_sdk::signature::{Keypair, Signer as _};
 use tonic::{Request, Response, Status};
 
 use super::completion_view::{CompletionRefusal, CompletionView};
+use super::governance_view::GovernanceView;
 use super::payout_view::{PartialSigner, PayoutRefusal, PayoutView};
 use super::policy::{
     self, Action, Decision, LocalView, Refusal, SeenSet, SigningIdentity, SigningRequest,
 };
 use super::ratelimit::RateLimiter;
+use super::sweep_view::{SweepRefusal, SweepView};
 use crate::glc::db::Db;
 
 pub mod pb {
@@ -34,9 +36,12 @@ pub mod pb {
 }
 
 use pb::federation_signer_server::FederationSigner;
-use pb::{CompletionSignRequest, CompletionSignResponse};
 use pb::{
-    HealthRequest, HealthResponse, PayoutSignRequest, PayoutSignResponse, SignRequest, SignResponse,
+    CompletionSignRequest, CompletionSignResponse, GovernanceSignRequest, GovernanceSignResponse,
+};
+use pb::{
+    HealthRequest, HealthResponse, PayoutSignRequest, PayoutSignResponse, SignRequest,
+    SignResponse, SweepSignRequest, SweepSignResponse,
 };
 
 pub fn now_unix() -> i64 {
@@ -85,6 +90,55 @@ pub struct SignerService<V: LocalView + Send + Sync + 'static> {
     /// The completion-attestation arm (Phase 7f, ADR-0018). `None` refuses
     /// completion requests, for the same fail-closed reason.
     completion: Option<CompletionArm>,
+    /// The governance arm (Phase 7i-0). `None` refuses every governance
+    /// request — the correct default, since governance signing requires
+    /// explicit operator intent that a validator without a staged approval
+    /// has not given.
+    governance: Option<GovernanceArm>,
+    /// The vault-sweep arm (Phase 7i-0). `None` refuses every sweep, which
+    /// is the right default for the most dangerous operation in the system.
+    sweep: Option<SweepArm>,
+}
+
+/// The vault-sweep half of a signer. Like the payout arm it needs its own
+/// database handle and its own Goldcoin node; unlike it, its authorisation
+/// comes from an operator-staged approval rather than from the chain.
+struct SweepArm {
+    view: Box<dyn ErasedSweepView>,
+    db: Arc<tokio::sync::Mutex<Db>>,
+    protocol_version: u8,
+}
+
+/// Erases the [`PartialSigner`] type parameter, as [`ErasedPayoutView`] does.
+#[tonic::async_trait]
+trait ErasedSweepView: Send + Sync {
+    async fn sign_sweep(
+        &self,
+        db: &mut Db,
+        unsigned_tx_hex: &str,
+        protocol_version: u8,
+        now_unix: i64,
+    ) -> Result<super::payout_view::PayoutPartial, SweepRefusal>;
+}
+
+#[tonic::async_trait]
+impl<S: PartialSigner + Send + Sync + 'static> ErasedSweepView for SweepView<S> {
+    async fn sign_sweep(
+        &self,
+        db: &mut Db,
+        unsigned_tx_hex: &str,
+        protocol_version: u8,
+        now_unix: i64,
+    ) -> Result<super::payout_view::PayoutPartial, SweepRefusal> {
+        SweepView::sign_sweep(self, db, unsigned_tx_hex, protocol_version, now_unix).await
+    }
+}
+
+/// The governance half of a signer.
+struct GovernanceArm {
+    view: GovernanceView,
+    program_id: [u8; 32],
+    protocol_version: u8,
 }
 
 /// The completion-attestation half of a signer. Needs its own database
@@ -208,6 +262,8 @@ impl<V: LocalView + Send + Sync + 'static> SignerService<V> {
             ))),
             payout: None,
             completion: None,
+            governance: None,
+            sweep: None,
         }
     }
 
@@ -308,6 +364,152 @@ impl<V: LocalView + Send + Sync + 'static> SignerService<V> {
             validator_pubkey: self.validator_pubkey().to_vec(),
             signature: self.keypair.sign_message(&message).as_ref().to_vec(),
         })
+    }
+
+    /// Attaches the governance arm (Phase 7i-0).
+    ///
+    /// Governance is the one thing this signer cannot derive: it signs only
+    /// what its operator has staged. Without this arm it refuses every
+    /// governance request.
+    pub fn with_governance_arm(
+        mut self,
+        view: GovernanceView,
+        program_id: [u8; 32],
+        protocol_version: u8,
+    ) -> Self {
+        self.governance = Some(GovernanceArm {
+            view,
+            program_id,
+            protocol_version,
+        });
+        self
+    }
+
+    /// Handles a governance signing request. Exposed directly so the
+    /// decision path is testable without standing up a server.
+    pub fn handle_governance(
+        &self,
+        req: GovernanceSignRequest,
+    ) -> Result<GovernanceSignResponse, Refusal> {
+        let now = now_unix();
+        if now > req.expiry_unix {
+            return Err(Refusal::Expired {
+                expiry_unix: req.expiry_unix,
+                now,
+            });
+        }
+        if !self.view.view_is_fresh() {
+            return Err(Refusal::StaleView);
+        }
+        let observed = self.view.observed_epoch();
+
+        let Some(arm) = &self.governance else {
+            return Err(Refusal::Underivable(
+                "this validator has no governance arm and will not sign governance actions",
+            ));
+        };
+
+        let action = u8::try_from(req.action)
+            .map_err(|_| Refusal::Underivable("governance action does not fit in a byte"))?;
+        let commitment: [u8; 32] = req
+            .params_commitment
+            .as_slice()
+            .try_into()
+            .map_err(|_| Refusal::Underivable("parameter commitment is not 32 bytes"))?;
+
+        arm.view
+            .approve(action, &commitment, req.epoch, observed, now)
+            .map_err(|refusal| {
+                tracing::warn!(action, %refusal, "refused a governance signing request");
+                Refusal::GovernanceRefused(refusal.to_string())
+            })?;
+
+        // Built from THIS validator's own configuration and observed epoch,
+        // never from the request — the requester supplies only the
+        // commitment, which was compared against the staged approval above.
+        let message = glc_bridge_shared::governance::governance_message(
+            arm.protocol_version,
+            &arm.program_id,
+            observed,
+            action,
+            &commitment,
+        );
+        tracing::warn!(
+            action,
+            epoch = observed,
+            "SIGNED a governance action — this changes federation policy"
+        );
+
+        Ok(GovernanceSignResponse {
+            request_id: req.request_id,
+            validator_pubkey: self.validator_pubkey().to_vec(),
+            signature: self.keypair.sign_message(&message).as_ref().to_vec(),
+        })
+    }
+
+    /// Attaches the vault-sweep arm (Phase 7i-0).
+    ///
+    /// `db` must be this validator's OWN database: every input amount in a
+    /// sweep is read from it, and reading them from anywhere else would mean
+    /// signing over values this validator never observed.
+    pub fn with_sweep_arm<S: PartialSigner + Send + Sync + 'static>(
+        mut self,
+        view: SweepView<S>,
+        db: Db,
+        protocol_version: u8,
+    ) -> Self {
+        self.sweep = Some(SweepArm {
+            view: Box::new(view),
+            db: Arc::new(tokio::sync::Mutex::new(db)),
+            protocol_version,
+        });
+        self
+    }
+
+    /// Handles a sweep signing request. Exposed directly so the decision
+    /// path is testable without standing up a server.
+    pub async fn handle_sweep(&self, req: SweepSignRequest) -> Result<SweepSignResponse, Refusal> {
+        let now = now_unix();
+        if now > req.expiry_unix {
+            return Err(Refusal::Expired {
+                expiry_unix: req.expiry_unix,
+                now,
+            });
+        }
+        if !self.view.view_is_fresh() {
+            return Err(Refusal::StaleView);
+        }
+        let observed = self.view.observed_epoch();
+        if req.epoch != observed {
+            return Err(Refusal::EpochMismatch {
+                requested: req.epoch,
+                observed,
+            });
+        }
+
+        let Some(arm) = &self.sweep else {
+            return Err(Refusal::Underivable(
+                "this validator has no sweep arm and will not sign vault sweeps",
+            ));
+        };
+
+        let mut db = arm.db.lock().await;
+        match arm
+            .view
+            .sign_sweep(&mut db, &req.unsigned_tx_hex, arm.protocol_version, now)
+            .await
+        {
+            Ok(partial) => Ok(SweepSignResponse {
+                request_id: req.request_id,
+                validator_pubkey: self.validator_pubkey().to_vec(),
+                vault_pubkey: partial.vault_pubkey.to_vec(),
+                signatures: partial.signatures,
+            }),
+            Err(refusal) => {
+                tracing::warn!(%refusal, "refused a vault sweep signing request");
+                Err(Refusal::SweepRefused(refusal.to_string()))
+            }
+        }
     }
 
     /// Attaches the Goldcoin payout arm (Phase 7e).
@@ -550,6 +752,42 @@ impl<V: LocalView + Send + Sync + 'static> FederationSigner for SignerService<V>
         }
     }
 
+    async fn sign_governance(
+        &self,
+        request: Request<GovernanceSignRequest>,
+    ) -> Result<Response<GovernanceSignResponse>, Status> {
+        let peer = peer_key(&request);
+        if let Err(refusal) = self.check_rate_limit(&peer) {
+            tracing::warn!(%peer, "rate-limited a governance signing request");
+            return Err(Status::resource_exhausted(refusal.to_string()));
+        }
+        match self.handle_governance(request.into_inner()) {
+            Ok(resp) => Ok(Response::new(resp)),
+            Err(refusal) => {
+                tracing::warn!(%peer, %refusal, "refused a governance signing request");
+                Err(Status::failed_precondition(refusal.to_string()))
+            }
+        }
+    }
+
+    async fn sign_sweep(
+        &self,
+        request: Request<SweepSignRequest>,
+    ) -> Result<Response<SweepSignResponse>, Status> {
+        let peer = peer_key(&request);
+        if let Err(refusal) = self.check_rate_limit(&peer) {
+            tracing::warn!(%peer, "rate-limited a sweep signing request");
+            return Err(Status::resource_exhausted(refusal.to_string()));
+        }
+        match self.handle_sweep(request.into_inner()).await {
+            Ok(resp) => Ok(Response::new(resp)),
+            Err(refusal) => {
+                tracing::warn!(%peer, %refusal, "refused a sweep signing request");
+                Err(Status::failed_precondition(refusal.to_string()))
+            }
+        }
+    }
+
     async fn health(
         &self,
         _request: Request<HealthRequest>,
@@ -717,6 +955,8 @@ mod tests {
             },
             payout: None,
             completion: None,
+            governance: None,
+            sweep: None,
             seen: {
                 let mut seen = SeenSet::new();
                 seen.record(

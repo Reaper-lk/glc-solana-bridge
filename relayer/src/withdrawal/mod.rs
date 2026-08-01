@@ -5,14 +5,18 @@
 //! it, tracks confirmations, and reconciles — restart-safe, reorg-safe, and
 //! structurally unable to pay twice.
 //!
-//! # ⚠️ Regtest bootstrap custody — NOT production
+//! # Custody
 //!
-//! Owner decision D2: the vault is a single-key P2PKH address whose key is
-//! held by the Goldcoin node wallet. This is the withdrawal-side analogue of
-//! Phase 5's R2 bootstrap topology and carries the same warning: one key can
-//! drain the vault, and there is no threshold, no multisig, and no key
-//! ceremony. custody.md #2 (vault construction) and #3 (signing model)
-//! remain OPEN. Do not deploy this beyond a controlled regtest environment.
+//! The vault is a **P2SH M-of-N multisig** (ADR-0015, ADR-0017): no single
+//! process holds enough key material to spend it, and each designated signer
+//! signs on its own Goldcoin node against its own UTXO view.
+//!
+//! This header previously described the Phase 6 bootstrap: a single-key
+//! P2PKH vault held by the node wallet (owner decision D2). That vault was
+//! deleted in Phase 7e — `config::WithdrawalConfig` now refuses to validate
+//! anything but a multisig redeem script — and the warning is removed here
+//! rather than left standing, because a stale custody warning is read as a
+//! current one.
 
 pub mod adapter;
 pub mod address;
@@ -26,4 +30,5 @@ pub mod executor;
 pub mod federation;
 pub mod multisig;
 pub mod status;
+pub mod sweep;
 pub mod vault;
