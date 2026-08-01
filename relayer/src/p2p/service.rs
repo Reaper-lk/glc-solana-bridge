@@ -21,19 +21,23 @@ use std::sync::{Arc, Mutex};
 use solana_sdk::signature::{Keypair, Signer as _};
 use tonic::{Request, Response, Status};
 
+use super::payout_view::{PartialSigner, PayoutRefusal, PayoutView};
 use super::policy::{
     self, Action, Decision, LocalView, Refusal, SeenSet, SigningIdentity, SigningRequest,
 };
 use super::ratelimit::RateLimiter;
+use crate::glc::db::Db;
 
 pub mod pb {
     tonic::include_proto!("glc.federation.v1");
 }
 
 use pb::federation_signer_server::FederationSigner;
-use pb::{HealthRequest, HealthResponse, SignRequest, SignResponse};
+use pb::{
+    HealthRequest, HealthResponse, PayoutSignRequest, PayoutSignResponse, SignRequest, SignResponse,
+};
 
-fn now_unix() -> i64 {
+pub fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -71,6 +75,59 @@ pub struct SignerService<V: LocalView + Send + Sync + 'static> {
     view: V,
     seen: Arc<Mutex<SeenSet>>,
     limiter: Arc<Mutex<RateLimiter>>,
+    /// The Goldcoin payout arm (Phase 7e, ADR-0017). `None` means this
+    /// signer serves mint requests only and refuses payout requests
+    /// outright — the correct behaviour for a validator that holds no vault
+    /// key, and a fail-closed default rather than a silent no-op.
+    payout: Option<PayoutArm>,
+}
+
+/// The vault-signing half of a signer, kept separate because it is optional
+/// and because it needs its own database handle and its own Goldcoin node.
+struct PayoutArm {
+    view: Box<dyn ErasedPayoutView>,
+    /// A dedicated connection: `rusqlite::Connection` is `Send` but not
+    /// `Sync`, and payout signing must not contend with mint signing.
+    db: Arc<tokio::sync::Mutex<Db>>,
+}
+
+/// Erases the [`PartialSigner`] type parameter so `SignerService` does not
+/// gain a second one purely for an optional arm.
+#[tonic::async_trait]
+trait ErasedPayoutView: Send + Sync {
+    async fn sign_payout(
+        &self,
+        db: &mut Db,
+        withdrawal_index: u64,
+        quorum_attempt: u32,
+        canonical_intent: &[u8],
+        unsigned_tx_hex: &str,
+        now_unix: i64,
+    ) -> Result<super::payout_view::PayoutPartial, PayoutRefusal>;
+}
+
+#[tonic::async_trait]
+impl<S: PartialSigner + Send + Sync + 'static> ErasedPayoutView for PayoutView<S> {
+    async fn sign_payout(
+        &self,
+        db: &mut Db,
+        withdrawal_index: u64,
+        quorum_attempt: u32,
+        canonical_intent: &[u8],
+        unsigned_tx_hex: &str,
+        now_unix: i64,
+    ) -> Result<super::payout_view::PayoutPartial, PayoutRefusal> {
+        PayoutView::sign_payout(
+            self,
+            db,
+            withdrawal_index,
+            quorum_attempt,
+            canonical_intent,
+            unsigned_tx_hex,
+            now_unix,
+        )
+        .await
+    }
 }
 
 impl<V: LocalView + Send + Sync + 'static> SignerService<V> {
@@ -103,6 +160,92 @@ impl<V: LocalView + Send + Sync + 'static> SignerService<V> {
                 refill_per_second,
                 burst,
             ))),
+            payout: None,
+        }
+    }
+
+    /// Attaches the Goldcoin payout arm (Phase 7e).
+    ///
+    /// `db` must be this validator's OWN database and `view` must be backed
+    /// by this validator's OWN Goldcoin node (ADR-0017 E2). Sharing the
+    /// relayer's node would mean inheriting the requester's view of the
+    /// chain, which defeats the independent validation the whole design
+    /// rests on.
+    pub fn with_payout_arm<S: PartialSigner + Send + Sync + 'static>(
+        mut self,
+        view: PayoutView<S>,
+        db: Db,
+    ) -> Self {
+        self.payout = Some(PayoutArm {
+            view: Box::new(view),
+            db: Arc::new(tokio::sync::Mutex::new(db)),
+        });
+        self
+    }
+
+    /// Handles a payout signing request. Exposed directly so the decision
+    /// path is testable without standing up a server.
+    pub async fn handle_payout(
+        &self,
+        req: PayoutSignRequest,
+    ) -> Result<PayoutSignResponse, Refusal> {
+        let now = now_unix();
+        if now > req.expiry_unix {
+            return Err(Refusal::Expired {
+                expiry_unix: req.expiry_unix,
+                now,
+            });
+        }
+        // The epoch check applies identically to payouts: a validator must
+        // not authorize a spend under a federation revision it does not
+        // agree with.
+        if !self.view.view_is_fresh() {
+            return Err(Refusal::StaleView);
+        }
+        let observed = self.view.observed_epoch();
+        if req.epoch != observed {
+            return Err(Refusal::EpochMismatch {
+                requested: req.epoch,
+                observed,
+            });
+        }
+
+        let Some(arm) = &self.payout else {
+            // Fail closed: a signer with no vault key must say so, not
+            // return something that looks like agreement.
+            return Err(Refusal::Underivable(
+                "this validator holds no vault key and cannot sign payouts",
+            ));
+        };
+
+        let mut db = arm.db.lock().await;
+        match arm
+            .view
+            .sign_payout(
+                &mut db,
+                req.withdrawal_index,
+                req.quorum_attempt,
+                &req.canonical_intent,
+                &req.unsigned_tx_hex,
+                now,
+            )
+            .await
+        {
+            Ok(partial) => Ok(PayoutSignResponse {
+                request_id: req.request_id,
+                validator_pubkey: self.validator_pubkey().to_vec(),
+                vault_pubkey: partial.vault_pubkey.to_vec(),
+                signatures: partial.signatures,
+            }),
+            Err(refusal) => {
+                tracing::warn!(
+                    withdrawal_index = req.withdrawal_index,
+                    quorum_attempt = req.quorum_attempt,
+                    %refusal,
+                    "refused a vault payout signing request"
+                );
+                Err(Refusal::PayoutRefused(refusal.to_string()))
+            }
         }
     }
 
@@ -219,6 +362,24 @@ impl<V: LocalView + Send + Sync + 'static> FederationSigner for SignerService<V>
             // bug or an attack — never routine.
             Err(refusal) => {
                 tracing::warn!(%peer, %refusal, "refused a federation signing request");
+                Err(Status::failed_precondition(refusal.to_string()))
+            }
+        }
+    }
+
+    async fn sign_payout(
+        &self,
+        request: Request<PayoutSignRequest>,
+    ) -> Result<Response<PayoutSignResponse>, Status> {
+        let peer = peer_key(&request);
+        if let Err(refusal) = self.check_rate_limit(&peer) {
+            tracing::warn!(%peer, "rate-limited a payout signing request");
+            return Err(Status::resource_exhausted(refusal.to_string()));
+        }
+        match self.handle_payout(request.into_inner()).await {
+            Ok(resp) => Ok(Response::new(resp)),
+            Err(refusal) => {
+                tracing::warn!(%peer, %refusal, "refused a payout signing request");
                 Err(Status::failed_precondition(refusal.to_string()))
             }
         }
@@ -389,6 +550,7 @@ mod tests {
                 epoch: 7,
                 messages: m2,
             },
+            payout: None,
             seen: {
                 let mut seen = SeenSet::new();
                 seen.record(

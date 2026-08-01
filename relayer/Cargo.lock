@@ -1557,6 +1557,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "glc-bridge-shared",
+ "libsecp256k1",
  "prost",
  "protoc-bin-vendored",
  "rcgen",

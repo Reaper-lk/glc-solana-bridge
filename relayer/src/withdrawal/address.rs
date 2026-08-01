@@ -38,7 +38,7 @@ pub enum AddressError {
     Empty,
 }
 
-fn base58_decode(s: &str) -> Result<Vec<u8>, AddressError> {
+pub(crate) fn base58_decode(s: &str) -> Result<Vec<u8>, AddressError> {
     if s.is_empty() {
         return Err(AddressError::Empty);
     }
@@ -91,7 +91,7 @@ fn base58_encode(data: &[u8]) -> String {
     s
 }
 
-fn checksum(payload: &[u8]) -> [u8; 4] {
+pub(crate) fn checksum(payload: &[u8]) -> [u8; 4] {
     use sha2::{Digest, Sha256};
     let first = Sha256::digest(payload);
     let second = Sha256::digest(first);

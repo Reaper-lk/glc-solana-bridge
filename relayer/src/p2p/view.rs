@@ -26,75 +26,16 @@
 //! every request is refused until the link recovers. Fail-closed: the
 //! process also refuses to start until it has observed the epoch once.
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
 
 use crate::glc::db::{Db, DepositState};
 use crate::glc::withdrawal_db::WithdrawalState;
 use crate::p2p::policy::{Action, LocalView, SigningIdentity};
 
-/// How long an epoch observation stays usable without a successful refresh.
-///
-/// Bounded by how quickly a validator-set rotation must stop a lagging
-/// signer from authorizing under the old set. Longer than several poll
-/// intervals so a brief RPC blip does not take a signer offline, short
-/// enough that a real outage does.
-pub const MAX_VIEW_STALENESS: Duration = Duration::from_secs(60);
-
-/// How often the epoch is re-observed from the chain.
-pub const EPOCH_POLL_INTERVAL: Duration = Duration::from_secs(10);
-
-/// The shared, atomically-updated result of epoch polling.
-///
-/// Separated from [`DbLocalView`] so the refresher task can own a handle
-/// without taking the database lock — a signer must never be blocked from
-/// noticing a rotation by an in-flight derivation.
-#[derive(Debug)]
-pub struct EpochObservation {
-    epoch: AtomicU64,
-    /// Unix seconds of the last *successful* observation. A failed poll
-    /// deliberately does not update it — that is what makes staleness
-    /// accumulate rather than being papered over.
-    observed_at: AtomicI64,
-}
-
-impl EpochObservation {
-    /// Seeds the observation from a first successful read.
-    ///
-    /// There is deliberately no constructor producing an *unobserved* state:
-    /// a signer with no epoch at all has nothing meaningful to compare
-    /// against, so startup blocks on this instead.
-    pub fn seeded(epoch: u64, at_unix: i64) -> Self {
-        EpochObservation {
-            epoch: AtomicU64::new(epoch),
-            observed_at: AtomicI64::new(at_unix),
-        }
-    }
-
-    pub fn record(&self, epoch: u64, at_unix: i64) {
-        // Order matters: publish the epoch before the timestamp that
-        // vouches for it, so a concurrent reader can never see a fresh
-        // timestamp attached to a stale epoch.
-        self.epoch.store(epoch, Ordering::SeqCst);
-        self.observed_at.store(at_unix, Ordering::SeqCst);
-    }
-
-    pub fn epoch(&self) -> u64 {
-        self.epoch.load(Ordering::SeqCst)
-    }
-
-    pub fn observed_at(&self) -> i64 {
-        self.observed_at.load(Ordering::SeqCst)
-    }
-
-    pub fn is_fresh_at(&self, now_unix: i64) -> bool {
-        let age = now_unix.saturating_sub(self.observed_at());
-        // A negative age (clock stepped backwards) is not treated as extra
-        // freshness; only a genuinely recent observation counts.
-        (0..=MAX_VIEW_STALENESS.as_secs() as i64).contains(&age)
-    }
-}
+// The epoch observation lives in `solana::epoch` so `signer-server` and
+// `glc-relayer` cannot come to disagree about what "stale" means. Re-exported
+// here because this is where it is consumed.
+pub use crate::solana::epoch::{EpochObservation, EPOCH_POLL_INTERVAL, MAX_VIEW_STALENESS};
 
 /// A [`LocalView`] over this validator's own database.
 pub struct DbLocalView {
@@ -210,54 +151,15 @@ impl LocalView for DbLocalView {
 
 #[cfg(test)]
 mod tests {
+    // `EpochObservation`'s own behaviour is tested at its home in
+    // `solana::epoch`; `DbLocalView` is covered end-to-end against a real
+    // database in `tests/signer_local_view.rs`.
     use super::*;
 
     #[test]
-    fn a_fresh_observation_is_usable() {
+    fn re_exports_the_shared_epoch_observation() {
         let o = EpochObservation::seeded(7, 1_000);
-        assert!(o.is_fresh_at(1_000));
-        assert!(o.is_fresh_at(1_000 + MAX_VIEW_STALENESS.as_secs() as i64));
         assert_eq!(o.epoch(), 7);
-    }
-
-    #[test]
-    fn an_observation_goes_stale_once_past_the_bound() {
-        let o = EpochObservation::seeded(7, 1_000);
-        assert!(
-            !o.is_fresh_at(1_001 + MAX_VIEW_STALENESS.as_secs() as i64),
-            "a validator that stopped hearing from the chain must stop signing"
-        );
-    }
-
-    #[test]
-    fn a_failed_poll_does_not_refresh_the_observation() {
-        // The refresher only calls `record` on success, so staleness
-        // accumulates across an outage instead of being papered over.
-        let o = EpochObservation::seeded(7, 1_000);
-        let far_future = 1_000 + 10 * MAX_VIEW_STALENESS.as_secs() as i64;
-        assert!(!o.is_fresh_at(far_future));
-        o.record(7, far_future);
-        assert!(o.is_fresh_at(far_future), "a successful poll restores it");
-    }
-
-    #[test]
-    fn an_observation_timestamped_in_the_future_does_not_read_as_fresh() {
-        // Both a small and a large backwards step: the small one is the
-        // interesting case, because taking the magnitude of the difference
-        // would still land inside the staleness bound and silently pass.
-        let o = EpochObservation::seeded(7, 1_000);
-        assert!(
-            !o.is_fresh_at(1_000 - (MAX_VIEW_STALENESS.as_secs() as i64 / 2)),
-            "a clock that stepped backwards must not be read as a recent observation"
-        );
-        assert!(!o.is_fresh_at(500));
-    }
-
-    #[test]
-    fn a_rotation_is_picked_up_by_the_next_successful_poll() {
-        let o = EpochObservation::seeded(7, 1_000);
-        o.record(8, 1_005);
-        assert_eq!(o.epoch(), 8);
-        assert_eq!(o.observed_at(), 1_005);
+        assert!(o.is_fresh_at(1_000));
     }
 }

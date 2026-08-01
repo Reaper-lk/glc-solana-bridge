@@ -36,10 +36,12 @@
 //! | [`aggregation`] | who to ask, how long to wait, when a round is done |
 //! | [`collector`] | the client: mTLS, timeouts, failover |
 //! | [`ratelimit`] | per-peer request limits, so one peer cannot starve the rest |
+//! | [`payout_view`] | what this validator will sign for a vault payout (7e) |
 
 pub mod aggregation;
 pub mod collector;
 pub mod identity;
+pub mod payout_view;
 pub mod policy;
 pub mod ratelimit;
 pub mod service;

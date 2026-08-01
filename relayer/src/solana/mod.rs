@@ -12,5 +12,6 @@
 //! future work — Phase 5 is deposit-mint only, per the approved objective.
 
 pub mod config;
+pub mod epoch;
 pub mod instruction;
 pub mod rpc;

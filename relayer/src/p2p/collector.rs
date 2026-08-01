@@ -35,7 +35,9 @@ use crate::orchestrator::SignatureCollector;
 use crate::p2p::aggregation::{ask_order, PeerOutcome, Round, PER_PEER_TIMEOUT, ROUND_TIMEOUT};
 use crate::p2p::identity::{PeerEndpoint, TlsMaterial};
 use crate::p2p::service::pb::federation_signer_client::FederationSignerClient;
-use crate::p2p::service::{mint_request, payout_request, pb};
+use crate::p2p::service::{mint_request, payout_request, pb, REQUEST_TTL_SECONDS};
+use crate::withdrawal::multisig::PartialSignature;
+use crate::withdrawal::vault::COMPRESSED_PUBKEY_LEN;
 
 pub struct GrpcCollector {
     peers: Vec<PeerEndpoint>,
@@ -278,6 +280,196 @@ impl GrpcCollector {
     }
 }
 
+/// A designated signer's endpoint plus the vault key it must answer with
+/// (Phase 7e, ADR-0017 E1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesignatedSigner {
+    pub validator_pubkey: Pubkey,
+    pub vault_pubkey: [u8; COMPRESSED_PUBKEY_LEN],
+}
+
+/// The outcome of collecting vault partials from a designated quorum.
+#[derive(Debug, Clone)]
+pub struct PartialRound {
+    pub partials: Vec<PartialSignature>,
+    pub round: Round,
+}
+
+impl GrpcCollector {
+    /// Collects **Goldcoin partial signatures** from an explicitly
+    /// designated quorum (Phase 7e, ADR-0017).
+    ///
+    /// Only the designated members are asked, and only they may contribute:
+    /// the txid depends on which quorum signs, so an unavailable designated
+    /// signer must produce a shortfall requiring explicit, audited
+    /// reassignment — never an implicit substitution (ADR-0015).
+    ///
+    /// A returned partial is checked against the vault key that signer is
+    /// registered as holding. The signature itself is verified later, during
+    /// assembly, against that input's sighash — which is where a forged or
+    /// corrupted partial is actually caught.
+    pub async fn collect_payout_partials(
+        &self,
+        epoch: u64,
+        withdrawal_index: u64,
+        quorum_attempt: u32,
+        canonical_intent: &[u8],
+        unsigned_tx_hex: &str,
+        designated: &[DesignatedSigner],
+    ) -> PartialRound {
+        let mut round = Round::new();
+        let mut partials = Vec::with_capacity(designated.len());
+        let deadline = tokio::time::Instant::now() + ROUND_TIMEOUT;
+
+        for d in designated {
+            let Some(peer) = self
+                .peers
+                .iter()
+                .find(|p| p.validator_pubkey == d.validator_pubkey)
+            else {
+                round.record(
+                    d.validator_pubkey,
+                    PeerOutcome::Unavailable(
+                        "designated signer is not a configured peer".to_string(),
+                    ),
+                );
+                continue;
+            };
+            if tokio::time::Instant::now() >= deadline {
+                round.record(
+                    d.validator_pubkey,
+                    PeerOutcome::Unavailable("round timeout".to_string()),
+                );
+                continue;
+            }
+
+            let req = pb::PayoutSignRequest {
+                request_id: Self::next_request_id(),
+                epoch,
+                withdrawal_index,
+                quorum_attempt,
+                canonical_intent: canonical_intent.to_vec(),
+                unsigned_tx_hex: unsigned_tx_hex.to_string(),
+                expiry_unix: crate::p2p::service::now_unix() + REQUEST_TTL_SECONDS,
+            };
+
+            match self.ask_payout(peer, req, d).await {
+                Ok(partial) => {
+                    // A synthetic marker: `Round` counts approvals by
+                    // federation identity, and the real cryptographic check
+                    // happens during assembly.
+                    round.record(
+                        d.validator_pubkey,
+                        PeerOutcome::Signed(Signature::default()),
+                    );
+                    partials.push(partial);
+                }
+                Err(outcome) => {
+                    if let PeerOutcome::Refused(why) = &outcome {
+                        tracing::warn!(
+                            peer = %d.validator_pubkey,
+                            withdrawal_index,
+                            quorum_attempt,
+                            reason = %why,
+                            "designated payout signer refused — its view of the Goldcoin chain disagrees with ours"
+                        );
+                    }
+                    round.record(d.validator_pubkey, outcome);
+                }
+            }
+        }
+
+        tracing::info!(
+            withdrawal_index,
+            quorum_attempt,
+            summary = %round.summary(),
+            "payout partial-signature collection round"
+        );
+        PartialRound { partials, round }
+    }
+
+    async fn ask_payout(
+        &self,
+        peer: &PeerEndpoint,
+        req: pb::PayoutSignRequest,
+        designated: &DesignatedSigner,
+    ) -> Result<PartialSignature, PeerOutcome> {
+        let mut client = self
+            .connect(&peer.uri)
+            .await
+            .map_err(PeerOutcome::Unavailable)?;
+
+        let resp = match tokio::time::timeout(PER_PEER_TIMEOUT, client.sign_payout(req)).await {
+            Err(_) => return Err(PeerOutcome::Unavailable("per-peer timeout".to_string())),
+            Ok(Err(status)) => {
+                return Err(if status.code() == tonic::Code::FailedPrecondition {
+                    PeerOutcome::Refused(status.message().to_string())
+                } else {
+                    PeerOutcome::Unavailable(status.to_string())
+                })
+            }
+            Ok(Ok(r)) => r.into_inner(),
+        };
+
+        Self::accept_payout(&peer.validator_pubkey, designated, resp)
+            .map_err(PeerOutcome::Unavailable)
+    }
+
+    /// Accepts a payout response only if it is internally consistent.
+    ///
+    /// Two separate identity checks, in two different cryptosystems, and
+    /// neither implies the other:
+    ///
+    /// - the **federation** ed25519 identity must match the endpoint, as on
+    ///   the mint path;
+    /// - the **vault** secp256k1 key must be the one this signer was
+    ///   designated to hold (ADR-0017 E1). A peer answering with some other
+    ///   vault key — even its own, at a different position — would produce a
+    ///   signature that cannot satisfy the designated quorum, and would
+    ///   change the txid if it did.
+    ///
+    /// The signature itself is verified later, during assembly, against the
+    /// input's sighash. That is where a forged or corrupted partial is
+    /// actually caught; this is only about *who* answered.
+    fn accept_payout(
+        expected_validator: &Pubkey,
+        designated: &DesignatedSigner,
+        resp: pb::PayoutSignResponse,
+    ) -> Result<PartialSignature, String> {
+        let answered = Pubkey::try_from(resp.validator_pubkey.as_slice())
+            .map_err(|_| "response carried a malformed validator pubkey".to_string())?;
+        if answered != *expected_validator {
+            return Err(format!(
+                "endpoint registered as {expected_validator} answered as {answered}"
+            ));
+        }
+
+        let vault_pubkey: [u8; COMPRESSED_PUBKEY_LEN] = resp
+            .vault_pubkey
+            .as_slice()
+            .try_into()
+            .map_err(|_| "response carried a malformed vault pubkey".to_string())?;
+        if vault_pubkey != designated.vault_pubkey {
+            return Err(format!(
+                "designated signer {expected_validator} answered with a vault key it was not \
+                 designated for"
+            ));
+        }
+
+        if resp.signatures.is_empty() {
+            return Err("response carried no signatures".to_string());
+        }
+        if resp.signatures.iter().any(|s| s.is_empty()) {
+            return Err("response carried an empty signature".to_string());
+        }
+
+        Ok(PartialSignature {
+            vault_pubkey,
+            signatures: resp.signatures,
+        })
+    }
+}
+
 impl SignatureCollector for GrpcCollector {
     async fn collect_mint_signatures(
         &self,
@@ -449,6 +641,90 @@ mod tests {
         assert!(
             round.retry_could_help(2),
             "unreachable peers may come back, so a later tick should try again"
+        );
+    }
+
+    fn designated(vault_key: u8) -> (Pubkey, DesignatedSigner) {
+        let validator = Keypair::new().pubkey();
+        let mut vault_pubkey = [0u8; 33];
+        vault_pubkey[0] = 0x02;
+        vault_pubkey[32] = vault_key;
+        (
+            validator,
+            DesignatedSigner {
+                validator_pubkey: validator,
+                vault_pubkey,
+            },
+        )
+    }
+
+    fn payout_resp(validator: &Pubkey, vault_pubkey: [u8; 33]) -> pb::PayoutSignResponse {
+        pb::PayoutSignResponse {
+            request_id: vec![1],
+            validator_pubkey: validator.to_bytes().to_vec(),
+            vault_pubkey: vault_pubkey.to_vec(),
+            signatures: vec![vec![0x30, 0x44, 0x01]],
+        }
+    }
+
+    #[test]
+    fn accepts_a_consistent_payout_response() {
+        let (v, d) = designated(7);
+        let r = payout_resp(&v, d.vault_pubkey);
+        let p = GrpcCollector::accept_payout(&v, &d, r).unwrap();
+        assert_eq!(p.vault_pubkey, d.vault_pubkey);
+        assert_eq!(p.signatures.len(), 1);
+    }
+
+    #[test]
+    fn rejects_a_payout_response_from_the_wrong_federation_identity() {
+        let (v, d) = designated(7);
+        let impostor = Keypair::new().pubkey();
+        let r = payout_resp(&impostor, d.vault_pubkey);
+        let err = GrpcCollector::accept_payout(&v, &d, r).unwrap_err();
+        assert!(err.contains("answered as"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_vault_key_the_signer_was_not_designated_for() {
+        // The second, independent binding (ADR-0017 E1): a peer with the
+        // right federation identity answering with a different vault key
+        // would produce a signature that cannot satisfy the designated
+        // quorum — and the txid depends on which quorum signs.
+        let (v, d) = designated(7);
+        let mut other = d.vault_pubkey;
+        other[32] = 9;
+        let err = GrpcCollector::accept_payout(&v, &d, payout_resp(&v, other)).unwrap_err();
+        assert!(
+            err.contains("not \n                 designated for") || err.contains("designated for"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_or_empty_payout_responses() {
+        let (v, d) = designated(7);
+
+        let mut r = payout_resp(&v, d.vault_pubkey);
+        r.vault_pubkey = vec![0u8; 5];
+        assert!(GrpcCollector::accept_payout(&v, &d, r).is_err());
+
+        let mut r = payout_resp(&v, d.vault_pubkey);
+        r.validator_pubkey = vec![0u8; 5];
+        assert!(GrpcCollector::accept_payout(&v, &d, r).is_err());
+
+        let mut r = payout_resp(&v, d.vault_pubkey);
+        r.signatures = Vec::new();
+        assert!(
+            GrpcCollector::accept_payout(&v, &d, r).is_err(),
+            "a response with no signatures contributes nothing and must be refused"
+        );
+
+        let mut r = payout_resp(&v, d.vault_pubkey);
+        r.signatures = vec![Vec::new()];
+        assert!(
+            GrpcCollector::accept_payout(&v, &d, r).is_err(),
+            "an empty signature would be placed into a scriptSig as a zero-length push"
         );
     }
 

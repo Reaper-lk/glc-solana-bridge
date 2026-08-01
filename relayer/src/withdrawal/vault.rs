@@ -279,9 +279,205 @@ pub fn decode_p2sh_hash160(addr: &str) -> Result<[u8; 20], super::address::Addre
     Ok(payload)
 }
 
+/// Decodes a WIF private key to its compressed public key (Phase 7e).
+///
+/// Used at startup so a signer can prove it actually holds the vault key it
+/// is configured to sign with, rather than discovering the mismatch when a
+/// payout fails (ADR-0017 E1).
+///
+/// Only **compressed** WIF is accepted: an uncompressed key derives a
+/// different public key, which would not appear in the redeem script at all,
+/// so accepting one could only ever produce unusable signatures.
+pub fn compressed_pubkey_from_wif(wif: &str) -> Result<[u8; COMPRESSED_PUBKEY_LEN], VaultError> {
+    use super::address::{base58_decode, checksum};
+
+    let raw = base58_decode(wif.trim())
+        .map_err(|_| VaultError::MalformedRedeemScript("WIF is not valid base58"))?;
+    // version(1) + key(32) + compression flag(1) + checksum(4)
+    if raw.len() != 38 {
+        return Err(VaultError::MalformedRedeemScript(
+            "WIF is not a 38-byte compressed-key encoding",
+        ));
+    }
+    let (payload, given) = raw.split_at(34);
+    if checksum(payload) != given {
+        return Err(VaultError::MalformedRedeemScript("WIF checksum is wrong"));
+    }
+    if payload[33] != 0x01 {
+        return Err(VaultError::MalformedRedeemScript(
+            "WIF is not marked compressed; an uncompressed key is not in any vault script",
+        ));
+    }
+    let secret = libsecp256k1::SecretKey::parse_slice(&payload[1..33])
+        .map_err(|_| VaultError::MalformedRedeemScript("WIF does not encode a valid key"))?;
+    let public = libsecp256k1::PublicKey::from_secret_key(&secret);
+    Ok(public.serialize_compressed())
+}
+
+impl MultisigVault {
+    /// Confirms this process actually holds the vault key at
+    /// `signer_index`, **failing closed** on any mismatch (ADR-0017 E1).
+    ///
+    /// This is the check that makes configuration a safe home for the
+    /// identity↔position mapping: a misconfigured operator cannot silently
+    /// participate, because the key they hold is compared against the key
+    /// the vault expects at that position.
+    pub fn require_signer_at(&self, signer_index: u8, wif: &str) -> Result<(), VaultError> {
+        let expected = self.signer_pubkeys.get(signer_index as usize).ok_or(
+            VaultError::MalformedRedeemScript(
+                "configured vault signer index is out of range for this vault",
+            ),
+        )?;
+        let derived = compressed_pubkey_from_wif(wif)?;
+        if &derived != expected {
+            return Err(VaultError::AddressMismatch {
+                configured: format!(
+                    "key at configured index {signer_index} ({})",
+                    crate::glc::hex::encode(&derived)
+                ),
+                derived: format!("vault expects {}", crate::glc::hex::encode(expected)),
+            });
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Real vault keys captured from a goldcoind 0.17.0 regtest node
+    // (`createmultisig` + `dumpprivkey`), so the WIF handling is verified
+    // against the format a real node actually emits rather than one
+    // reconstructed from a specification.
+    const REAL_REDEEM: &str = "522103f7ebeda62099ab2339a8517a49289010c5903b05c752e0b6443044c742c59a8f2103d635959d3b5fcc0494144c2969353b94ce18af462b6deb26bbc717d25e28a1d8210208c5feb9ae64c4f3e8773809433c97aa71df1be9888fc365374ddf72ab375e1f53ae";
+    const REAL_WIFS: [&str; 3] = [
+        "cVPnL3ct7pm1vYEupsYzDosiAt6xBJbVtNMzqG4cuPqHCjV1EgwG",
+        "cVy2ePyVAgdo1kgNHUB7LL1gy93b7JVadtDrGWT6aS7Bu8SQ1CGf",
+        "cN2FMGJEM6GtJPBd8DrMucmCBiWJQ9MD4cVy17qYVnx4x93ETZAM",
+    ];
+    const REAL_PUBS: [&str; 3] = [
+        "03f7ebeda62099ab2339a8517a49289010c5903b05c752e0b6443044c742c59a8f",
+        "03d635959d3b5fcc0494144c2969353b94ce18af462b6deb26bbc717d25e28a1d8",
+        "0208c5feb9ae64c4f3e8773809433c97aa71df1be9888fc365374ddf72ab375e1f",
+    ];
+
+    #[test]
+    fn derives_the_public_key_a_real_node_paired_with_each_wif() {
+        for i in 0..3 {
+            let derived = compressed_pubkey_from_wif(REAL_WIFS[i]).unwrap();
+            assert_eq!(
+                crate::glc::hex::encode(&derived),
+                REAL_PUBS[i],
+                "WIF {i} must derive the pubkey the node reported"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_each_signer_at_its_own_position_and_no_other() {
+        // ADR-0017 E1: configuration says "you are signer i"; the key on
+        // disk must actually be signer i's key. This is what makes a
+        // configured identity-to-position mapping safe.
+        let v = MultisigVault::from_redeem_script_hex(REAL_REDEEM).unwrap();
+        for i in 0..3u8 {
+            v.require_signer_at(i, REAL_WIFS[i as usize])
+                .unwrap_or_else(|e| panic!("signer {i} at its own position: {e}"));
+            for j in 0..3u8 {
+                if i != j {
+                    assert!(
+                        v.require_signer_at(j, REAL_WIFS[i as usize]).is_err(),
+                        "signer {i}'s key must be REFUSED at position {j}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_a_vault_position_outside_the_signer_set() {
+        let v = MultisigVault::from_redeem_script_hex(REAL_REDEEM).unwrap();
+        assert!(v.require_signer_at(3, REAL_WIFS[0]).is_err());
+        assert!(v.require_signer_at(255, REAL_WIFS[0]).is_err());
+    }
+
+    #[test]
+    fn refuses_a_malformed_or_uncompressed_wif() {
+        let v = MultisigVault::from_redeem_script_hex(REAL_REDEEM).unwrap();
+
+        // Empty, non-base58, too short, and a corrupted checksum.
+        //
+        // Note the version byte is deliberately NOT checked: what matters is
+        // the key it derives, which `require_signer_at` compares against the
+        // vault. Regtest and testnet WIF version bytes differ, and rejecting
+        // on that would refuse a correct key for a cosmetic reason.
+        let corrupted: String = {
+            let mut c: Vec<char> = REAL_WIFS[0].chars().collect();
+            let last = c.len() - 1;
+            c[last] = if c[last] == 'a' { 'b' } else { 'a' };
+            c.into_iter().collect()
+        };
+        for bad in ["", "notbase58!!", "abc", corrupted.as_str()] {
+            assert!(
+                compressed_pubkey_from_wif(bad).is_err(),
+                "must refuse {bad:?}"
+            );
+        }
+
+        // A genuine UNCOMPRESSED WIF is 37 bytes (no trailing flag) and is
+        // caught by the length check. An uncompressed key derives a
+        // DIFFERENT public key, which appears in no vault redeem script, so
+        // accepting one could only ever produce unusable signatures.
+        let real = super::super::address::base58_decode(REAL_WIFS[0]).unwrap();
+        let mut uncompressed = real[..33].to_vec(); // version + 32-byte key
+        let c = super::super::address::checksum(&uncompressed);
+        uncompressed.extend_from_slice(&c);
+        let encoded = base58_encode_for_test(&uncompressed);
+        assert!(
+            compressed_pubkey_from_wif(&encoded).is_err(),
+            "an uncompressed WIF must be refused"
+        );
+        assert!(v.require_signer_at(0, &encoded).is_err());
+
+        // And a CRAFTED 38-byte WIF whose trailing byte is not the 0x01
+        // compression flag: right length, valid checksum, wrong marker. Only
+        // the flag check catches this one.
+        let mut wrong_flag = real[..34].to_vec();
+        wrong_flag[33] = 0x00;
+        let c = super::super::address::checksum(&wrong_flag);
+        wrong_flag.extend_from_slice(&c);
+        let encoded = base58_encode_for_test(&wrong_flag);
+        assert!(
+            compressed_pubkey_from_wif(&encoded).is_err(),
+            "a 38-byte WIF without the compression flag must be refused"
+        );
+    }
+
+    /// Minimal base58 encoder, test-only: the production path never mints a
+    /// WIF, so there is deliberately no encoder outside tests.
+    fn base58_encode_for_test(data: &[u8]) -> String {
+        const B58: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+        let mut digits: Vec<u8> = Vec::new();
+        for &byte in data {
+            let mut carry = byte as u32;
+            for d in digits.iter_mut() {
+                let v = (*d as u32) * 256 + carry;
+                *d = (v % 58) as u8;
+                carry = v / 58;
+            }
+            while carry > 0 {
+                digits.push((carry % 58) as u8);
+                carry /= 58;
+            }
+        }
+        let mut s = String::new();
+        for _ in data.iter().take_while(|&&b| b == 0) {
+            s.push('1');
+        }
+        for d in digits.iter().rev() {
+            s.push(B58[*d as usize] as char);
+        }
+        s
+    }
 
     /// The exact 2-of-3 vault produced by `createmultisig` on a real regtest
     /// node during Phase 7b verification. This is a golden vector: if our

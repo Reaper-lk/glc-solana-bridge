@@ -42,12 +42,15 @@ use glc_relayer::glc::rpc::RpcClient as GlcRpcClient;
 use glc_relayer::glc::withdrawal_db::WithdrawalState;
 use glc_relayer::orchestrator::Orchestrator;
 use glc_relayer::p2p::collector::InProcessCollector;
+use glc_relayer::p2p::service::now_unix;
+use glc_relayer::solana::epoch::EpochObservation;
 use glc_relayer::solana::instruction as glc_ix;
 use glc_relayer::solana::rpc::RealSolanaRpc;
 use glc_relayer::withdrawal::adapter::RealPayoutRpc;
 use glc_relayer::withdrawal::config::{RawWithdrawalConfig, WithdrawalConfig};
 use glc_relayer::withdrawal::discovery;
 use glc_relayer::withdrawal::executor::WithdrawalExecutor;
+use glc_relayer::withdrawal::federation::InProcessPayoutCollector;
 
 const DECLARED_PROGRAM_ID: &str = "77oYT33t13HnZ6PNxKdbHDABb1uR2zzJMW9u7cJuwkRq";
 
@@ -376,6 +379,13 @@ async fn deposit_to_mint_to_burn_to_goldcoin_payout() {
     .unwrap();
     let vault = ms["address"].as_str().unwrap().to_string();
     let vault_redeem = ms["redeemScript"].as_str().unwrap().to_string();
+    // Phase 7e: the executor holds no vault key. It collects partials from
+    // the designated quorum and assembles the scriptSig itself.
+    let vault_wifs: Vec<(u8, String)> = signers
+        .iter()
+        .enumerate()
+        .map(|(i, a)| (i as u8, gold.cli(&["dumpprivkey", a])))
+        .collect();
     let _ = gold.try_cli(&["importaddress", &vault, "vault", "false"]);
     let _ = gold.try_cli(&[
         "importaddress",
@@ -642,10 +652,14 @@ async fn deposit_to_mint_to_burn_to_goldcoin_payout() {
     .expect("withdrawal config");
 
     let make_executor = || {
+        let collector = InProcessPayoutCollector::from_wifs(w_config.vault.clone(), &vault_wifs)
+            .expect("vault keys must match the vault the node built");
         WithdrawalExecutor::new(
             Db::open(&db_path).unwrap(),
             RealPayoutRpc::new(GlcRpcClient::new(&gold.rpc_config()).unwrap()),
             w_config.clone(),
+            collector,
+            std::sync::Arc::new(EpochObservation::seeded(1, now_unix())),
         )
     };
 
