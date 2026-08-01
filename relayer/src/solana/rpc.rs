@@ -85,6 +85,92 @@ pub fn decode_validator_set(data: &[u8]) -> Result<ValidatorSetSnapshot, SolanaR
     })
 }
 
+/// A queued governance action, decoded from the singleton
+/// `PendingGovernanceAction` account (Phase 7a, extended 7h-0).
+///
+/// Read by `glc-admin` so an operator can see what is pending, and — more
+/// importantly — so a **cancellation** derives its parameters from the chain
+/// rather than from what the operator remembers. `cancel_params` commits to
+/// the exact action and eta being cancelled, and a mistyped eta produces a
+/// signature the program rejects after the whole federation has been asked
+/// to sign it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingActionSnapshot {
+    pub action: u8,
+    pub proposed_under_epoch: u64,
+    pub eta: i64,
+    pub threshold: u8,
+    pub validators: Vec<Pubkey>,
+    pub proposed_max_wrapped_supply: u64,
+}
+
+/// Manually decodes the `PendingGovernanceAction` Borsh body, skipping the
+/// 8-byte Anchor discriminator. Layout is a verbatim copy of
+/// `programs/glc-bridge/src/state.rs`: `action: u8, proposed_under_epoch:
+/// u64, eta: i64, threshold: u8, validators: Vec<Pubkey>, bump: u8,
+/// proposed_max_wrapped_supply: u64, reserved: [u8; 24]`.
+///
+/// Hand-decoded for the same reason `decode_validator_set` is: ADR-0001 and
+/// owner decision R1 keep this workspace free of `anchor-lang`.
+pub fn decode_pending_action(data: &[u8]) -> Result<PendingActionSnapshot, SolanaRpcError> {
+    const DISCRIMINATOR_LEN: usize = 8;
+    let body = data
+        .get(DISCRIMINATOR_LEN..)
+        .ok_or_else(|| SolanaRpcError::Malformed("account shorter than discriminator".into()))?;
+    let need = |what: &str| SolanaRpcError::Malformed(format!("pending action: missing {what}"));
+
+    let action = *body.first().ok_or_else(|| need("action"))?;
+    let proposed_under_epoch = u64::from_le_bytes(
+        body.get(1..9)
+            .ok_or_else(|| need("epoch"))?
+            .try_into()
+            .unwrap(),
+    );
+    let eta = i64::from_le_bytes(
+        body.get(9..17)
+            .ok_or_else(|| need("eta"))?
+            .try_into()
+            .unwrap(),
+    );
+    let threshold = *body.get(17).ok_or_else(|| need("threshold"))?;
+    let vec_len = u32::from_le_bytes(
+        body.get(18..22)
+            .ok_or_else(|| need("validators length"))?
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    // A length prefix read off an account is attacker-influenced only if the
+    // account is not the program's own PDA — but it is still bounded here
+    // rather than used to reserve memory, because a corrupt account must
+    // produce an error, not an allocation.
+    let mut validators = Vec::new();
+    let mut offset = 22usize;
+    for _ in 0..vec_len {
+        let pk = body
+            .get(offset..offset + 32)
+            .ok_or_else(|| need("a validator"))?;
+        validators.push(Pubkey::try_from(pk).unwrap());
+        offset += 32;
+    }
+    // Skip `bump`.
+    offset += 1;
+    let proposed_max_wrapped_supply = u64::from_le_bytes(
+        body.get(offset..offset + 8)
+            .ok_or_else(|| need("proposed max wrapped supply"))?
+            .try_into()
+            .unwrap(),
+    );
+
+    Ok(PendingActionSnapshot {
+        action,
+        proposed_under_epoch,
+        eta,
+        threshold,
+        validators,
+        proposed_max_wrapped_supply,
+    })
+}
+
 /// The exact RPC surface the orchestrator needs. A trait so orchestration
 /// logic is unit-testable against a mock (mirrors `glc::indexer::GoldcoinRpc`).
 pub trait SolanaRpc {
@@ -224,6 +310,86 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `PendingGovernanceAction` body an operator's node would return.
+    fn pending_action_bytes(
+        action: u8,
+        epoch: u64,
+        eta: i64,
+        threshold: u8,
+        validators: &[Pubkey],
+        new_max: u64,
+    ) -> Vec<u8> {
+        let mut d = vec![0u8; 8]; // discriminator
+        d.push(action);
+        d.extend_from_slice(&epoch.to_le_bytes());
+        d.extend_from_slice(&eta.to_le_bytes());
+        d.push(threshold);
+        d.extend_from_slice(&(validators.len() as u32).to_le_bytes());
+        for v in validators {
+            d.extend_from_slice(v.as_ref());
+        }
+        d.push(0xFE); // bump
+        d.extend_from_slice(&new_max.to_le_bytes());
+        d.extend_from_slice(&[0u8; 24]); // reserved
+        d
+    }
+
+    #[test]
+    fn decodes_a_pending_rotation() {
+        let v1 = Pubkey::new_unique();
+        let v2 = Pubkey::new_unique();
+        let data = pending_action_bytes(0x03, 9, 1_800_000_000, 2, &[v1, v2], 0);
+        assert_eq!(
+            decode_pending_action(&data).unwrap(),
+            PendingActionSnapshot {
+                action: 0x03,
+                proposed_under_epoch: 9,
+                eta: 1_800_000_000,
+                threshold: 2,
+                validators: vec![v1, v2],
+                proposed_max_wrapped_supply: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_a_pending_cap_raise_whose_validator_list_is_empty() {
+        // A TVL raise carries no validators, so the u64 that follows sits at
+        // a different offset than it does for a rotation. Reading it from a
+        // fixed offset would silently return part of the reserved bytes.
+        let data = pending_action_bytes(0x05, 4, 123, 0, &[], 21_000_000_000_000);
+        let got = decode_pending_action(&data).unwrap();
+        assert_eq!(got.action, 0x05);
+        assert_eq!(got.proposed_max_wrapped_supply, 21_000_000_000_000);
+        assert!(got.validators.is_empty());
+    }
+
+    #[test]
+    fn the_eta_round_trips_exactly_because_a_cancel_commits_to_it() {
+        // `cancel_params(action, eta)` is hashed into the message the whole
+        // federation signs. An eta off by one produces a signature the
+        // program rejects, after everyone has been asked.
+        for eta in [0i64, 1, -1, i64::MIN, i64::MAX, 1_800_000_000] {
+            let data = pending_action_bytes(0x03, 1, eta, 1, &[Pubkey::new_unique()], 0);
+            assert_eq!(decode_pending_action(&data).unwrap().eta, eta);
+        }
+    }
+
+    #[test]
+    fn a_truncated_pending_action_is_an_error_rather_than_a_guess() {
+        let full = pending_action_bytes(0x03, 1, 2, 1, &[Pubkey::new_unique()], 0);
+        for cut in [0, 4, 8, 12, 20, 30, 50] {
+            assert!(
+                decode_pending_action(&full[..cut.min(full.len())]).is_err(),
+                "a {cut}-byte account must not decode"
+            );
+        }
+        // And a validator list whose length prefix overruns the account.
+        let mut lying = full.clone();
+        lying[8 + 18..8 + 22].copy_from_slice(&9_999u32.to_le_bytes());
+        assert!(decode_pending_action(&lying).is_err());
+    }
 
     #[test]
     fn decodes_validator_set_account_layout() {
