@@ -31,7 +31,11 @@ fn initialize_happy_path() {
     assert_eq!(config.withdrawal_count, 0);
     assert_eq!(config.min_deposit, 1_000);
     assert_eq!(config.min_withdrawal, 2_000);
-    assert_eq!(config.reserved, [0u8; 23]);
+    assert_eq!(config.reserved, [0u8; 15]);
+    assert_eq!(
+        config.max_wrapped_supply, DEFAULT_TEST_SUPPLY_CAP,
+        "the ceiling is set at initialize and never defaulted"
+    );
     assert_eq!(
         config.governance_timelock_seconds, DEFAULT_TEST_TIMELOCK,
         "the governance timelock is stored as configured (ADR-0014)"

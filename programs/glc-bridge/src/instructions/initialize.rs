@@ -72,6 +72,7 @@ pub fn initialize(
     min_deposit: u64,
     min_withdrawal: u64,
     governance_timelock_seconds: i64,
+    max_wrapped_supply: u64,
 ) -> Result<()> {
     validate_validator_set(&validators, threshold)?;
     // No built-in default (ADR-0014): a governance timelock of zero would
@@ -83,6 +84,12 @@ pub fn initialize(
         governance_timelock_seconds > 0,
         BridgeError::ZeroGovernanceTimelock
     );
+    // Same reasoning, applied to exposure (ADR-0014 §11): a cap of zero
+    // would have to mean either "no minting" or "unlimited", and the second
+    // is the exact wrong default for a bound on total value at risk. The
+    // program refuses to start without a deliberate ceiling rather than
+    // choosing one on the operator's behalf.
+    require!(max_wrapped_supply > 0, BridgeError::ZeroWrappedSupplyCap);
 
     let config = &mut ctx.accounts.bridge_config;
     config.protocol_version = PROTOCOL_VERSION;
@@ -98,7 +105,8 @@ pub fn initialize(
     config.wrapped_mint = Pubkey::default();
     config.mint_authority_bump = 0;
     config.governance_timelock_seconds = governance_timelock_seconds;
-    config.reserved = [0u8; 23];
+    config.max_wrapped_supply = max_wrapped_supply;
+    config.reserved = [0u8; 15];
 
     let validator_count = validators.len() as u8;
     let set = &mut ctx.accounts.validator_set;

@@ -740,9 +740,48 @@ configuration). This section proposes a *method*, not numbers.
 | Max reorg depth | ≥ 2× deposit depth; beyond it the indexer halts rather than guessing a fork point (already implemented, Phase 4). |
 | Per-deposit cap | Start deliberately small in canary; raise only against reorg-cost evidence. |
 | Rolling-window cap | Bounds loss *rate* under sustained attack. Already implemented (Phase 4). |
-| **Total TVL cap** | **New on-chain requirement.** A hard ceiling on wrapped supply, enforced in `mint_wrapped`. Without it there is no bound on absolute exposure. Needs a `BridgeConfig` field — 31 reserved bytes are available. |
+| **Total TVL cap** | **DELIVERED in Phase 7h-0 — see §11.1.** A hard ceiling on wrapped supply, enforced in `mint_wrapped`. `BridgeConfig.max_wrapped_supply`, taken out of `reserved` (23 → 15 bytes; the field was verified all-zero on a live account first). No migration, no `PROTOCOL_VERSION` bump. |
 | Halt conditions | Reorg beyond max depth; TVL invariant breach; any `IntegrityHalted` deposit or withdrawal; validator-set epoch mismatch between peers; vault balance reconciliation mismatch. |
 | Recovery | Every halt requires explicit operator action. The existing `operator_clear_integrity_halt` pattern (audited, non-empty note, restricted targets) is the model. |
+
+---
+
+### 11.1 The TVL cap is deliberately ASYMMETRIC (Phase 7h-0)
+
+| direction | authority | delay | why |
+|---|---|---|---|
+| **Lower** the cap | admin alone | **immediate** | reduces exposure; this is incident response, and incident response cannot wait out a timelock |
+| **Raise** the cap | M-of-N threshold approval | **full governance timelock** | increases exposure; this is exactly what an attacker holding a stolen admin key would want |
+
+This mirrors §7.3's deliberate asymmetry for pausing rather than introducing
+a second authority model. The raise path reuses the Phase 7a machinery
+wholesale — same `PendingGovernanceAction` singleton, same message shape,
+same `require_federation_approval`, same timelock, same cancellation path.
+Only the action byte (`ACTION_PROPOSE_TVL_RAISE = 0x05`) and the parameter
+set differ.
+
+**Why the asymmetry rather than symmetry.** Gating both directions behind
+governance would be simpler to describe, but it would mean an operator
+watching an incident unfold could not reduce the bridge's maximum exposure
+without waiting out the timelock — precisely when speed matters and
+precisely in the direction that is safe. Conversely, letting the admin raise
+the cap would hand a single key the power to increase exposure, which is the
+shape of authority §7 exists to remove. The risk is not symmetric, so the
+controls are not either.
+
+**Two consequences worth stating.** A queued raise is re-checked at
+execution, so a raise proposed before an incident cannot silently undo an
+admin lowering that happened during it. And a cap of zero is invalid in
+every path: it would have to mean "no minting" or "unlimited" depending on
+how it were read, and the second is the exact wrong default for a bound on
+exposure — `initialize` refuses it, following the `governance_timelock_seconds`
+precedent rather than `min_deposit`'s "0 = disabled" convention.
+
+**What it does and does not do.** It bounds *absolute* exposure on-chain.
+It does not verify the solvency invariant itself — threat-model invariant #1
+compares wrapped supply against confirmed vault deposits minus completed
+payouts, and the vault side is not visible to the program. That remains a
+monitoring responsibility (§13.1), delivered in Phase 7h.
 
 ---
 

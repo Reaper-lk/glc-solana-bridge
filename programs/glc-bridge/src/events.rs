@@ -113,3 +113,13 @@ pub struct WithdrawalCompleted {
     pub amount: u64,
     pub epoch: u64,
 }
+
+/// The wrapped-supply cap changed (Phase 7h-0). `raised` distinguishes the
+/// two authority paths at a glance: a lowering is an admin action, a raise
+/// can only have come through threshold-approved, timelocked governance.
+#[event]
+pub struct WrappedSupplyCapChanged {
+    pub previous: u64,
+    pub current: u64,
+    pub raised: bool,
+}

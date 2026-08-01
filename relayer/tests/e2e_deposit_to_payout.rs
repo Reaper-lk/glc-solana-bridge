@@ -417,6 +417,9 @@ async fn deposit_to_mint_to_burn_to_goldcoin_payout() {
                                                       // Phase 7a (ADR-0014): governance timelock. No default exists —
                                                       // the program rejects zero — so tests state it explicitly.
     init_data.extend_from_slice(&3_600i64.to_le_bytes()); // governance_timelock_seconds
+    // Phase 7h-0 (ADR-0014 §11.1): the wrapped-supply ceiling, also
+    // mandatory and also rejected at zero.
+    init_data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_wrapped_supply
     let init_ix = Instruction {
         program_id,
         accounts: vec![

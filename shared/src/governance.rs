@@ -40,6 +40,14 @@ pub const ACTION_PROPOSE_ROTATION: u8 = 0x03;
 /// Cancel the currently pending governance action.
 pub const ACTION_CANCEL_ROTATION: u8 = 0x04;
 
+/// Propose an **increase** to the wrapped-supply cap (Phase 7h-0).
+///
+/// Only increases need federation approval. Lowering the cap reduces
+/// exposure and is an admin action available immediately, mirroring the
+/// asymmetry ADR-0014 §7.3 already applies to pausing: the dangerous
+/// direction is gated, the safe one is fast.
+pub const ACTION_PROPOSE_TVL_RAISE: u8 = 0x05;
+
 /// Exact length of a governance message: 16 + 1 + 32 + 8 + 1 + 32.
 pub const GOVERNANCE_MESSAGE_LEN: usize = 90;
 
@@ -110,6 +118,16 @@ pub fn cancel_params(pending_action: u8, pending_eta: i64) -> Vec<u8> {
     out.push(pending_action);
     out.extend_from_slice(&pending_eta.to_le_bytes());
     out
+}
+
+/// Canonical parameter layout for a TVL-cap increase.
+///
+/// A single `u64`, so unlike a rotation it would fit inline — but it is
+/// hashed like every other governance parameter set so all actions share one
+/// message shape and one verification path. Uniformity here is worth more
+/// than eight bytes.
+pub fn tvl_raise_params(new_max_wrapped_supply: u64) -> Vec<u8> {
+    new_max_wrapped_supply.to_le_bytes().to_vec()
 }
 
 #[cfg(test)]
