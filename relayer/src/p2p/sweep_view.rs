@@ -227,12 +227,20 @@ impl<S: PartialSigner> SweepView<S> {
         for (i, inp) in tx.inputs.iter().enumerate() {
             let found = available
                 .iter()
-                .find(|u| u.txid == inp.prev_txid && u.vout as u32 == inp.prev_vout)
+                // `VaultUtxo::txid` is display order, the transaction's is
+                // internal. Comparing them directly made every real sweep
+                // fail as UnknownInput (see sweep::internal_txid).
+                .find(|u| {
+                    crate::withdrawal::sweep::internal_txid(&u.txid) == inp.prev_txid
+                        && u.vout as u32 == inp.prev_vout
+                })
                 .ok_or_else(|| SweepRefusal::UnknownInput {
                     index: i,
                     outpoint: format!(
                         "{}:{}",
-                        crate::glc::hex::encode(&inp.prev_txid),
+                        crate::glc::hex::encode(&crate::withdrawal::sweep::internal_txid(
+                            &inp.prev_txid
+                        )),
                         inp.prev_vout
                     ),
                 })?;
