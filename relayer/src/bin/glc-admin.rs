@@ -47,7 +47,8 @@ use glc_relayer::p2p::identity::{parse_peers, TlsMaterial, TlsPaths};
 use glc_relayer::signer::aggregate::build_ed25519_instruction;
 use glc_relayer::solana::instruction as ix;
 use glc_relayer::solana::rpc::{
-    decode_pending_action, decode_validator_set, PendingActionSnapshot, RealSolanaRpc, SolanaRpc,
+    decode_bridge_config, decode_pending_action, decode_validator_set, BridgeConfigSnapshot,
+    PendingActionSnapshot, RealSolanaRpc, SolanaRpc,
 };
 use glc_relayer::withdrawal::adapter::RealPayoutRpc;
 use glc_relayer::withdrawal::executor::PayoutRpc;
@@ -70,6 +71,16 @@ GOVERNANCE (stages an approval for THIS operator's signer)
   approve-cancel        --approvals PATH --epoch N --pending-action N --pending-eta N --note TEXT
   list-approvals        --approvals PATH
   revoke-approval       --approvals PATH --action N
+
+BOOTSTRAP (once, at launch -- see docs/launch-checklist.md)
+  initialize            --validators A,B,C --threshold M --timelock-secs N
+                        --max-supply ATOMIC --min-deposit N --min-withdrawal N --note TEXT
+  create-wrapped-mint   --mint-keypair PATH --note TEXT
+  show-config
+
+ADMIN HANDOVER (custody #5)
+  transfer-admin        --new-admin PUBKEY --note TEXT      (signed by the OUTGOING admin)
+  accept-admin          --note TEXT                          (signed by the INCOMING admin)
 
 ON-CHAIN ADMIN (interim single admin key -- see docs/custody.md #7)
   pause                 --note TEXT
@@ -207,6 +218,11 @@ async fn main() -> anyhow::Result<()> {
         "unpause" => set_paused(&args, false).await,
         "lower-tvl-cap" => lower_tvl_cap(&args).await,
         "show-pending" => show_pending(&args).await,
+        "show-config" => show_config(&args).await,
+        "initialize" => initialize(&args).await,
+        "create-wrapped-mint" => create_wrapped_mint(&args).await,
+        "transfer-admin" => transfer_admin(&args).await,
+        "accept-admin" => accept_admin(&args).await,
         "submit-rotation" => submit_rotation(&args).await,
         "submit-tvl-raise" => submit_tvl_raise(&args).await,
         "submit-cancel" => submit_cancel(&args).await,
@@ -1204,4 +1220,230 @@ fn goldcoin_rpc_from_env() -> anyhow::Result<RealPayoutRpc> {
             read_timeout_ms: 30_000,
         })?;
     Ok(RealPayoutRpc::new(client))
+}
+
+// ---------------------------------------------------------------- bootstrap
+
+/// `initialize` — stands the bridge up. Runs exactly once, at launch.
+///
+/// Every parameter is a launch-time security decision with **no default**
+/// (owner decision U6). The program refuses a zero timelock and a zero
+/// supply cap outright rather than inventing one, and this command refuses
+/// them earlier so the operator gets a sentence instead of a program error.
+async fn initialize(args: &[String]) -> anyhow::Result<()> {
+    let note = require_note(args);
+    let threshold: u8 = require(args, "--threshold").parse()?;
+    let timelock: i64 = require(args, "--timelock-secs").parse()?;
+    let max_supply: u64 = require(args, "--max-supply").parse()?;
+    let min_deposit: u64 = require(args, "--min-deposit").parse()?;
+    let min_withdrawal: u64 = require(args, "--min-withdrawal").parse()?;
+    let validators: Vec<Pubkey> = require(args, "--validators")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse()
+                .map_err(|e| anyhow::anyhow!("{s:?} is not a pubkey: {e}"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+
+    if threshold == 0 || usize::from(threshold) > validators.len() {
+        anyhow::bail!(
+            "threshold {threshold} is impossible for {} validators",
+            validators.len()
+        );
+    }
+    if timelock <= 0 {
+        anyhow::bail!(
+            "the governance timelock must be positive — the program refuses zero, because a \
+             timelock of zero is no timelock and there is deliberately no default"
+        );
+    }
+    if max_supply == 0 {
+        anyhow::bail!(
+            "a wrapped-supply cap of zero is never valid: it would have to mean either 'no \
+             minting' or 'unlimited', and the second is the exact wrong default for a bound \
+             on exposure"
+        );
+    }
+
+    let chain = chain_from_env()?;
+    let authority = keypair_at("GLC_ADMIN_KEYPAIR_PATH")?;
+
+    // Validator ORDER is permanent: it fixes each member's bitmask index for
+    // the life of the federation. Echo it back so it is checked before it is
+    // committed rather than after.
+    println!(
+        "INITIALIZING the bridge\n  program:   {}\n  authority: {}\n  threshold: {threshold} of {}\n  \
+         timelock:  {timelock}s\n  max supply: {max_supply} atomic\n  min deposit/withdrawal: {min_deposit}/{min_withdrawal}",
+        chain.program_id,
+        authority.pubkey(),
+        validators.len()
+    );
+    for (i, v) in validators.iter().enumerate() {
+        println!("  validator [{i}] {v}");
+    }
+    println!(
+        "\nValidator ORDER is permanent — it fixes each member's bitmask index. Check it now.\n\
+         This runs ONCE; the bridge config account cannot be created twice."
+    );
+
+    let instruction = ix::initialize_instruction(
+        &chain.program_id,
+        &authority.pubkey(),
+        &validators,
+        threshold,
+        min_deposit,
+        min_withdrawal,
+        timelock,
+        max_supply,
+    );
+    submit(&chain, &[instruction], &authority, "initialize", &note).await?;
+    println!("\nNow verify what actually landed: `glc-admin show-config`");
+    Ok(())
+}
+
+/// `create_wrapped_mint` — one-time creation of the wrapped-GLC SPL mint.
+///
+/// The mint account signs its own creation, so this needs its keypair for
+/// exactly one transaction. Keep it only until the transaction confirms:
+/// the mint authority becomes a program PDA and freeze authority is `None`
+/// (custody #6), so the keypair confers nothing afterwards and is one more
+/// thing to lose.
+async fn create_wrapped_mint(args: &[String]) -> anyhow::Result<()> {
+    let note = require_note(args);
+    let mint_path = require(args, "--mint-keypair");
+    let mint = read_keypair_file(&mint_path)
+        .map_err(|e| anyhow::anyhow!("could not read the mint keypair at {mint_path}: {e}"))?;
+    let chain = chain_from_env()?;
+    let admin = keypair_at("GLC_ADMIN_KEYPAIR_PATH")?;
+
+    let existing = bridge_config(&chain).await?;
+    if existing.mint_is_configured() {
+        anyhow::bail!(
+            "the wrapped mint is already set to {} — this instruction runs once",
+            existing.wrapped_mint
+        );
+    }
+
+    println!(
+        "CREATING the wrapped-GLC mint {}\n  mint authority becomes a program PDA; freeze \
+         authority is None (custody #6)",
+        mint.pubkey()
+    );
+
+    let instruction =
+        ix::create_wrapped_mint_instruction(&chain.program_id, &admin.pubkey(), &mint.pubkey());
+    let blockhash = chain.rpc.get_latest_blockhash().await?;
+    let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+        &[instruction],
+        Some(&admin.pubkey()),
+        &[&admin, &mint],
+        blockhash,
+    );
+    let sig = chain.rpc.send_transaction(&tx).await?;
+    tracing::warn!(signature = %sig, %note, "SUBMITTED create_wrapped_mint");
+    println!("create-wrapped-mint submitted\n  signature: {sig}\n  note: {note}");
+    println!(
+        "\nThe mint keypair confers nothing from here on. Verify with `glc-admin show-config`."
+    );
+    Ok(())
+}
+
+/// Reads the bridge configuration back — launch step 3.
+async fn bridge_config(chain: &Chain) -> anyhow::Result<BridgeConfigSnapshot> {
+    let (pda, _) = ix::bridge_config_pda(&chain.program_id);
+    let account = chain.rpc.get_account(&pda).await?.ok_or_else(|| {
+        anyhow::anyhow!("the bridge config account does not exist at {pda} — run `initialize`")
+    })?;
+    Ok(decode_bridge_config(&account.data)?)
+}
+
+/// `show-config` — what actually landed on chain.
+///
+/// Launch step 3 requires verifying `initialize` recorded the intended
+/// values by reading the accounts back. Every one of them is a security
+/// decision with no default, so confirming them is not optional.
+async fn show_config(_args: &[String]) -> anyhow::Result<()> {
+    let chain = chain_from_env()?;
+    let c = bridge_config(&chain).await?;
+    let set = validator_set(&chain).await?;
+
+    println!(
+        "bridge config ({})\n  protocol version: {}\n  admin:            {}\n  pending admin:    {}\n  \
+         paused:           {}\n  wrapped mint:     {}\n  governance timelock: {}s\n  \
+         max wrapped supply:  {} atomic\n  min deposit/withdrawal: {}/{}\n  withdrawals so far:  {}",
+        chain.program_id,
+        c.protocol_version,
+        c.admin,
+        match c.pending_admin {
+            Some(p) => format!("{p} — a handover is IN FLIGHT"),
+            None => "none".to_string(),
+        },
+        if c.paused { "YES" } else { "no" },
+        if c.mint_is_configured() {
+            c.wrapped_mint.to_string()
+        } else {
+            "NOT YET CREATED — minting is impossible until `create-wrapped-mint` runs".to_string()
+        },
+        c.governance_timelock_seconds,
+        c.max_wrapped_supply,
+        c.min_deposit,
+        c.min_withdrawal,
+        c.withdrawal_count
+    );
+    println!(
+        "\nvalidator set (epoch {})\n  threshold: {} of {}",
+        set.epoch,
+        set.threshold,
+        set.validators.len()
+    );
+    for (i, v) in set.validators.iter().enumerate() {
+        println!("  [{i}] {v}");
+    }
+    Ok(())
+}
+
+/// `transfer-admin` — step 1 of the handover, signed by the OUTGOING admin.
+async fn transfer_admin(args: &[String]) -> anyhow::Result<()> {
+    let note = require_note(args);
+    let new_admin: Pubkey = require(args, "--new-admin")
+        .parse()
+        .map_err(|e| anyhow::anyhow!("--new-admin is not a pubkey: {e}"))?;
+    let chain = chain_from_env()?;
+    let admin = keypair_at("GLC_ADMIN_KEYPAIR_PATH")?;
+
+    println!(
+        "NOMINATING {new_admin} as admin, replacing {}\n\n\
+         Nothing changes until that key signs `glc-admin accept-admin`. That is the point: a\n\
+         typoed key cannot brick governance, because a key that does not exist cannot accept.",
+        admin.pubkey()
+    );
+    let instruction =
+        ix::transfer_admin_instruction(&chain.program_id, &admin.pubkey(), &new_admin);
+    submit(&chain, &[instruction], &admin, "transfer-admin", &note).await
+}
+
+/// `accept-admin` — step 2, signed by the INCOMING admin.
+async fn accept_admin(args: &[String]) -> anyhow::Result<()> {
+    let note = require_note(args);
+    let chain = chain_from_env()?;
+    // Deliberately the same variable: the incoming admin runs this command
+    // on their own host, with their own key configured as GLC_ADMIN_KEYPAIR_PATH.
+    let new_admin = keypair_at("GLC_ADMIN_KEYPAIR_PATH")?;
+
+    let c = bridge_config(&chain).await?;
+    match c.pending_admin {
+        None => anyhow::bail!("no admin handover is pending"),
+        Some(p) if p != new_admin.pubkey() => anyhow::bail!(
+            "the pending admin is {p}, but GLC_ADMIN_KEYPAIR_PATH holds {} — this command must \
+             be run by the INCOMING admin",
+            new_admin.pubkey()
+        ),
+        Some(_) => {}
+    }
+
+    println!("ACCEPTING the admin role as {}", new_admin.pubkey());
+    let instruction = ix::accept_admin_instruction(&chain.program_id, &new_admin.pubkey());
+    submit(&chain, &[instruction], &new_admin, "accept-admin", &note).await
 }

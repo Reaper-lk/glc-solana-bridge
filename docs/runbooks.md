@@ -531,6 +531,77 @@ is the same standard this document holds every other procedure to.
 
 ---
 
+## 14. Bootstrap (once, at launch)
+
+Not an incident procedure — the one-time sequence that stands the bridge up.
+It is here because until Phase 7m none of it was executable: `initialize`
+and `create_wrapped_mint` had no caller outside the program's own tests, so
+the documented launch sequence could not be started.
+
+Run against a **paused-by-default** deployment, in this order.
+
+**1. Initialize.** Every value is a launch-time security decision with no
+default (owner decision U6); the program refuses a zero timelock and a zero
+supply cap rather than inventing one.
+
+```
+glc-admin initialize \
+  --validators <A>,<B>,<C> --threshold 2 \
+  --timelock-secs 172800 --max-supply <atomic> \
+  --min-deposit <atomic> --min-withdrawal <atomic> \
+  --note "launch: OPS-1"
+```
+
+**Validator order is permanent** — it fixes each member's bitmask index for
+the life of the federation. The command echoes the list back; check it
+before it lands, not after. This runs once and cannot be repeated.
+
+**2. Create the wrapped mint.**
+
+```
+glc-admin create-wrapped-mint --mint-keypair /path/to/mint.json --note "launch: OPS-1"
+```
+
+The mint account signs its own creation, so this needs its keypair for
+exactly one transaction. Afterwards the mint authority is a program PDA and
+freeze authority is `None` (custody #6) — the keypair confers nothing and is
+one more thing to lose.
+
+**3. Verify what actually landed.**
+
+```
+glc-admin show-config
+```
+
+Confirm the admin, threshold, validator set **and its order**, timelock,
+supply ceiling and deposit/withdrawal floors are what you intended. Reading
+them back is not a formality: nothing else will tell you a digit was
+transposed.
+
+**4. Pause before any funds can move** (§9), then bring operators up.
+
+### 14.1 Admin handover (custody #5)
+
+Two steps, so a typoed key cannot brick governance: nothing changes until the
+named key proves it exists.
+
+```
+glc-admin transfer-admin --new-admin <PUBKEY> --note "custody: hand over to multisig"
+```
+run by the **outgoing** admin, then
+
+```
+glc-admin accept-admin --note "custody: accepting"
+```
+run by the **incoming** admin, on their own host, with their own key in
+`GLC_ADMIN_KEYPAIR_PATH`.
+
+Between the two, `glc-admin show-config` reports the nomination as in
+flight, and the **outgoing** admin still governs. Verify the handover
+completed before standing down the old key.
+
+---
+
 ## What is deliberately absent
 
 - **Proof-of-reserves / attestation cadence** — `custody.md` #8, OPEN; no procedure exists.

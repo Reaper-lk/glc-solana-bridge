@@ -46,6 +46,7 @@ runs against real nodes. "Verified" here means *mechanically checked*, not
 | Every runbook command exists and every variable/metric it names is real | `runbook_commands.rs` |
 | Every variable the binaries read is documented | `deployment_config.rs` |
 | Every granted signature leaves an audit record (§13.3) | `signature_audit_log.rs`, and the payout/completion suites |
+| The bridge can be bootstrapped and the admin key handed over | `rehearsal_rotation.rs`, `admin_governance_encoding.rs` |
 | A halted indexer is an alarm, not a log line | `ops::indexer_status`, `ops::health` |
 | Reorg depth is visible *before* the halt (§13.1 (5)) | `ops::indexer_status`, `ops::health` |
 | Every stored commitment re-verifies offline (§13.4) | `offline_audit.rs`, `ops::audit` |
@@ -132,8 +133,15 @@ argued about in advance rather than at the time.
    proving it holds its key at its configured position (the `signer-server`
    E1 check does this at startup and refuses to run otherwise).
 3. **Deploy the program**, then transfer the upgrade authority per custody
-   #5. Verify `initialize` recorded the intended validator set, threshold,
-   timelock and supply ceiling by reading the accounts back.
+   #5. Stand the bridge up and verify what landed — `runbooks.md` §14:
+   ```
+   glc-admin initialize --validators ... --threshold M --timelock-secs N \
+     --max-supply ATOMIC --min-deposit N --min-withdrawal N --note "launch"
+   glc-admin create-wrapped-mint --mint-keypair PATH --note "launch"
+   glc-admin show-config
+   ```
+   Check the validator set **and its order**: it fixes each member's bitmask
+   index for the life of the federation.
 4. **Start paused.** `glc-admin pause` before any funds can move.
 5. **Bring up each operator** and confirm, on every host:
    - `/health` returns 200 with all five invariants present;

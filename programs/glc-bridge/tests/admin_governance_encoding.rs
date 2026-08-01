@@ -350,3 +350,159 @@ fn a_cap_raise_shifts_the_supply_field_because_its_validator_list_is_empty() {
         "the supply ceiling sits 64 bytes earlier than for a 2-validator rotation"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Bootstrap encoding (Phase 7m)
+// ---------------------------------------------------------------------------
+//
+// `initialize`, `create_wrapped_mint`, `transfer_admin` and `accept_admin`
+// had no shipped caller at all until Phase 7m — the bridge could not be
+// stood up with the released binaries. Now that `glc-admin` builds them by
+// hand, they need the same cross-workspace pin as everything else.
+
+#[test]
+fn initialize_encodes_its_arguments_in_declaration_order() {
+    let authority = Pubkey::new_unique();
+    let program_data = Pubkey::new_unique();
+    let validators = vec![Pubkey::new_unique(), Pubkey::new_unique()];
+    let ix = initialize_ix_with_cap(&authority, program_data, validators.clone(), 2, 77);
+
+    assert_eq!(&ix.data[..8], &discriminator("initialize"));
+    assert_eq!(&ix.data[8..12], &2u32.to_le_bytes(), "Vec length prefix");
+    assert_eq!(&ix.data[12..44], validators[0].as_ref());
+    assert_eq!(&ix.data[44..76], validators[1].as_ref());
+    assert_eq!(ix.data[76], 2, "threshold");
+    // min_deposit, min_withdrawal, governance_timelock_seconds,
+    // max_wrapped_supply — the order the relayer must reproduce exactly.
+    assert_eq!(&ix.data[77..85], &1_000u64.to_le_bytes());
+    assert_eq!(&ix.data[85..93], &2_000u64.to_le_bytes());
+    assert_eq!(&ix.data[93..101], &DEFAULT_TEST_TIMELOCK.to_le_bytes());
+    assert_eq!(&ix.data[101..109], &77u64.to_le_bytes());
+    assert_eq!(ix.data.len(), 109);
+
+    assert_eq!(
+        shape(&ix),
+        vec![
+            (authority, true, true),
+            (config_pda(), false, true),
+            (validator_set_pda(), false, true),
+            (glc_bridge::ID, false, false),
+            (program_data, false, false),
+            (solana_sdk::system_program::id(), false, false),
+        ]
+    );
+}
+
+#[test]
+fn create_wrapped_mint_requires_the_mint_itself_to_sign() {
+    // The account is created by this instruction, so the caller must hold
+    // its keypair for exactly this one transaction. A builder that marked it
+    // read-only or non-signing would fail only against a live cluster.
+    let admin = Pubkey::new_unique();
+    let mint = Pubkey::new_unique();
+    let ix = create_wrapped_mint_ix(&admin, &mint);
+
+    assert_eq!(ix.data, discriminator("create_wrapped_mint").to_vec());
+    assert_eq!(
+        shape(&ix),
+        vec![
+            (admin, true, true),
+            (config_pda(), false, true),
+            (mint_authority_pda(), false, false),
+            (mint, true, true),
+            (anchor_spl::token::spl_token::ID, false, false),
+            (solana_sdk::system_program::id(), false, false),
+        ]
+    );
+}
+
+#[test]
+fn transfer_admin_encodes_the_incoming_key() {
+    let admin = Pubkey::new_unique();
+    let new_admin = Pubkey::new_unique();
+    let ix = transfer_admin_ix(&admin, new_admin);
+
+    assert_eq!(&ix.data[..8], &discriminator("transfer_admin"));
+    assert_eq!(&ix.data[8..40], new_admin.as_ref());
+    assert_eq!(ix.data.len(), 40);
+    assert_eq!(
+        shape(&ix),
+        vec![(admin, true, false), (config_pda(), false, true)]
+    );
+}
+
+#[test]
+fn accept_admin_is_signed_by_the_incoming_key_not_the_outgoing_one() {
+    // The whole point of the two-step handover: nothing changes until the
+    // named key proves it exists.
+    let new_admin = Pubkey::new_unique();
+    let ix = accept_admin_ix(&new_admin);
+
+    assert_eq!(ix.data, discriminator("accept_admin").to_vec());
+    assert_eq!(
+        shape(&ix),
+        vec![(new_admin, true, false), (config_pda(), false, true)]
+    );
+}
+
+#[test]
+fn bridge_config_serialises_at_the_offsets_the_relayer_reads() {
+    use anchor_lang::AccountSerialize;
+
+    // `pending_admin: Option<Pubkey>` is a one-byte Borsh tag followed by the
+    // value only when set, so every later field moves by 32 bytes depending
+    // on whether a handover is in flight. Both shapes are pinned, because
+    // reading from fixed offsets would return wrong numbers exactly while an
+    // operator is mid-handover and checking.
+    for pending in [None, Some(Pubkey::new_unique())] {
+        let cfg = glc_bridge::state::BridgeConfig {
+            protocol_version: 1,
+            admin: Pubkey::new_unique(),
+            pending_admin: pending,
+            paused: true,
+            withdrawal_count: 9,
+            min_deposit: 1_000,
+            min_withdrawal: 2_000,
+            bump: 0xFD,
+            wrapped_mint: Pubkey::new_unique(),
+            mint_authority_bump: 0xFE,
+            governance_timelock_seconds: 3_600,
+            max_wrapped_supply: 21_000_000_000_000,
+            reserved: [0u8; 15],
+        };
+        let mut data = Vec::new();
+        cfg.try_serialize(&mut data).unwrap();
+        let body = &data[8..];
+
+        assert_eq!(body[0], 1, "protocol_version at body[0]");
+        assert_eq!(&body[1..33], cfg.admin.as_ref());
+        let mut off = match pending {
+            None => {
+                assert_eq!(body[33], 0, "absent Option is a zero tag with no value");
+                34
+            }
+            Some(p) => {
+                assert_eq!(body[33], 1, "present Option is a one tag");
+                assert_eq!(&body[34..66], p.as_ref());
+                66
+            }
+        };
+        assert_eq!(body[off], 1, "paused");
+        off += 1;
+        assert_eq!(&body[off..off + 8], &9u64.to_le_bytes());
+        off += 8;
+        assert_eq!(&body[off..off + 8], &1_000u64.to_le_bytes());
+        off += 8;
+        assert_eq!(&body[off..off + 8], &2_000u64.to_le_bytes());
+        off += 8;
+        assert_eq!(body[off], 0xFD, "bump");
+        off += 1;
+        assert_eq!(&body[off..off + 32], cfg.wrapped_mint.as_ref());
+        off += 32;
+        assert_eq!(body[off], 0xFE, "mint_authority_bump");
+        off += 1;
+        assert_eq!(&body[off..off + 8], &3_600i64.to_le_bytes());
+        off += 8;
+        assert_eq!(&body[off..off + 8], &21_000_000_000_000u64.to_le_bytes());
+    }
+}
