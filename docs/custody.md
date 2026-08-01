@@ -12,7 +12,7 @@ open as of 2026-07-28 (Phase 0).**
 | 4 | Key rotation & vault migration procedure (UTXO sweep to new vault) | operations runbook |
 | 5 | Program upgrade-authority custody (e.g., Squads multisig) and immutability timeline | deployment gating |
 | 6 | ~~Freeze authority on wrapped mint~~ — **DECIDED 2026-07-29**, see decision log | `create_wrapped_mint` (ADR-0009) |
-| 7 | Emergency pause: who can pause, what quorum un-pauses | admin instructions |
+| 7 | Emergency pause: who can pause, what quorum un-pauses | admin instructions, `glc-admin pause`/`unpause` (ADR-0022 §6) |
 | 8 | Proof-of-reserves / attestation cadence | operations |
 | 9 | Withdrawal payout policy: deterministic UTXO selection, fee bearer, min amount | `WithdrawalRequest` schema reserves fields |
 
@@ -22,6 +22,17 @@ validator-set rotation, and its own two-step handover until #1/#7 are
 decided. See ADR-0008.
 
 ## Decision log
+
+- **2026-08-01 — #7 remains OPEN, and is now reachable (Phase 7i-1,
+  ADR-0022 §6).** Until this phase, `set_paused` had no caller outside the
+  program's own tests: the circuit breaker existed on-chain and could not be
+  pulled. `glc-admin pause` / `unpause` now invoke it, under the **interim
+  single admin key** — one holder can pause, one holder can unpause, and
+  losing that key removes the breaker entirely. The owner's decision for this
+  phase was to keep that model as implemented, document it, and treat the
+  quorum question as a **launch-time governance decision**, not to redesign
+  it mid-phase. The tooling and the runbook state the single-key model
+  explicitly rather than implying a threshold exists.
 
 - **2026-07-31 — Governance hardening delivered (Phase 7a, ADR-0014).**
   Validator-set rotation no longer has an admin-gated path: it requires an

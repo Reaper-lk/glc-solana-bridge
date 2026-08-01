@@ -24,6 +24,7 @@ pub const SEED_BRIDGE_CONFIG: &[u8] = b"bridge_config";
 pub const SEED_VALIDATOR_SET: &[u8] = b"validator_set";
 pub const SEED_MINT_AUTHORITY: &[u8] = b"mint_authority";
 pub const SEED_DEPOSIT_CLAIM: &[u8] = b"deposit_claim";
+pub const SEED_GOVERNANCE_ACTION: &[u8] = b"governance_action";
 
 /// SPL Token program id (classic, not Token-2022 — owner decision U5,
 /// Phase 2). Sourced from the `spl-token` crate's own constant rather than
@@ -173,6 +174,192 @@ pub fn destination_commitment(glc_address_bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(glc_address_bytes).into()
 }
 
+// ---------------------------------------------------------------------------
+// Admin and governance instructions (Phase 7i-1)
+// ---------------------------------------------------------------------------
+//
+// These existed on-chain since Phases 7a and 7h-0 and had **no caller
+// outside the program's own tests**: `set_paused`, the supply-cap controls
+// and the whole rotation lifecycle could not be invoked by any shipped
+// tool. Runbooks for emergency pause, TVL breach, key rotation and the
+// compromise response therefore described procedures nobody could carry
+// out. These builders, plus `glc-admin`, are what make them real.
+//
+// Account order and mutability below are verbatim copies of the builders in
+// `programs/glc-bridge/tests/common/mod.rs`, which Anchor generates from the
+// on-chain accounts structs. `admin_governance_encoding.rs` in that suite
+// pins the same bytes this module produces, so a rename or reorder on either
+// side breaks a test rather than a deployment.
+
+pub fn governance_action_pda(program_id: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[SEED_GOVERNANCE_ACTION], program_id)
+}
+
+/// The two accounts every admin-only instruction takes.
+fn admin_config_metas(admin: &Pubkey, program_id: &Pubkey) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new_readonly(*admin, true),
+        AccountMeta::new(bridge_config_pda(program_id).0, false),
+    ]
+}
+
+/// `set_paused` — the admin-only circuit breaker.
+///
+/// The program rejects a no-op (pausing an already-paused bridge), so an
+/// operator who is unsure of the current state must read it rather than
+/// issue this blindly.
+pub fn set_paused_instruction(program_id: &Pubkey, admin: &Pubkey, paused: bool) -> Instruction {
+    let mut data = Vec::with_capacity(9);
+    data.extend_from_slice(&anchor_discriminator("set_paused"));
+    // Borsh encodes a bool as one byte, 0 or 1.
+    data.push(u8::from(paused));
+    Instruction {
+        program_id: *program_id,
+        accounts: admin_config_metas(admin, program_id),
+        data,
+    }
+}
+
+/// `lower_wrapped_supply_cap` — admin-only, immediate, and only downward
+/// (ADR-0014 §11.1). Reducing exposure is incident response; raising it is a
+/// federation decision behind a threshold and a timelock.
+pub fn lower_supply_cap_instruction(
+    program_id: &Pubkey,
+    admin: &Pubkey,
+    new_max: u64,
+) -> Instruction {
+    let mut data = Vec::with_capacity(16);
+    data.extend_from_slice(&anchor_discriminator("lower_wrapped_supply_cap"));
+    data.extend_from_slice(&new_max.to_le_bytes());
+    Instruction {
+        program_id: *program_id,
+        accounts: admin_config_metas(admin, program_id),
+        data,
+    }
+}
+
+/// The accounts a governance *proposal* takes. The proposer pays rent and
+/// confers no authority — the federation proof in the preceding ed25519
+/// instruction is the only authorization (owner decision U7).
+fn propose_metas(proposer: &Pubkey, program_id: &Pubkey) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new(*proposer, true),
+        AccountMeta::new_readonly(bridge_config_pda(program_id).0, false),
+        AccountMeta::new_readonly(validator_set_pda(program_id).0, false),
+        AccountMeta::new(governance_action_pda(program_id).0, false),
+        AccountMeta::new_readonly(INSTRUCTIONS_SYSVAR_ID, false),
+        AccountMeta::new_readonly(system_program::id(), false),
+    ]
+}
+
+/// The accounts an *execution* takes. Permissionless: the threshold proof at
+/// proposal time was the authorization, and rent is refunded to whoever
+/// submits.
+fn execute_metas(
+    executor: &Pubkey,
+    program_id: &Pubkey,
+    config_writable: bool,
+) -> Vec<AccountMeta> {
+    let config = bridge_config_pda(program_id).0;
+    vec![
+        AccountMeta::new(*executor, true),
+        // A rotation writes the validator set and only reads the config; a
+        // cap raise is the other way round. Getting this backwards is a
+        // runtime failure, not a compile error, which is why both orders are
+        // pinned by tests.
+        if config_writable {
+            AccountMeta::new(config, false)
+        } else {
+            AccountMeta::new_readonly(config, false)
+        },
+        if config_writable {
+            AccountMeta::new_readonly(validator_set_pda(program_id).0, false)
+        } else {
+            AccountMeta::new(validator_set_pda(program_id).0, false)
+        },
+        AccountMeta::new(governance_action_pda(program_id).0, false),
+    ]
+}
+
+/// `propose_validator_rotation` — queues a rotation behind the timelock.
+///
+/// Must be preceded in the same transaction by the ed25519 verification
+/// instruction carrying M validator signatures over the canonical rotation
+/// message (ADR-0010).
+pub fn propose_rotation_instruction(
+    program_id: &Pubkey,
+    proposer: &Pubkey,
+    validators: &[Pubkey],
+    threshold: u8,
+) -> Instruction {
+    let mut data = Vec::with_capacity(8 + 4 + validators.len() * 32 + 1);
+    data.extend_from_slice(&anchor_discriminator("propose_validator_rotation"));
+    // Borsh encodes a Vec as a u32 length prefix followed by the elements.
+    data.extend_from_slice(&(validators.len() as u32).to_le_bytes());
+    for v in validators {
+        data.extend_from_slice(v.as_ref());
+    }
+    data.push(threshold);
+    Instruction {
+        program_id: *program_id,
+        accounts: propose_metas(proposer, program_id),
+        data,
+    }
+}
+
+/// `execute_validator_rotation` — applies a queued rotation once its
+/// timelock has elapsed.
+pub fn execute_rotation_instruction(program_id: &Pubkey, executor: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: *program_id,
+        accounts: execute_metas(executor, program_id, false),
+        data: anchor_discriminator("execute_validator_rotation").to_vec(),
+    }
+}
+
+/// `cancel_validator_rotation` — cancels the pending action under a **fresh**
+/// M-of-N proof. Also preceded by an ed25519 verification instruction.
+pub fn cancel_rotation_instruction(program_id: &Pubkey, canceller: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(*canceller, true),
+            AccountMeta::new_readonly(bridge_config_pda(program_id).0, false),
+            AccountMeta::new_readonly(validator_set_pda(program_id).0, false),
+            AccountMeta::new(governance_action_pda(program_id).0, false),
+            AccountMeta::new_readonly(INSTRUCTIONS_SYSVAR_ID, false),
+        ],
+        data: anchor_discriminator("cancel_validator_rotation").to_vec(),
+    }
+}
+
+/// `propose_wrapped_supply_cap_raise` — queues a cap increase under the same
+/// threshold-and-timelock path a rotation takes (ADR-0014 §11.1).
+pub fn propose_cap_raise_instruction(
+    program_id: &Pubkey,
+    proposer: &Pubkey,
+    new_max: u64,
+) -> Instruction {
+    let mut data = Vec::with_capacity(16);
+    data.extend_from_slice(&anchor_discriminator("propose_wrapped_supply_cap_raise"));
+    data.extend_from_slice(&new_max.to_le_bytes());
+    Instruction {
+        program_id: *program_id,
+        accounts: propose_metas(proposer, program_id),
+        data,
+    }
+}
+
+/// `execute_wrapped_supply_cap_raise` — applies a queued increase once its
+/// timelock has elapsed. The program re-checks the ceiling at execution.
+pub fn execute_cap_raise_instruction(program_id: &Pubkey, executor: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: *program_id,
+        accounts: execute_metas(executor, program_id, true),
+        data: anchor_discriminator("execute_wrapped_supply_cap_raise").to_vec(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,5 +459,211 @@ mod tests {
             deposit_claim_pda(&program_id, &txid, 6).0,
             "different vout must derive a different claim PDA"
         );
+    }
+
+    // --- admin and governance (Phase 7i-1) ---------------------------------
+    //
+    // Each of these pins the SAME literal spec that
+    // `programs/glc-bridge/tests/admin_governance_encoding.rs` asserts
+    // Anchor generates. Those two files are the only link between the two
+    // workspaces (ADR-0001 forbids a code dependency), so a change on
+    // either side must break one of them.
+
+    fn shape(ix: &Instruction) -> Vec<(Pubkey, bool, bool)> {
+        ix.accounts
+            .iter()
+            .map(|m| (m.pubkey, m.is_signer, m.is_writable))
+            .collect()
+    }
+
+    #[test]
+    fn every_seed_is_pinned_to_its_literal_bytes() {
+        // A seed that drifts derives a DIFFERENT PDA, so every instruction
+        // built here would address an account the program never touches —
+        // silent, and visible only against a live cluster. A surviving
+        // mutant found this test missing: changing the governance seed broke
+        // nothing.
+        assert_eq!(SEED_BRIDGE_CONFIG, b"bridge_config");
+        assert_eq!(SEED_VALIDATOR_SET, b"validator_set");
+        assert_eq!(SEED_MINT_AUTHORITY, b"mint_authority");
+        assert_eq!(SEED_DEPOSIT_CLAIM, b"deposit_claim");
+        assert_eq!(SEED_GOVERNANCE_ACTION, b"governance_action");
+    }
+
+    #[test]
+    fn set_paused_is_discriminator_then_one_borsh_bool() {
+        let program_id = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
+        let ix = set_paused_instruction(&program_id, &admin, true);
+        assert_eq!(&ix.data[..8], &anchor_discriminator("set_paused"));
+        assert_eq!(ix.data.len(), 9);
+        assert_eq!(ix.data[8], 1);
+        assert_eq!(
+            set_paused_instruction(&program_id, &admin, false).data[8],
+            0,
+            "the argument must actually reach the wire"
+        );
+        // The admin signs but is not written to; the config is the reverse.
+        assert_eq!(
+            shape(&ix),
+            vec![
+                (admin, true, false),
+                (bridge_config_pda(&program_id).0, false, true)
+            ]
+        );
+    }
+
+    #[test]
+    fn lower_supply_cap_is_discriminator_then_a_u64() {
+        let program_id = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
+        let ix = lower_supply_cap_instruction(&program_id, &admin, 21_000_000_000_000);
+        assert_eq!(
+            &ix.data[..8],
+            &anchor_discriminator("lower_wrapped_supply_cap")
+        );
+        assert_eq!(&ix.data[8..16], &21_000_000_000_000u64.to_le_bytes());
+        assert_eq!(ix.data.len(), 16);
+        assert_eq!(shape(&ix).len(), 2);
+    }
+
+    #[test]
+    fn propose_rotation_encodes_a_borsh_vec_then_the_threshold() {
+        let program_id = Pubkey::new_unique();
+        let proposer = Pubkey::new_unique();
+        let validators = vec![Pubkey::new_unique(), Pubkey::new_unique()];
+        let ix = propose_rotation_instruction(&program_id, &proposer, &validators, 2);
+
+        assert_eq!(
+            &ix.data[..8],
+            &anchor_discriminator("propose_validator_rotation")
+        );
+        assert_eq!(&ix.data[8..12], &2u32.to_le_bytes(), "Vec length prefix");
+        assert_eq!(&ix.data[12..44], validators[0].as_ref());
+        assert_eq!(&ix.data[44..76], validators[1].as_ref());
+        assert_eq!(ix.data[76], 2, "the threshold follows the vector");
+        assert_eq!(ix.data.len(), 77);
+
+        assert_eq!(
+            shape(&ix),
+            vec![
+                (proposer, true, true),
+                (bridge_config_pda(&program_id).0, false, false),
+                (validator_set_pda(&program_id).0, false, false),
+                (governance_action_pda(&program_id).0, false, true),
+                (INSTRUCTIONS_SYSVAR_ID, false, false),
+                (system_program::id(), false, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn validator_order_is_preserved_because_it_fixes_the_bitmask_index() {
+        // Two proposals differing only in ordering are genuinely different
+        // proposals (shared::governance::rotation_params), so the encoding
+        // must not sort or dedupe.
+        let program_id = Pubkey::new_unique();
+        let p = Pubkey::new_unique();
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        let ab = propose_rotation_instruction(&program_id, &p, &[a, b], 1);
+        let ba = propose_rotation_instruction(&program_id, &p, &[b, a], 1);
+        assert_ne!(ab.data, ba.data);
+        assert_eq!(&ab.data[12..44], a.as_ref());
+        assert_eq!(&ba.data[12..44], b.as_ref());
+    }
+
+    #[test]
+    fn the_two_execute_paths_have_mirror_image_writability() {
+        // A rotation writes the validator set and reads the config; a cap
+        // raise is the other way round. Getting this backwards fails only at
+        // runtime, on a real cluster, mid-incident.
+        let program_id = Pubkey::new_unique();
+        let executor = Pubkey::new_unique();
+        let config = bridge_config_pda(&program_id).0;
+        let vset = validator_set_pda(&program_id).0;
+        let action = governance_action_pda(&program_id).0;
+
+        assert_eq!(
+            shape(&execute_rotation_instruction(&program_id, &executor)),
+            vec![
+                (executor, true, true),
+                (config, false, false),
+                (vset, false, true),
+                (action, false, true),
+            ]
+        );
+        assert_eq!(
+            shape(&execute_cap_raise_instruction(&program_id, &executor)),
+            vec![
+                (executor, true, true),
+                (config, false, true),
+                (vset, false, false),
+                (action, false, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_execute_instructions_carry_a_bare_discriminator() {
+        let program_id = Pubkey::new_unique();
+        let e = Pubkey::new_unique();
+        assert_eq!(
+            execute_rotation_instruction(&program_id, &e).data,
+            anchor_discriminator("execute_validator_rotation").to_vec()
+        );
+        assert_eq!(
+            execute_cap_raise_instruction(&program_id, &e).data,
+            anchor_discriminator("execute_wrapped_supply_cap_raise").to_vec()
+        );
+    }
+
+    #[test]
+    fn cancel_reads_the_sysvar_and_takes_no_system_program() {
+        // Cancellation needs a FRESH federation proof, so it reads the
+        // sysvar; it creates nothing, so a copy-paste of the propose metas
+        // would wrongly add a system program.
+        let program_id = Pubkey::new_unique();
+        let canceller = Pubkey::new_unique();
+        let ix = cancel_rotation_instruction(&program_id, &canceller);
+        assert_eq!(
+            ix.data,
+            anchor_discriminator("cancel_validator_rotation").to_vec()
+        );
+        assert_eq!(
+            shape(&ix),
+            vec![
+                (canceller, true, true),
+                (bridge_config_pda(&program_id).0, false, false),
+                (validator_set_pda(&program_id).0, false, false),
+                (governance_action_pda(&program_id).0, false, true),
+                (INSTRUCTIONS_SYSVAR_ID, false, false),
+            ]
+        );
+        assert!(
+            !ix.accounts.iter().any(|m| m.pubkey == system_program::id()),
+            "cancel creates no account and must not take the system program"
+        );
+    }
+
+    #[test]
+    fn both_proposals_take_the_same_accounts() {
+        let program_id = Pubkey::new_unique();
+        let p = Pubkey::new_unique();
+        assert_eq!(
+            shape(&propose_rotation_instruction(&program_id, &p, &[], 1)),
+            shape(&propose_cap_raise_instruction(&program_id, &p, 1))
+        );
+    }
+
+    #[test]
+    fn the_governance_action_pda_is_a_singleton_per_program() {
+        // One seed, no discriminating input: the program relies on `init`
+        // failing when an action is already pending, so a backlog can never
+        // be queued.
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        assert_ne!(governance_action_pda(&a).0, governance_action_pda(&b).0);
+        assert_eq!(governance_action_pda(&a).0, governance_action_pda(&a).0);
     }
 }

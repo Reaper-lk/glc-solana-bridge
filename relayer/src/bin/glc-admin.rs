@@ -25,7 +25,7 @@
 use std::path::PathBuf;
 
 use glc_bridge_shared::governance::{
-    cancel_params, rotation_params, tvl_raise_params, ACTION_CANCEL_ROTATION,
+    cancel_params, governance_message, rotation_params, tvl_raise_params, ACTION_CANCEL_ROTATION,
     ACTION_PROPOSE_ROTATION, ACTION_PROPOSE_TVL_RAISE,
 };
 use sha2::{Digest, Sha256};
@@ -36,10 +36,23 @@ use glc_relayer::glc::hex;
 use glc_relayer::glc::withdrawal_db::{
     canonical_payout_intent, payout_commitment, WithdrawalState,
 };
+use glc_relayer::ops::preflight::{can_execute, can_propose, cancel_target, enough_approvals};
 use glc_relayer::p2p::governance_view::{Approval, ApprovalStore, APPROVAL_TTL_SECONDS};
 use glc_relayer::p2p::sweep_view::{SweepApproval, SWEEP_APPROVAL_TTL_SECONDS};
 use glc_relayer::withdrawal::config::{RawWithdrawalConfig, WithdrawalConfig};
 use glc_relayer::withdrawal::sweep::{plan_sweep, SweepDestination, SweepPlan};
+
+use glc_relayer::p2p::collector::{DesignatedSigner, GrpcCollector};
+use glc_relayer::p2p::identity::{parse_peers, TlsMaterial, TlsPaths};
+use glc_relayer::signer::aggregate::build_ed25519_instruction;
+use glc_relayer::solana::instruction as ix;
+use glc_relayer::solana::rpc::{
+    decode_pending_action, decode_validator_set, PendingActionSnapshot, RealSolanaRpc, SolanaRpc,
+};
+use glc_relayer::withdrawal::adapter::RealPayoutRpc;
+use glc_relayer::withdrawal::executor::PayoutRpc;
+use glc_relayer::withdrawal::multisig::{assemble, PartialSignature, Transaction};
+use solana_sdk::signature::{read_keypair_file, Keypair, Signer as _};
 
 const USAGE: &str = r#"glc-admin — operator utility for recovery, governance and vault sweeps
 
@@ -58,11 +71,25 @@ GOVERNANCE (stages an approval for THIS operator's signer)
   list-approvals        --approvals PATH
   revoke-approval       --approvals PATH --action N
 
+ON-CHAIN ADMIN (interim single admin key -- see docs/custody.md #7)
+  pause                 --note TEXT
+  unpause               --note TEXT
+  lower-tvl-cap         --new-max ATOMIC --note TEXT
+
+ON-CHAIN GOVERNANCE (collects M signatures from the federation, then submits)
+  show-pending
+  submit-rotation       --threshold M --validators A,B,C --note TEXT
+  submit-tvl-raise      --new-max ATOMIC --note TEXT
+  submit-cancel         --note TEXT
+  execute-rotation      --note TEXT
+  execute-tvl-raise     --note TEXT
+
 VAULT SWEEP (ADR-0014 section 8.7 compromise response)
   sweep-plan            --db PATH --dest-hash160 HEX --dest-address ADDR
   sweep-approve         --db PATH --sweep-approvals PATH --dest-hash160 HEX
                         --dest-address ADDR --commitment HEX --note TEXT
   sweep-revoke          --sweep-approvals PATH
+  sweep-execute         --db PATH --dest-hash160 HEX --dest-address ADDR --note TEXT
 
 Staging an approval does NOT perform the action. It tells this operator's own
 signer that it may sign that one exact proposal. The action happens only once
@@ -149,7 +176,14 @@ fn protocol_version_from_env() -> anyhow::Result<u8> {
     Ok(env_required("GLC_PROTOCOL_VERSION")?.parse()?)
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
     let args: Vec<String> = std::env::args().collect();
     let Some(cmd) = args.get(1).map(|s| s.as_str()) else {
         usage()
@@ -168,6 +202,16 @@ fn main() -> anyhow::Result<()> {
         "sweep-plan" => sweep_plan(&args),
         "sweep-approve" => sweep_approve(&args),
         "sweep-revoke" => sweep_revoke(&args),
+        "sweep-execute" => sweep_execute(&args).await,
+        "pause" => set_paused(&args, true).await,
+        "unpause" => set_paused(&args, false).await,
+        "lower-tvl-cap" => lower_tvl_cap(&args).await,
+        "show-pending" => show_pending(&args).await,
+        "submit-rotation" => submit_rotation(&args).await,
+        "submit-tvl-raise" => submit_tvl_raise(&args).await,
+        "submit-cancel" => submit_cancel(&args).await,
+        "execute-rotation" => execute_queued(&args, false).await,
+        "execute-tvl-raise" => execute_queued(&args, true).await,
         "-h" | "--help" | "help" => usage(),
         other => {
             eprintln!("error: unknown command {other:?}\n");
@@ -636,4 +680,528 @@ fn sweep_revoke(args: &[String]) -> anyhow::Result<()> {
     }
     println!("sweep approval revoked — effective immediately, no restart needed");
     Ok(())
+}
+
+// ------------------------------------------------------- on-chain plumbing
+
+/// Everything a Solana-touching command needs, read from the same
+/// environment the relayer uses.
+struct Chain {
+    rpc: RealSolanaRpc,
+    program_id: solana_sdk::pubkey::Pubkey,
+}
+
+fn chain_from_env() -> anyhow::Result<Chain> {
+    let commitment =
+        glc_relayer::solana::config::parse_commitment(&env_required("GLC_SOLANA_COMMITMENT")?)
+            .map_err(|e| anyhow::anyhow!("invalid GLC_SOLANA_COMMITMENT: {e}"))?;
+    let program_id = solana_sdk::pubkey::Pubkey::from(
+        hex::decode_exact::<32>(&env_required("GLC_PROGRAM_ID_HEX")?)
+            .map_err(|e| anyhow::anyhow!("GLC_PROGRAM_ID_HEX is not 32 hex bytes: {e}"))?,
+    );
+    Ok(Chain {
+        rpc: RealSolanaRpc::new(env_required("GLC_SOLANA_RPC_URL")?, commitment),
+        program_id,
+    })
+}
+
+fn keypair_at(var: &str) -> anyhow::Result<Keypair> {
+    let path = env_required(var)?;
+    read_keypair_file(&path)
+        .map_err(|e| anyhow::anyhow!("could not read the keypair at {path} ({var}): {e}"))
+}
+
+/// Signs and sends one transaction, reporting the signature.
+async fn submit(
+    chain: &Chain,
+    instructions: &[solana_sdk::instruction::Instruction],
+    payer: &Keypair,
+    what: &str,
+    note: &str,
+) -> anyhow::Result<()> {
+    let blockhash = chain.rpc.get_latest_blockhash().await?;
+    let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+        instructions,
+        Some(&payer.pubkey()),
+        &[payer],
+        blockhash,
+    );
+    let sig = chain.rpc.send_transaction(&tx).await?;
+    // Logged at warn: every command that reaches here changed the bridge's
+    // behaviour on-chain, and the note is the audit record of why.
+    tracing::warn!(action = what, signature = %sig, %note, "SUBMITTED an on-chain operator action");
+    println!("{what} submitted\n  signature: {sig}\n  note: {note}");
+    Ok(())
+}
+
+/// The federation as this operator's node currently sees it.
+async fn validator_set(
+    chain: &Chain,
+) -> anyhow::Result<glc_relayer::solana::rpc::ValidatorSetSnapshot> {
+    let (pda, _) = ix::validator_set_pda(&chain.program_id);
+    let account = chain
+        .rpc
+        .get_account(&pda)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("the validator set account does not exist at {pda}"))?;
+    Ok(decode_validator_set(&account.data)?)
+}
+
+async fn pending_action(chain: &Chain) -> anyhow::Result<Option<PendingActionSnapshot>> {
+    let (pda, _) = ix::governance_action_pda(&chain.program_id);
+    match chain.rpc.get_account(&pda).await? {
+        // Anchor closes the account on execute/cancel, so an existing but
+        // empty account means "nothing pending", not "corrupt".
+        Some(a) if !a.data.is_empty() => Ok(Some(decode_pending_action(&a.data)?)),
+        _ => Ok(None),
+    }
+}
+
+fn collector_from_env() -> anyhow::Result<GrpcCollector> {
+    let peers = parse_peers(&env_required("GLC_FEDERATION_PEERS")?, None)?;
+    if std::env::var("GLC_FEDERATION_TLS").as_deref() == Ok("off") {
+        eprintln!(
+            "WARNING: GLC_FEDERATION_TLS=off — federation traffic is UNAUTHENTICATED at the \
+             transport layer; acceptable only for loopback or regtest"
+        );
+        return Ok(GrpcCollector::insecure_without_tls(peers));
+    }
+    let tls = TlsMaterial::load(&TlsPaths {
+        ca: PathBuf::from(env_required("GLC_FEDERATION_CA_CERT_PATH")?),
+        cert: PathBuf::from(env_required("GLC_RELAYER_TLS_CERT_PATH")?),
+        key: PathBuf::from(env_required("GLC_RELAYER_TLS_KEY_PATH")?),
+    })?;
+    Ok(GrpcCollector::new(
+        peers,
+        tls,
+        env_required("GLC_FEDERATION_TLS_DOMAIN")?,
+    ))
+}
+
+// ------------------------------------------------------------ admin actions
+
+/// `pause` / `unpause`.
+///
+/// # Custody note (docs/custody.md #7, OPEN)
+///
+/// This is gated by a **single interim admin key**, not by a threshold. One
+/// key holder can pause the bridge, and one key holder can unpause it —
+/// which also means losing that key removes the circuit breaker entirely.
+/// Whether pause should stay single-key and what quorum should unpause is a
+/// launch-time governance decision that has not been made; this command
+/// implements what the program actually enforces today and says so rather
+/// than implying a threshold exists.
+async fn set_paused(args: &[String], paused: bool) -> anyhow::Result<()> {
+    let note = require_note(args);
+    let chain = chain_from_env()?;
+    let admin = keypair_at("GLC_ADMIN_KEYPAIR_PATH")?;
+
+    // The program rejects a no-op, so an operator who issues this blindly
+    // gets an obscure error. Read the state and say so plainly instead.
+    println!(
+        "{} the bridge as admin {}\n  program: {}",
+        if paused { "PAUSING" } else { "UNPAUSING" },
+        admin.pubkey(),
+        chain.program_id
+    );
+    if !paused {
+        println!(
+            "\nNOTE: unpausing resumes minting and payouts. Confirm the condition that caused\n\
+             the pause is actually resolved — the bridge does not re-check it for you."
+        );
+    }
+
+    let instruction = ix::set_paused_instruction(&chain.program_id, &admin.pubkey(), paused);
+    submit(
+        &chain,
+        &[instruction],
+        &admin,
+        if paused { "pause" } else { "unpause" },
+        &note,
+    )
+    .await
+}
+
+/// `lower-tvl-cap` — admin-only, immediate, and only downward (ADR-0014
+/// §11.1). Raising the cap needs `submit-tvl-raise` and a timelock.
+async fn lower_tvl_cap(args: &[String]) -> anyhow::Result<()> {
+    let new_max: u64 = require(args, "--new-max").parse()?;
+    let note = require_note(args);
+    if new_max == 0 {
+        anyhow::bail!("a wrapped-supply cap of zero is never valid; the program refuses it");
+    }
+    let chain = chain_from_env()?;
+    let admin = keypair_at("GLC_ADMIN_KEYPAIR_PATH")?;
+    println!(
+        "LOWERING the wrapped-supply cap to {new_max} atomic units\n  \
+         This takes effect immediately and cannot be undone without a threshold-approved,\n  \
+         timelocked raise (`submit-tvl-raise`)."
+    );
+    let instruction = ix::lower_supply_cap_instruction(&chain.program_id, &admin.pubkey(), new_max);
+    submit(&chain, &[instruction], &admin, "lower-tvl-cap", &note).await
+}
+
+// ------------------------------------------------------- governance actions
+
+async fn show_pending(_args: &[String]) -> anyhow::Result<()> {
+    let chain = chain_from_env()?;
+    let Some(p) = pending_action(&chain).await? else {
+        println!("no governance action is pending");
+        return Ok(());
+    };
+    let now = now_unix();
+    println!(
+        "pending governance action\n  action:   {} ({})\n  epoch:    {}\n  eta:      {} ({})",
+        p.action,
+        match p.action {
+            ACTION_PROPOSE_ROTATION => "validator rotation",
+            ACTION_PROPOSE_TVL_RAISE => "wrapped-supply cap raise",
+            _ => "unrecognised",
+        },
+        p.proposed_under_epoch,
+        p.eta,
+        if now >= p.eta {
+            "timelock elapsed — executable now".to_string()
+        } else {
+            format!("{} seconds remaining", p.eta - now)
+        }
+    );
+    if p.action == ACTION_PROPOSE_ROTATION {
+        println!("  threshold: {} of {}", p.threshold, p.validators.len());
+        for (i, v) in p.validators.iter().enumerate() {
+            println!("    [{i}] {v}");
+        }
+    }
+    if p.action == ACTION_PROPOSE_TVL_RAISE {
+        println!("  new ceiling: {}", p.proposed_max_wrapped_supply);
+    }
+    Ok(())
+}
+
+/// Collects M governance signatures over `message` and returns the ed25519
+/// verification instruction the program will read.
+///
+/// Refusals here are **ordinary**: a validator whose operator has not staged
+/// this exact proposal is behaving as designed (ADR-0021 §4). They are
+/// reported so the operator can see who still needs to approve.
+async fn collect_governance(
+    chain: &Chain,
+    action: u8,
+    params: &[u8],
+) -> anyhow::Result<solana_sdk::instruction::Instruction> {
+    let protocol_version = protocol_version_from_env()?;
+    let set = validator_set(chain).await?;
+    let commitment = commitment_of(params);
+    let message = governance_message(
+        protocol_version,
+        &chain.program_id.to_bytes(),
+        set.epoch,
+        action,
+        &commitment,
+    );
+
+    println!(
+        "collecting signatures for action {action} under epoch {}\n  commitment: {}\n  need {} of {} validators",
+        set.epoch,
+        hex::encode(&commitment),
+        set.threshold,
+        set.validators.len()
+    );
+
+    let round = collector_from_env()?
+        .collect_governance_signatures(set.epoch, action, &commitment, &message)
+        .await;
+
+    for (peer, why) in &round.refused {
+        println!("  not approved by {peer}: {why}");
+    }
+    for (peer, why) in &round.unavailable {
+        println!("  unreachable {peer}: {why}");
+    }
+    let have = round.unique_signers();
+    println!("  collected {have} of {} required", set.threshold);
+    enough_approvals(have, set.threshold).map_err(|e| {
+        anyhow::anyhow!(
+            "{e}. Each remaining operator must run the matching `glc-admin approve-*` command."
+        )
+    })?;
+    Ok(build_ed25519_instruction(&round.signatures, &message))
+}
+
+async fn submit_rotation(args: &[String]) -> anyhow::Result<()> {
+    let threshold: u8 = require(args, "--threshold").parse()?;
+    let note = require_note(args);
+    let validators: Vec<solana_sdk::pubkey::Pubkey> = require(args, "--validators")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse()
+                .map_err(|e| anyhow::anyhow!("{s:?} is not a pubkey: {e}"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    if threshold == 0 || usize::from(threshold) > validators.len() {
+        anyhow::bail!(
+            "threshold {threshold} is impossible for {} validators",
+            validators.len()
+        );
+    }
+    let chain = chain_from_env()?;
+    can_propose(pending_action(&chain).await?.as_ref())
+        .map_err(|e| anyhow::anyhow!("{e} (`glc-admin show-pending`)"))?;
+
+    let raw: Vec<[u8; 32]> = validators.iter().map(|v| v.to_bytes()).collect();
+    let ed25519 = collect_governance(
+        &chain,
+        ACTION_PROPOSE_ROTATION,
+        &rotation_params(threshold, &raw),
+    )
+    .await?;
+
+    let payer = keypair_at("GLC_SOLANA_SUBMITTER_KEYPAIR_PATH")?;
+    let propose = ix::propose_rotation_instruction(
+        &chain.program_id,
+        &payer.pubkey(),
+        &validators,
+        threshold,
+    );
+    submit(
+        &chain,
+        &[ed25519, propose],
+        &payer,
+        "propose-rotation",
+        &note,
+    )
+    .await?;
+    println!(
+        "\nThe rotation is QUEUED behind the governance timelock. Run `glc-admin show-pending`\n\
+         for its eta, then `glc-admin execute-rotation` once it has elapsed."
+    );
+    Ok(())
+}
+
+async fn submit_tvl_raise(args: &[String]) -> anyhow::Result<()> {
+    let new_max: u64 = require(args, "--new-max").parse()?;
+    let note = require_note(args);
+    if new_max == 0 {
+        anyhow::bail!("a wrapped-supply cap of zero is never valid");
+    }
+    let chain = chain_from_env()?;
+    can_propose(pending_action(&chain).await?.as_ref())
+        .map_err(|e| anyhow::anyhow!("{e} (`glc-admin show-pending`)"))?;
+    let ed25519 =
+        collect_governance(&chain, ACTION_PROPOSE_TVL_RAISE, &tvl_raise_params(new_max)).await?;
+
+    let payer = keypair_at("GLC_SOLANA_SUBMITTER_KEYPAIR_PATH")?;
+    let propose = ix::propose_cap_raise_instruction(&chain.program_id, &payer.pubkey(), new_max);
+    submit(
+        &chain,
+        &[ed25519, propose],
+        &payer,
+        "propose-tvl-raise",
+        &note,
+    )
+    .await?;
+    println!(
+        "\nThe raise is QUEUED behind the governance timelock. The program re-checks the\n\
+         ceiling at execution, so a supply change in the meantime can still refuse it."
+    );
+    Ok(())
+}
+
+/// `submit-cancel` — cancels the pending action under a **fresh** M-of-N proof.
+///
+/// The cancelled action and its eta are read **from the chain**, never typed
+/// by the operator: `cancel_params` commits to both, and a mistyped eta
+/// produces a proof the program rejects after the whole federation has been
+/// asked to sign it.
+async fn submit_cancel(args: &[String]) -> anyhow::Result<()> {
+    let note = require_note(args);
+    let chain = chain_from_env()?;
+    let pending = pending_action(&chain).await?;
+    let (target_action, target_eta) =
+        cancel_target(pending.as_ref()).map_err(|e| anyhow::anyhow!("{e} — nothing to cancel"))?;
+    let pending = pending.expect("cancel_target succeeded, so an action is pending");
+
+    println!("cancelling the pending action {target_action} with eta {target_eta}");
+    println!(
+        "  Every operator must have staged this exact cancellation:\n    \
+         glc-admin approve-cancel --epoch {} --pending-action {} --pending-eta {} ...",
+        pending.proposed_under_epoch, pending.action, pending.eta
+    );
+
+    let ed25519 = collect_governance(
+        &chain,
+        ACTION_CANCEL_ROTATION,
+        &cancel_params(target_action, target_eta),
+    )
+    .await?;
+
+    let payer = keypair_at("GLC_SOLANA_SUBMITTER_KEYPAIR_PATH")?;
+    let cancel = ix::cancel_rotation_instruction(&chain.program_id, &payer.pubkey());
+    submit(
+        &chain,
+        &[ed25519, cancel],
+        &payer,
+        "cancel-governance",
+        &note,
+    )
+    .await
+}
+
+/// `execute-rotation` / `execute-tvl-raise`.
+///
+/// Permissionless — the threshold proof at proposal time was the
+/// authorization — so this needs no signatures, only a fee payer.
+async fn execute_queued(args: &[String], cap_raise: bool) -> anyhow::Result<()> {
+    let note = require_note(args);
+    let chain = chain_from_env()?;
+    let pending = pending_action(&chain).await?;
+    let expected = if cap_raise {
+        ACTION_PROPOSE_TVL_RAISE
+    } else {
+        ACTION_PROPOSE_ROTATION
+    };
+    // Every one of these is ALSO enforced on-chain. Checking here buys a
+    // clear refusal instead of a failed transaction and an error code to
+    // decode mid-incident (ops::preflight).
+    can_execute(
+        pending.as_ref(),
+        expected,
+        validator_set(&chain).await?.epoch,
+        now_unix(),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let payer = keypair_at("GLC_SOLANA_SUBMITTER_KEYPAIR_PATH")?;
+    let instruction = if cap_raise {
+        ix::execute_cap_raise_instruction(&chain.program_id, &payer.pubkey())
+    } else {
+        ix::execute_rotation_instruction(&chain.program_id, &payer.pubkey())
+    };
+    submit(
+        &chain,
+        &[instruction],
+        &payer,
+        if cap_raise {
+            "execute-tvl-raise"
+        } else {
+            "execute-rotation"
+        },
+        &note,
+    )
+    .await
+}
+
+// ------------------------------------------------------------- sweep-execute
+
+/// Collects partial signatures for an approved sweep, assembles the
+/// transaction, and broadcasts it.
+///
+/// This operator's own node broadcasts, and this operator's own rows built
+/// the plan — but the *authorisation* is M other operators each having
+/// staged the same commitment. Assembly verifies every signature against its
+/// input's sighash, so a wrong or forged partial fails here rather than at
+/// broadcast.
+async fn sweep_execute(args: &[String]) -> anyhow::Result<()> {
+    let note = require_note(args);
+    let cfg = withdrawal_config_from_env()?;
+    let protocol_version = protocol_version_from_env()?;
+    let chain = chain_from_env()?;
+    let db = open_db(args)?;
+
+    let plan = build_plan(args, &cfg, &db)?;
+    let commitment = plan.commitment(protocol_version);
+    println!("\ncommitment: {}", hex::encode(&commitment));
+
+    // The transaction is built by this operator's own Goldcoin node, then
+    // verified against the plan before anyone is asked to sign it.
+    let rpc = goldcoin_rpc_from_env()?;
+    let outputs = vec![(plan.dest_address.clone(), plan.swept_atomic)];
+    let inputs: Vec<(String, i64)> = plan
+        .inputs
+        .iter()
+        .map(|u| (u.txid_hex.clone(), u.vout))
+        .collect();
+    let unsigned_hex = rpc.create_raw_transaction(&inputs, &outputs).await?;
+    let unsigned = Transaction::parse_hex(&unsigned_hex)
+        .map_err(|e| anyhow::anyhow!("the node returned an unparseable transaction: {e}"))?;
+    glc_relayer::withdrawal::sweep::verify_sweep_tx(&unsigned, &plan)
+        .map_err(|e| anyhow::anyhow!("the node did not build the planned sweep: {e}"))?;
+
+    // Every vault signer is asked; the first `threshold` that answer are the
+    // quorum. A sweep is not derived from a withdrawal index, so unlike a
+    // payout there is nothing to designate from (ADR-0021 §5.1).
+    let set = validator_set(&chain).await?;
+    let signers: Vec<DesignatedSigner> = set
+        .validators
+        .iter()
+        .enumerate()
+        .filter_map(|(i, v)| {
+            cfg.vault
+                .signer_pubkeys
+                .get(i)
+                .map(|vault_pubkey| DesignatedSigner {
+                    validator_pubkey: *v,
+                    vault_pubkey: *vault_pubkey,
+                })
+        })
+        .collect();
+
+    let round = collector_from_env()?
+        .collect_sweep_partials(set.epoch, &unsigned_hex, &signers, cfg.vault.threshold)
+        .await;
+    for (peer, why) in &round.round.refused {
+        println!("  not approved by {peer}: {why}");
+    }
+    for (peer, why) in &round.round.unavailable {
+        println!("  unreachable {peer}: {why}");
+    }
+    enough_approvals(round.partials.len(), cfg.vault.threshold as u8).map_err(|e| {
+        anyhow::anyhow!(
+            "{e}. Each remaining operator must run `glc-admin sweep-approve` with commitment {}.",
+            hex::encode(&commitment)
+        )
+    })?;
+
+    // Assembly verifies each signature against its input's sighash and
+    // orders them by redeem-script position, which consensus enforces
+    // (ADR-0017 D2).
+    let partials: Vec<PartialSignature> = round.partials;
+    let signed = assemble(&unsigned, &cfg.vault, &partials)
+        .map_err(|e| anyhow::anyhow!("could not assemble the sweep: {e}"))?;
+    let signed_hex = signed.serialize_hex();
+    let txid = signed.txid_hex();
+
+    println!("\nassembled sweep {txid}\n  broadcasting...");
+    match rpc.send_raw_transaction(&signed_hex).await? {
+        glc_relayer::glc::rpc::BroadcastOutcome::Accepted { txid } => {
+            println!("BROADCAST. txid {txid}\n  note: {note}");
+        }
+        glc_relayer::glc::rpc::BroadcastOutcome::AlreadyInChain => {
+            println!("already in a block — the sweep had already been broadcast");
+        }
+        glc_relayer::glc::rpc::BroadcastOutcome::MissingInputs => {
+            anyhow::bail!(
+                "the node rejected the sweep: its inputs are missing or already spent. The \
+                 vault's contents changed since the plan was built; re-plan and re-approve."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// This operator's own Goldcoin node, wrapped in the same adapter the
+/// executor uses so the amount formatting the node demands (decimal GLC to
+/// exactly eight places) is done in one place rather than two.
+fn goldcoin_rpc_from_env() -> anyhow::Result<RealPayoutRpc> {
+    let client =
+        glc_relayer::glc::rpc::RpcClient::new(&glc_relayer::glc::config::RpcConfigValidated {
+            url: env_required("GLC_RPC_URL")?,
+            user: env_required("GLC_RPC_USER")?,
+            password: env_required("GLC_RPC_PASSWORD")?,
+            connect_timeout_ms: 5_000,
+            read_timeout_ms: 30_000,
+        })?;
+    Ok(RealPayoutRpc::new(client))
 }

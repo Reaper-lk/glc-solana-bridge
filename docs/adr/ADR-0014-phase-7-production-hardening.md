@@ -544,9 +544,12 @@ performed by the running system: `signer-server` had no governance RPC, and
 the vault sweep had no implementation anywhere. The response above was
 therefore documented but not available.
 
-Both are implemented as of Phase 7i-0 (**ADR-0021**): `SignGovernance` plus
-`glc-admin approve-rotation` for the rotation, and `SignSweep` plus
-`glc-admin sweep-plan` / `sweep-approve` for the sweep. Authorisation for
+Both are implemented as of Phases 7i-0 and 7i-1 (**ADR-0021**, **ADR-0022**):
+`SignGovernance` plus `glc-admin approve-rotation` / `submit-rotation` /
+`execute-rotation` for the rotation, and `SignSweep` plus `glc-admin
+sweep-plan` / `sweep-approve` / `sweep-execute` for the sweep. The pause step
+is `glc-admin pause`, which had no caller at all until 7i-1 and remains
+gated by the interim single admin key (ADR-0022 §6, custody #7 OPEN). Authorisation for
 both is by **operator-staged approval** rather than derivation, because
 neither has an on-chain fact to derive from — see ADR-0021 §4.
 
@@ -855,12 +858,18 @@ Solana outage; Goldcoin outage; stuck withdrawal; TVL breach; emergency
 pause and unpause; key rotation; vault sweep. Each rehearsed at least once
 on testnet before launch.
 
-**Split into two phases (owner decision, 2026-08-01).** Verifying the
+**Split into three phases (owner decision, 2026-08-01).** Verifying the
 current state found that integrity-halt recovery, key rotation, the TVL
-raise and the vault sweep had no executable form — see ADR-0021 §2. Phase
-7i-0 built the tooling (`glc-admin`, `SignGovernance`, `SignSweep`); Phase
-7i writes the runbooks, and documents **only** procedures an operator can
-carry out with supported tools.
+raise and the vault sweep had no executable form — see ADR-0021 §2. A
+second survey then found that even after 7i-0 the federation could *produce*
+governance signatures but nothing could *submit* them, and that pause and
+the supply-cap controls had no caller either (ADR-0022 §2).
+
+- **7i-0** (ADR-0021): `glc-admin`, `SignGovernance`, `SignSweep`.
+- **7i-1** (ADR-0022): on-chain submission — pause/unpause, supply-cap
+  controls, the rotation lifecycle, and `sweep-execute`.
+- **7i**: the runbooks, documenting **only** procedures an operator can
+  carry out with supported tools.
 
 ---
 
