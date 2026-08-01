@@ -18,6 +18,7 @@
 //! | [`health`] | the HTTP surface: `/health` and `/metrics` |
 //! | [`collector`] | gathers a report from live database and chain state |
 
+pub mod audit;
 pub mod collector;
 pub mod health;
 pub mod indexer_status;

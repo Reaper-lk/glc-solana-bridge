@@ -397,6 +397,26 @@ pub struct PayoutRow {
     pub completed_at: Option<i64>,
 }
 
+/// One payout's stored intent and every field needed to recompute it.
+///
+/// Read-only input to [`crate::ops::audit`]; explicitly **unverified**.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPayoutIntent {
+    pub withdrawal_index: i64,
+    pub commitment_hash: Vec<u8>,
+    pub intent_bytes: Vec<u8>,
+    pub vault_script_hash: [u8; 20],
+    pub quorum_attempt: u32,
+    pub quorum_indices: Vec<u8>,
+    pub fee_atomic: u64,
+    pub payout_atomic: u64,
+    pub change_atomic: u64,
+    pub change_address: Option<String>,
+    pub protocol_version: u8,
+    pub dest_hash160: [u8; 20],
+    pub withdrawal_state: String,
+}
+
 /// Everything needed to sign, returned by
 /// [`Db::verify_and_load_signable_payout`] — the output of the pre-signing
 /// guard sequence. Constructed only from freshly reloaded rows.
@@ -601,6 +621,50 @@ impl Db {
         }
         tx.commit()?;
         Ok(inserted)
+    }
+
+    /// Every payout with its stored intent and the fields needed to
+    /// recompute it, for the **read-only** offline auditor (ADR-0014 §13.4).
+    ///
+    /// Everything the recompute needs is in the database — including the
+    /// change hash160, which is decoded from the stored `change_address`
+    /// rather than taken from configuration. So an auditor can run against a
+    /// backup on a host that has no vault configuration at all.
+    pub fn all_payout_intents(&self) -> Result<Vec<StoredPayoutIntent>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.withdrawal_index, p.commitment_hash, p.intent_bytes, p.vault_script_hash,
+                    p.quorum_attempt, p.quorum_indices, p.fee_atomic, p.payout_atomic,
+                    p.change_atomic, p.change_address,
+                    w.protocol_version, w.glc_address_hash160, w.state
+             FROM withdrawal_payouts p
+             JOIN withdrawal_requests w ON w.withdrawal_index = p.withdrawal_index
+             ORDER BY p.withdrawal_index",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(StoredPayoutIntent {
+                    withdrawal_index: r.get(0)?,
+                    commitment_hash: r.get(1)?,
+                    intent_bytes: r.get(2)?,
+                    vault_script_hash: to_array20(&r.get::<_, Vec<u8>>(3)?),
+                    quorum_attempt: r.get(4)?,
+                    quorum_indices: r.get(5)?,
+                    fee_atomic: u64_from(&r.get::<_, Vec<u8>>(6)?),
+                    payout_atomic: u64_from(&r.get::<_, Vec<u8>>(7)?),
+                    change_atomic: u64_from(&r.get::<_, Vec<u8>>(8)?),
+                    change_address: r.get(9)?,
+                    protocol_version: r.get(10)?,
+                    dest_hash160: to_array20(&r.get::<_, Vec<u8>>(11)?),
+                    withdrawal_state: r.get(12)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The committed inputs of one payout, in their canonical order.
+    pub fn committed_payout_inputs(&self, index: i64) -> Result<Vec<VaultUtxo>, DbError> {
+        self.payout_inputs(index)
     }
 
     pub fn withdrawals_by_state(
