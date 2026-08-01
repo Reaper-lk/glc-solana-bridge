@@ -483,9 +483,58 @@ condition §4 alarms on.
 
 ---
 
+## 13. Backup, restore, and integrity
+
+ADR-0014 §13.4. The database is this operator's independent record of the
+chain — it is what makes their signer's refusal mean anything — so a backup
+that turns out to be corrupt is worse than no backup, because it is trusted.
+
+**Snapshot.** SQLite is in WAL mode, so copying the file while the relayer
+runs produces a torn database. Use SQLite's own consistent-snapshot support:
+
+```
+sqlite3 "$GLC_DB_PATH" ".backup '/backups/relayer-$(date -u +%Y%m%dT%H%M%SZ).sqlite3'"
+```
+
+Hourly is the ADR-0014 §13.4 cadence. Nothing in the bridge schedules this;
+it is a cron entry an operator owns.
+
+**Audit every snapshot** — a backup nobody has checked is a file:
+
+```
+glc-audit --db /backups/relayer-<timestamp>.sqlite3
+```
+
+Exit `0` clean, `1` findings, `2` could not run. **Alert on `2` as loudly as
+on `1`**: an audit that could not run is not a passing audit, and a broken
+cron entry otherwise looks exactly like a clean bill of health.
+
+`glc-audit` is read-only. It never writes, never halts a record, and is safe
+against a live database — it just answers a less useful question there.
+
+**What it checks.** Every frozen deposit claim and every payout intent, with
+the same recompute-and-compare logic the signing guards use, plus SQLite's
+`PRAGMA integrity_check`. The guards check one record at signing time; a
+deposit minted last month is never re-examined, which is the gap this fills.
+
+**If it reports findings.** They are reported, never repaired. Recovery is an
+operator decision made with `glc-admin` so it lands in the audit trail —
+work §1, and treat a finding on the live database as an integrity halt in
+everything but name.
+
+**Restore drill.** Restoring has never been rehearsed on this deployment
+(launch checklist). At minimum, before launch: restore a snapshot to a
+scratch host, run `glc-audit` against it, start a relayer pointed at it with
+`GLC_FEDERATION_TLS=off` and no peers, and confirm it reaches the chain tip
+without halting. A restore procedure nobody has performed is a wish, which
+is the same standard this document holds every other procedure to.
+
+---
+
 ## What is deliberately absent
 
 - **Proof-of-reserves / attestation cadence** — `custody.md` #8, OPEN; no procedure exists.
+- **A rehearsed restore.** §13 describes the drill; it has not been performed.
 - **Program upgrade** — `custody.md` #5 (upgrade-authority custody), OPEN.
 - **Pause quorum** — `custody.md` #7, OPEN; see §9.
 - **Testnet rehearsal of §5 and §7** — required by ADR-0014 §8.7 and **not

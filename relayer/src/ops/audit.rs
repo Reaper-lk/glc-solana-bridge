@@ -242,18 +242,30 @@ pub fn check_payout(
     None
 }
 
+/// Turns SQLite's `PRAGMA integrity_check` output into a finding.
+///
+/// `"ok"` — exactly, and nothing else — is the only healthy answer. Treating
+/// any other output as a pass would be the worst possible failure here,
+/// because everything else the audit reports is computed from a database it
+/// has just been told it cannot trust.
+pub fn check_integrity(output: &str) -> Option<Finding> {
+    if output == "ok" {
+        None
+    } else {
+        Some(Finding::DatabaseCorrupt(output.to_string()))
+    }
+}
+
 /// Audits a whole database, read-only.
 pub fn audit(db: &Db) -> Result<AuditReport, crate::glc::db::DbError> {
     let mut report = AuditReport {
         integrity_check: db.integrity_check()?,
         ..Default::default()
     };
-    if report.integrity_check != "ok" {
+    if let Some(f) = check_integrity(&report.integrity_check) {
         // Reported, and the walk still runs: the operator wants to know how
         // much is affected, not merely that something is.
-        report
-            .findings
-            .push(Finding::DatabaseCorrupt(report.integrity_check.clone()));
+        report.findings.push(f);
     }
 
     for c in db.all_claim_artifacts()? {
@@ -410,6 +422,164 @@ mod tests {
             check_claim(&c),
             Some(Finding::ClaimRecomputeMismatch { .. })
         ));
+    }
+
+    // --- payouts ---------------------------------------------------------
+    //
+    // Mutation testing found this half of the auditor entirely untested:
+    // removing either payout check, or silently skipping a payout whose
+    // inputs are gone, broke nothing.
+
+    fn payout_inputs() -> Vec<crate::glc::withdrawal_db::VaultUtxo> {
+        vec![crate::glc::withdrawal_db::VaultUtxo {
+            txid: [0xCD; 32],
+            txid_hex: crate::glc::hex::encode(&[0xCD; 32]),
+            vout: 1,
+            amount_atomic: 900_000,
+            script_pubkey_hex: "a914".into(),
+            confirmations: 6,
+        }]
+    }
+
+    fn payout() -> StoredPayoutIntent {
+        let mut p = StoredPayoutIntent {
+            withdrawal_index: 4,
+            commitment_hash: Vec::new(),
+            intent_bytes: Vec::new(),
+            vault_script_hash: [0x44; 20],
+            quorum_attempt: 0,
+            quorum_indices: vec![0, 1],
+            fee_atomic: 2_000,
+            payout_atomic: 500_000,
+            change_atomic: 0,
+            change_address: None,
+            protocol_version: 1,
+            dest_hash160: [0x55; 20],
+            withdrawal_state: "Signing".into(),
+        };
+        let intent = canonical_payout_intent(
+            p.protocol_version,
+            p.withdrawal_index,
+            &p.vault_script_hash,
+            &p.dest_hash160,
+            p.payout_atomic,
+            p.fee_atomic,
+            p.change_atomic,
+            &[0u8; 20],
+            p.quorum_attempt,
+            &p.quorum_indices,
+            &payout_inputs(),
+        );
+        p.commitment_hash = payout_commitment(&intent).to_vec();
+        p.intent_bytes = intent;
+        p
+    }
+
+    #[test]
+    fn a_consistent_payout_produces_no_finding() {
+        assert_eq!(check_payout(&payout(), &payout_inputs()), None);
+    }
+
+    #[test]
+    fn a_payout_whose_commitment_was_rewritten_is_caught() {
+        let mut p = payout();
+        p.commitment_hash = vec![0xFF; 32];
+        assert_eq!(
+            check_payout(&p, &payout_inputs()),
+            Some(Finding::PayoutSelfInconsistent {
+                withdrawal_index: 4
+            })
+        );
+    }
+
+    #[test]
+    fn a_payout_field_that_drifted_after_commitment_is_caught() {
+        // The economically dangerous one: the amount the vault would pay no
+        // longer matches what the quorum committed to.
+        for mutate in [
+            |p: &mut StoredPayoutIntent| p.payout_atomic += 1,
+            |p: &mut StoredPayoutIntent| p.fee_atomic += 1,
+            |p: &mut StoredPayoutIntent| p.dest_hash160 = [0x99; 20],
+            |p: &mut StoredPayoutIntent| p.vault_script_hash = [0x99; 20],
+            |p: &mut StoredPayoutIntent| p.quorum_attempt += 1,
+            |p: &mut StoredPayoutIntent| p.quorum_indices = vec![1, 2],
+            |p: &mut StoredPayoutIntent| p.protocol_version = 9,
+        ] {
+            let mut p = payout();
+            mutate(&mut p);
+            // The stored intent and commitment still agree with each other,
+            // so only the recompute can catch this.
+            assert_eq!(
+                check_payout(&p, &payout_inputs()),
+                Some(Finding::PayoutRecomputeMismatch {
+                    withdrawal_index: 4
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn an_altered_input_amount_is_caught() {
+        // The inputs are committed to, so a UTXO row whose amount changed
+        // after the fact makes the payout unverifiable.
+        let mut inputs = payout_inputs();
+        inputs[0].amount_atomic += 1;
+        assert_eq!(
+            check_payout(&payout(), &inputs),
+            Some(Finding::PayoutRecomputeMismatch {
+                withdrawal_index: 4
+            })
+        );
+    }
+
+    #[test]
+    fn a_payout_with_no_committed_inputs_is_reported_not_skipped() {
+        // Silence about a record that could not be checked is
+        // indistinguishable from a pass.
+        assert_eq!(
+            check_payout(&payout(), &[]),
+            Some(Finding::PayoutInputsMissing {
+                withdrawal_index: 4
+            })
+        );
+    }
+
+    #[test]
+    fn an_undecodable_change_address_is_reported_not_defaulted() {
+        // Defaulting to twenty zero bytes would make a corrupt row look like
+        // a no-change payout and quietly pass.
+        let mut p = payout();
+        p.change_address = Some("not a base58check address".into());
+        p.change_atomic = 1_000;
+        assert_eq!(
+            check_payout(&p, &payout_inputs()),
+            Some(Finding::PayoutChangeAddressUndecodable {
+                withdrawal_index: 4
+            })
+        );
+    }
+
+    // --- integrity_check --------------------------------------------------
+
+    #[test]
+    fn only_the_exact_string_ok_is_a_passing_integrity_check() {
+        // Everything else the audit reports is computed from a database it
+        // has just been told it cannot trust, so anything but "ok" must be a
+        // finding.
+        assert_eq!(check_integrity("ok"), None);
+        for bad in [
+            "",
+            "OK",
+            "ok ",
+            "row 3 missing from index idx_x",
+            "*** in database main ***",
+        ] {
+            assert_eq!(
+                check_integrity(bad),
+                Some(Finding::DatabaseCorrupt(bad.to_string())),
+                "{bad:?} must not be treated as a passing integrity check"
+            );
+        }
     }
 
     #[test]
