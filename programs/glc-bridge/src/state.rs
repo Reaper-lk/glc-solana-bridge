@@ -75,15 +75,38 @@ pub struct BridgeConfig {
     /// every pre-existing field keeps its byte offset and the account's
     /// total size is unchanged (the same discipline ADR-0009 used).
     pub governance_timelock_seconds: i64,
+    /// Hard ceiling on wrapped-GLC supply, in atomic units (Phase 7h-0,
+    /// ADR-0014 §11). Enforced by `mint_wrapped` BEFORE minting, so total
+    /// exposure is bounded on-chain rather than only observed by monitoring.
+    ///
+    /// Never zero: a cap of zero would have to mean either "no minting" or
+    /// "unlimited", and the second is the exact wrong default for a bound on
+    /// exposure. `initialize` refuses it, following the
+    /// `governance_timelock_seconds` precedent rather than the
+    /// `min_deposit` "0 = disabled" one.
+    ///
+    /// **Asymmetric to change**: the admin may LOWER it immediately
+    /// (reducing exposure, an incident-response action); RAISING it requires
+    /// the same threshold-approved, timelocked governance as a validator
+    /// rotation.
+    ///
+    /// Appended AFTER `governance_timelock_seconds` and taken out of
+    /// `reserved`, so every pre-existing field keeps its byte offset and the
+    /// account's total size is unchanged — the discipline ADR-0009 used and
+    /// Phase 7a repeated. `reserved` was verified all-zero on a live account
+    /// before being claimed.
+    pub max_wrapped_supply: u64,
     /// Expansion space for future fields, so already-initialized deployments
     /// can migrate without moving accounts. Must be all zeroes until a
     /// migration assigns meaning.
-    pub reserved: [u8; 23],
+    pub reserved: [u8; 15],
 }
 
 impl BridgeConfig {
-    /// 8 (discriminator) + 1 + 32 + 33 + 1 + 8 + 8 + 8 + 1 + 32 + 1 + 8 + 23
-    /// = 164 — unchanged by Phase 7a, which took its field out of `reserved`.
+    /// 8 (discriminator) + 1 + 32 + 33 + 1 + 8 + 8 + 8 + 1 + 32 + 1 + 8 + 8 + 15 = 164.
+    ///
+    /// Unchanged by Phase 7a and again by 7h-0: both took their new field out
+    /// of `reserved` rather than growing the account.
     pub const SPACE: usize = 8 // Anchor discriminator
         + 1 // protocol_version
         + 32 // admin
@@ -96,7 +119,8 @@ impl BridgeConfig {
         + 32 // wrapped_mint
         + 1 // mint_authority_bump
         + 8 // governance_timelock_seconds
-        + 23; // reserved
+        + 8 // max_wrapped_supply
+        + 15; // reserved
 }
 
 /// Singleton federation validator set (PDA:
@@ -190,12 +214,18 @@ pub struct PendingGovernanceAction {
     pub validators: Vec<Pubkey>,
     /// Canonical PDA bump.
     pub bump: u8,
+    /// For `ACTION_PROPOSE_TVL_RAISE`: the proposed new ceiling. Zero for
+    /// every other action type.
+    ///
+    /// Taken out of `reserved` so the account size is unchanged, exactly as
+    /// `max_wrapped_supply` was taken out of `BridgeConfig::reserved`.
+    pub proposed_max_wrapped_supply: u64,
     /// Expansion space. Must be all zeroes until a migration assigns meaning.
-    pub reserved: [u8; 32],
+    pub reserved: [u8; 24],
 }
 
 impl PendingGovernanceAction {
-    /// 8 (discriminator) + 1 + 8 + 8 + 1 + (4 + 32×16) + 1 + 32 = 575.
+    /// 8 (discriminator) + 1 + 8 + 8 + 1 + (4 + 32×16) + 1 + 8 + 24 = 575.
     pub const SPACE: usize = 8 // Anchor discriminator
         + 1 // action
         + 8 // proposed_under_epoch
@@ -203,7 +233,8 @@ impl PendingGovernanceAction {
         + 1 // threshold
         + (4 + 32 * MAX_VALIDATORS) // validators
         + 1 // bump
-        + 32; // reserved
+        + 8 // proposed_max_wrapped_supply
+        + 24; // reserved
 }
 
 /// One processed Goldcoin deposit (PDA: [`crate::constants::SEED_DEPOSIT_CLAIM`]
@@ -420,7 +451,8 @@ mod space {
             wrapped_mint: Pubkey::new_unique(),
             mint_authority_bump: u8::MAX,
             governance_timelock_seconds: i64::MAX,
-            reserved: [0u8; 23],
+            max_wrapped_supply: u64::MAX,
+            reserved: [0u8; 15],
         };
         let serialized = max.try_to_vec().unwrap();
         assert_eq!(8 + serialized.len(), BridgeConfig::SPACE);
@@ -449,7 +481,8 @@ mod space {
             wrapped_mint,
             mint_authority_bump: 0xCD,
             governance_timelock_seconds: 0,
-            reserved: [0u8; 23],
+            max_wrapped_supply: 0,
+            reserved: [0u8; 15],
         };
         let bytes = config.try_to_vec().unwrap();
         assert_eq!(bytes[0], 7, "protocol_version at offset 0");
@@ -476,7 +509,8 @@ mod space {
             threshold: u8::MAX,
             validators: vec![Pubkey::new_unique(); MAX_VALIDATORS],
             bump: u8::MAX,
-            reserved: [0u8; 32],
+            proposed_max_wrapped_supply: 0,
+            reserved: [0u8; 24],
         };
         let serialized = max.try_to_vec().unwrap();
         assert_eq!(8 + serialized.len(), PendingGovernanceAction::SPACE);

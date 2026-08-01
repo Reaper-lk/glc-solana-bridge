@@ -111,6 +111,29 @@ pub fn mint_wrapped(
         BridgeError::BelowMinimumDeposit
     );
 
+    // The wrapped-supply ceiling (Phase 7h-0, ADR-0014 §11). Checked BEFORE
+    // minting and before the federation proof is verified, so a mint that
+    // would breach the cap costs nothing to reject.
+    //
+    // Bounding total exposure on-chain is not the same as monitoring it: a
+    // monitor tells an operator afterwards, this refuses. Threat-model
+    // invariant #1 is the only standing invariant with no runtime
+    // enforcement, and this is the half that can be enforced by the program.
+    //
+    // `checked_add` rather than a comparison on the sum: an overflow would
+    // wrap to a small number and pass a naive check, which is exactly the
+    // input an attacker would look for.
+    let projected_supply = ctx
+        .accounts
+        .wrapped_mint
+        .supply
+        .checked_add(amount)
+        .ok_or(BridgeError::ArithmeticOverflow)?;
+    require!(
+        projected_supply <= config.max_wrapped_supply,
+        BridgeError::WrappedSupplyCapExceeded
+    );
+
     // The federation proof: the instruction directly before this one must
     // be the ed25519 precompile carrying >= threshold unique current
     // validators over exactly the canonical claim bytes.

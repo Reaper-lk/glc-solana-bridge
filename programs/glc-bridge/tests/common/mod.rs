@@ -100,6 +100,42 @@ pub fn keys(n: usize) -> Vec<Pubkey> {
     (0..n).map(|_| Pubkey::new_unique()).collect()
 }
 
+/// A cap high enough that no existing test bumps into it, so the Phase
+/// 7h-0 ceiling changes nothing for tests that are not about it.
+pub const DEFAULT_TEST_SUPPLY_CAP: u64 = u64::MAX / 2;
+
+/// `initialize_ix` with an explicit supply cap, for tests that exercise the
+/// ceiling itself.
+pub fn initialize_ix_with_cap(
+    authority: &Pubkey,
+    program_data: Pubkey,
+    validators: Vec<Pubkey>,
+    threshold: u8,
+    max_wrapped_supply: u64,
+) -> Instruction {
+    Instruction {
+        program_id: glc_bridge::ID,
+        accounts: glc_bridge::accounts::Initialize {
+            authority: *authority,
+            bridge_config: config_pda(),
+            validator_set: validator_set_pda(),
+            program: glc_bridge::ID,
+            program_data,
+            system_program: solana_sdk::system_program::id(),
+        }
+        .to_account_metas(None),
+        data: glc_bridge::instruction::Initialize {
+            validators,
+            threshold,
+            min_deposit: 1_000,
+            min_withdrawal: 2_000,
+            governance_timelock_seconds: DEFAULT_TEST_TIMELOCK,
+            max_wrapped_supply,
+        }
+        .data(),
+    }
+}
+
 pub fn initialize_ix(
     authority: &Pubkey,
     program_data: Pubkey,
@@ -123,6 +159,7 @@ pub fn initialize_ix(
             min_deposit: 1_000,
             min_withdrawal: 2_000,
             governance_timelock_seconds: DEFAULT_TEST_TIMELOCK,
+            max_wrapped_supply: DEFAULT_TEST_SUPPLY_CAP,
         }
         .data(),
     }
@@ -154,6 +191,7 @@ pub fn initialize_ix_with_timelock(
             min_deposit: 1_000,
             min_withdrawal: 2_000,
             governance_timelock_seconds,
+            max_wrapped_supply: DEFAULT_TEST_SUPPLY_CAP,
         }
         .data(),
     }
@@ -752,5 +790,61 @@ pub fn complete_withdrawal_ix(
             epoch,
         }
         .data(),
+    }
+}
+
+// ---- Wrapped-supply cap (Phase 7h-0, ADR-0014 §11) ----
+
+/// The canonical bytes validators sign to approve a cap INCREASE.
+pub fn tvl_raise_message(epoch: u64, new_max: u64) -> Vec<u8> {
+    let commitment = anchor_lang::solana_program::hash::hash(
+        &glc_bridge_shared::governance::tvl_raise_params(new_max),
+    )
+    .to_bytes();
+    glc_bridge_shared::governance::governance_message(
+        glc_bridge::constants::PROTOCOL_VERSION,
+        &glc_bridge::ID.to_bytes(),
+        epoch,
+        glc_bridge_shared::governance::ACTION_PROPOSE_TVL_RAISE,
+        &commitment,
+    )
+    .to_vec()
+}
+
+pub fn lower_cap_ix(admin: &Pubkey, new_max: u64) -> Instruction {
+    Instruction {
+        program_id: glc_bridge::ID,
+        accounts: admin_config_metas(admin),
+        data: glc_bridge::instruction::LowerWrappedSupplyCap { new_max }.data(),
+    }
+}
+
+pub fn propose_cap_raise_ix(proposer: &Pubkey, new_max: u64) -> Instruction {
+    Instruction {
+        program_id: glc_bridge::ID,
+        accounts: glc_bridge::accounts::ProposeGovernanceAction {
+            proposer: *proposer,
+            bridge_config: config_pda(),
+            validator_set: validator_set_pda(),
+            pending_action: governance_action_pda(),
+            instructions_sysvar: anchor_lang::solana_program::sysvar::instructions::ID,
+            system_program: solana_sdk::system_program::id(),
+        }
+        .to_account_metas(None),
+        data: glc_bridge::instruction::ProposeWrappedSupplyCapRaise { new_max }.data(),
+    }
+}
+
+pub fn execute_cap_raise_ix(executor: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: glc_bridge::ID,
+        accounts: glc_bridge::accounts::ExecuteCapRaise {
+            executor: *executor,
+            bridge_config: config_pda(),
+            validator_set: validator_set_pda(),
+            pending_action: governance_action_pda(),
+        }
+        .to_account_metas(None),
+        data: glc_bridge::instruction::ExecuteWrappedSupplyCapRaise {}.data(),
     }
 }

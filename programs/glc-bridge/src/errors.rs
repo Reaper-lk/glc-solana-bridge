@@ -87,4 +87,19 @@ pub enum BridgeError {
     ZeroPayoutTxid,
     #[msg("Payout block height must be greater than zero")]
     ZeroPayoutHeight,
+
+    // ---- Wrapped-supply cap (Phase 7h-0, ADR-0014 §11) ----
+    #[msg("Wrapped-supply cap must be greater than zero")]
+    ZeroWrappedSupplyCap,
+    #[msg("Mint would take wrapped supply above the configured cap")]
+    WrappedSupplyCapExceeded,
+    #[msg("A cap change must actually change the cap")]
+    WrappedSupplyCapUnchanged,
+    #[msg(
+        "The admin may only LOWER the wrapped-supply cap; raising it requires threshold-approved, \
+         timelocked governance"
+    )]
+    WrappedSupplyCapNotLowered,
+    #[msg("A governance TVL raise must propose a cap above the current one")]
+    WrappedSupplyCapNotRaised,
 }

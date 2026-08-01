@@ -40,14 +40,15 @@ use anchor_lang::solana_program::sysvar::instructions::{
     get_instruction_relative, ID as INSTRUCTIONS_SYSVAR_ID,
 };
 use glc_bridge_shared::governance::{
-    cancel_params, governance_message, rotation_params, ACTION_CANCEL_ROTATION,
-    ACTION_PROPOSE_ROTATION,
+    cancel_params, governance_message, rotation_params, tvl_raise_params, ACTION_CANCEL_ROTATION,
+    ACTION_PROPOSE_ROTATION, ACTION_PROPOSE_TVL_RAISE,
 };
 
 use crate::constants::{SEED_BRIDGE_CONFIG, SEED_GOVERNANCE_ACTION, SEED_VALIDATOR_SET};
 use crate::errors::BridgeError;
 use crate::events::{
     GovernanceActionCancelled, GovernanceActionExecuted, GovernanceActionProposed,
+    WrappedSupplyCapChanged,
 };
 use crate::state::{BridgeConfig, PendingGovernanceAction, ValidatorSet};
 use crate::validation::validate_validator_set;
@@ -167,7 +168,8 @@ pub fn propose_validator_rotation(
     pending.threshold = threshold;
     pending.validators = validators;
     pending.bump = ctx.bumps.pending_action;
-    pending.reserved = [0u8; 32];
+    pending.proposed_max_wrapped_supply = 0;
+    pending.reserved = [0u8; 24];
 
     emit!(GovernanceActionProposed {
         action: ACTION_PROPOSE_ROTATION,
@@ -241,6 +243,131 @@ pub fn execute_validator_rotation(ctx: Context<ExecuteGovernanceAction>) -> Resu
     emit!(GovernanceActionExecuted {
         action: ACTION_PROPOSE_ROTATION,
         new_epoch: set.epoch,
+    });
+    Ok(())
+}
+
+// --------------------------------------------------- TVL cap raise (7h-0) --
+
+/// Queues a wrapped-supply cap INCREASE (Phase 7h-0, ADR-0014 §11).
+///
+/// Reuses the rotation machinery wholesale — same `PendingGovernanceAction`
+/// singleton, same message shape, same `require_federation_approval`, same
+/// timelock. Only the parameter set and the action byte differ. A parallel
+/// authority model would be more surface for the security review to cover
+/// and nothing here needs one.
+pub fn propose_wrapped_supply_cap_raise(
+    ctx: Context<ProposeGovernanceAction>,
+    new_max: u64,
+) -> Result<()> {
+    let config = &ctx.accounts.bridge_config;
+    let validator_set = &ctx.accounts.validator_set;
+
+    // Only upward. A "raise" that lowers would let the federation path be
+    // used for something the admin path already covers, and would blur an
+    // asymmetry the whole design rests on.
+    require!(
+        new_max > config.max_wrapped_supply,
+        BridgeError::WrappedSupplyCapNotRaised
+    );
+
+    let params_commitment = hash(&tvl_raise_params(new_max)).to_bytes();
+    let expected_message = governance_message(
+        config.protocol_version,
+        &crate::ID.to_bytes(),
+        validator_set.epoch,
+        ACTION_PROPOSE_TVL_RAISE,
+        &params_commitment,
+    );
+    require_federation_approval(
+        &ctx.accounts.instructions_sysvar.to_account_info(),
+        validator_set,
+        &expected_message,
+    )?;
+
+    let eta = Clock::get()?
+        .unix_timestamp
+        .checked_add(config.governance_timelock_seconds)
+        .ok_or(BridgeError::ArithmeticOverflow)?;
+
+    let pending = &mut ctx.accounts.pending_action;
+    pending.action = ACTION_PROPOSE_TVL_RAISE;
+    pending.proposed_under_epoch = validator_set.epoch;
+    pending.eta = eta;
+    pending.threshold = 0;
+    pending.validators = Vec::new();
+    pending.bump = ctx.bumps.pending_action;
+    pending.proposed_max_wrapped_supply = new_max;
+    pending.reserved = [0u8; 24];
+
+    emit!(GovernanceActionProposed {
+        action: ACTION_PROPOSE_TVL_RAISE,
+        proposed_under_epoch: pending.proposed_under_epoch,
+        eta,
+        threshold: 0,
+        validator_count: 0,
+    });
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct ExecuteCapRaise<'info> {
+    /// Permissionless: rent is refunded here. Confers no authority.
+    #[account(mut)]
+    pub executor: Signer<'info>,
+
+    #[account(mut, seeds = [SEED_BRIDGE_CONFIG], bump = bridge_config.bump)]
+    pub bridge_config: Account<'info, BridgeConfig>,
+
+    #[account(seeds = [SEED_VALIDATOR_SET], bump = validator_set.bump)]
+    pub validator_set: Account<'info, ValidatorSet>,
+
+    /// Closed on success, refunding rent and freeing the singleton slot.
+    #[account(
+        mut,
+        close = executor,
+        seeds = [SEED_GOVERNANCE_ACTION],
+        bump = pending_action.bump
+    )]
+    pub pending_action: Account<'info, PendingGovernanceAction>,
+}
+
+/// Applies a queued cap increase once its timelock has elapsed.
+pub fn execute_wrapped_supply_cap_raise(ctx: Context<ExecuteCapRaise>) -> Result<()> {
+    let pending = &ctx.accounts.pending_action;
+    require!(
+        pending.action == ACTION_PROPOSE_TVL_RAISE,
+        BridgeError::WrongGovernanceAction
+    );
+    require!(
+        Clock::get()?.unix_timestamp >= pending.eta,
+        BridgeError::GovernanceTimelockNotElapsed
+    );
+    require!(
+        ctx.accounts.validator_set.epoch == pending.proposed_under_epoch,
+        BridgeError::StaleGovernanceProposal
+    );
+
+    let new_max = pending.proposed_max_wrapped_supply;
+    let config = &mut ctx.accounts.bridge_config;
+    // Re-checked at execution: the cap may have been LOWERED by the admin
+    // during the timelock, and a queued raise must not silently undo an
+    // incident response that happened after it was proposed.
+    require!(
+        new_max > config.max_wrapped_supply,
+        BridgeError::WrappedSupplyCapNotRaised
+    );
+    let previous = config.max_wrapped_supply;
+    config.max_wrapped_supply = new_max;
+
+    emit!(WrappedSupplyCapChanged {
+        previous,
+        current: new_max,
+        raised: true,
+    });
+    emit!(GovernanceActionExecuted {
+        action: ACTION_PROPOSE_TVL_RAISE,
+        new_epoch: ctx.accounts.validator_set.epoch,
     });
     Ok(())
 }

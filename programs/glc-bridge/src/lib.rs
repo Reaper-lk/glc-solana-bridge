@@ -49,6 +49,7 @@ pub mod glc_bridge {
         min_deposit: u64,
         min_withdrawal: u64,
         governance_timelock_seconds: i64,
+        max_wrapped_supply: u64,
     ) -> Result<()> {
         instructions::initialize(
             ctx,
@@ -57,6 +58,7 @@ pub mod glc_bridge {
             min_deposit,
             min_withdrawal,
             governance_timelock_seconds,
+            max_wrapped_supply,
         )
     }
 
@@ -126,6 +128,27 @@ pub mod glc_bridge {
         glc_address: Vec<u8>,
     ) -> Result<()> {
         instructions::burn_wrapped(ctx, amount, glc_address)
+    }
+
+    /// LOWERS the wrapped-supply cap immediately (Phase 7h-0). Admin-only,
+    /// and only downward: reducing exposure is incident response, raising it
+    /// is a federation decision.
+    pub fn lower_wrapped_supply_cap(ctx: Context<AdminConfig>, new_max: u64) -> Result<()> {
+        instructions::lower_wrapped_supply_cap(ctx, new_max)
+    }
+
+    /// Queues a wrapped-supply cap INCREASE behind the governance timelock,
+    /// under the same M-of-N proof a validator rotation requires.
+    pub fn propose_wrapped_supply_cap_raise(
+        ctx: Context<ProposeGovernanceAction>,
+        new_max: u64,
+    ) -> Result<()> {
+        instructions::propose_wrapped_supply_cap_raise(ctx, new_max)
+    }
+
+    /// Applies a queued cap increase once its timelock has elapsed.
+    pub fn execute_wrapped_supply_cap_raise(ctx: Context<ExecuteCapRaise>) -> Result<()> {
+        instructions::execute_wrapped_supply_cap_raise(ctx)
     }
 
     /// Records, under an M-of-N federation proof, that a withdrawal was paid

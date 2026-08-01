@@ -17,7 +17,9 @@ use anchor_lang::prelude::*;
 
 use crate::constants::SEED_BRIDGE_CONFIG;
 use crate::errors::BridgeError;
-use crate::events::{AdminTransferInitiated, AdminTransferred, PauseStateChanged};
+use crate::events::{
+    AdminTransferInitiated, AdminTransferred, PauseStateChanged, WrappedSupplyCapChanged,
+};
 use crate::state::BridgeConfig;
 
 #[derive(Accounts)]
@@ -51,6 +53,39 @@ pub fn set_paused(ctx: Context<AdminConfig>, paused: bool) -> Result<()> {
     require!(config.paused != paused, BridgeError::PauseStateUnchanged);
     config.paused = paused;
     emit!(PauseStateChanged { paused });
+    Ok(())
+}
+
+/// Lowers the wrapped-supply cap, immediately (Phase 7h-0, ADR-0014 §11).
+///
+/// # Why this is admin-only while raising is not
+///
+/// The two directions have opposite risk. Lowering reduces the bridge's
+/// maximum exposure and is exactly what an operator needs during an
+/// incident, when waiting out a timelock is the wrong answer. Raising
+/// increases exposure and is the action an attacker with a stolen admin key
+/// would want, so it is gated behind threshold approval and the timelock.
+///
+/// This mirrors ADR-0014 §7.3's deliberate asymmetry for pausing, rather
+/// than inventing a new authority model.
+pub fn lower_wrapped_supply_cap(ctx: Context<AdminConfig>, new_max: u64) -> Result<()> {
+    let config = &mut ctx.accounts.bridge_config;
+    let previous = config.max_wrapped_supply;
+    require!(new_max != previous, BridgeError::WrappedSupplyCapUnchanged);
+    // Strictly lower. An admin raise here would bypass the federation
+    // entirely, which is the whole point of the asymmetry.
+    require!(new_max < previous, BridgeError::WrappedSupplyCapNotLowered);
+    // Zero stays invalid in every path: it would mean "no minting" or
+    // "unlimited" depending on how it were read, and neither should be
+    // reachable by accident.
+    require!(new_max > 0, BridgeError::ZeroWrappedSupplyCap);
+
+    config.max_wrapped_supply = new_max;
+    emit!(WrappedSupplyCapChanged {
+        previous,
+        current: new_max,
+        raised: false,
+    });
     Ok(())
 }
 
