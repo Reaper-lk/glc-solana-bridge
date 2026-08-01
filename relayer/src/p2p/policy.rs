@@ -55,6 +55,10 @@ pub enum Refusal {
     PayoutRefused(String),
     #[error("withdrawal completion refused: {0}")]
     CompletionRefused(String),
+    #[error("governance action refused: {0}")]
+    GovernanceRefused(String),
+    #[error("vault sweep refused: {0}")]
+    SweepRefused(String),
     #[error(
         "this validator's observation of the chain is stale — refusing to sign rather than \
          authorize under a federation revision it may no longer be current with"

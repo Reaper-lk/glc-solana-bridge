@@ -537,6 +537,21 @@ against its own node before signing.
 - Rotation and sweep procedures must be **rehearsed on testnet**, not
   written and filed.
 
+#### 8.7.1 Executability (Phase 7i-0, 2026-08-01)
+
+When this section was written, none of "rotate" or "sweep" could actually be
+performed by the running system: `signer-server` had no governance RPC, and
+the vault sweep had no implementation anywhere. The response above was
+therefore documented but not available.
+
+Both are implemented as of Phase 7i-0 (**ADR-0021**): `SignGovernance` plus
+`glc-admin approve-rotation` for the rotation, and `SignSweep` plus
+`glc-admin sweep-plan` / `sweep-approve` for the sweep. Authorisation for
+both is by **operator-staged approval** rather than derivation, because
+neither has an on-chain fact to derive from — see ADR-0021 §4.
+
+The rehearsal requirement stands and is not yet met.
+
 ---
 
 ### 8.8 Designated signing quorum (owner decision, 2026-07-31)
@@ -839,6 +854,13 @@ Deep reorg; integrity halt; vault key compromise; validator offline;
 Solana outage; Goldcoin outage; stuck withdrawal; TVL breach; emergency
 pause and unpause; key rotation; vault sweep. Each rehearsed at least once
 on testnet before launch.
+
+**Split into two phases (owner decision, 2026-08-01).** Verifying the
+current state found that integrity-halt recovery, key rotation, the TVL
+raise and the vault sweep had no executable form — see ADR-0021 §2. Phase
+7i-0 built the tooling (`glc-admin`, `SignGovernance`, `SignSweep`); Phase
+7i writes the runbooks, and documents **only** procedures an operator can
+carry out with supported tools.
 
 ---
 

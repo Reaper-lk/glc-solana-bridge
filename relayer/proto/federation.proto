@@ -34,6 +34,27 @@ service FederationSigner {
   // which is a different check from re-deriving a deposit claim.
   rpc SignCompletion(CompletionSignRequest) returns (CompletionSignResponse);
 
+  // Requests this validator's ed25519 signature over a GOVERNANCE message
+  // (Phase 7i-0).
+  //
+  // Unlike every other method here, the responder cannot DERIVE whether it
+  // agrees: "should the federation rotate to this set?" has no on-chain
+  // answer. It signs only what its own operator has explicitly staged as an
+  // approval, so M signatures mean M operators each decided, rather than M
+  // processes agreeing with whoever asked first.
+  rpc SignGovernance(GovernanceSignRequest) returns (GovernanceSignResponse);
+
+  // Requests this validator's PARTIAL Goldcoin signatures for a VAULT SWEEP
+  // — moving the entire vault to a new one (Phase 7i-0, ADR-0014 §8.7).
+  //
+  // Separate from SignPayout even though both return partial signatures
+  // over the same vault key, because the authorisation differs completely:
+  // a payout is authorised by a burn on Solana, a sweep only by the
+  // responder's own operator having staged it. One path where the stronger
+  // condition could be reached through the weaker check is exactly the
+  // mistake this separation prevents.
+  rpc SignSweep(SweepSignRequest) returns (SweepSignResponse);
+
   // Liveness and identity probe, used to decide quorum availability BEFORE
   // designating one (ADR-0015: reassignment must be explicit, so the
   // executor prefers to designate a quorum it believes is reachable).
@@ -174,5 +195,57 @@ message CompletionSignResponse {
   bytes validator_pubkey = 2;
   // ed25519 signature over the canonical completion message the responder
   // built from ITS OWN state — never from the request.
+  bytes signature = 3;
+}
+
+// A request for one signer's partial signatures over a vault sweep
+// (Phase 7i-0).
+//
+// Deliberately minimal. It carries the transaction and nothing else: no
+// amounts, no destination label, no input descriptions. Every one of those
+// is read from the responder's OWN vault_utxos rows, so there is no field
+// here a proposer could use to influence what the sweep is worth.
+message SweepSignRequest {
+  bytes request_id = 1;
+  uint64 epoch = 2;
+  // The exact unsigned transaction to sign. The responder rebuilds the
+  // sweep plan from this plus its own UTXO view, recomputes the commitment,
+  // and refuses unless its operator staged that exact commitment.
+  string unsigned_tx_hex = 3;
+  int64 expiry_unix = 4;
+}
+
+message SweepSignResponse {
+  bytes request_id = 1;
+  bytes validator_pubkey = 2;
+  // The responder's VAULT key (compressed secp256k1, 33 bytes).
+  bytes vault_pubkey = 3;
+  // One DER-encoded signature per input, in INPUT ORDER, each including its
+  // trailing sighash byte exactly as it appears in a scriptSig.
+  repeated bytes signatures = 4;
+}
+
+// A request for one validator's governance signature (Phase 7i-0).
+message GovernanceSignRequest {
+  bytes request_id = 1;
+  // The validator-set epoch the requester believes is current. A governance
+  // signature must not outlive the federation revision it was made under.
+  uint64 epoch = 2;
+  // Governance action byte from shared::governance (0x03 rotation,
+  // 0x04 cancel, 0x05 TVL raise). Anything else is refused.
+  uint32 action = 3;
+  // SHA-256 over the canonical parameter bytes — the same commitment the
+  // on-chain program recomputes. The responder compares it against what its
+  // operator approved, byte for byte.
+  bytes params_commitment = 4;
+  int64 expiry_unix = 5;
+}
+
+message GovernanceSignResponse {
+  bytes request_id = 1;
+  bytes validator_pubkey = 2;
+  // ed25519 signature over the canonical governance message the responder
+  // built from ITS OWN configuration and observed epoch — never from the
+  // request.
   bytes signature = 3;
 }

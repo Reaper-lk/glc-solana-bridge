@@ -36,10 +36,12 @@ use glc_relayer::glc::config::RpcConfigValidated;
 use glc_relayer::glc::db::Db;
 use glc_relayer::glc::rpc::{PrevTx, RpcClient};
 use glc_relayer::p2p::completion_view::CompletionView;
+use glc_relayer::p2p::governance_view::GovernanceView;
 use glc_relayer::p2p::identity::{TlsMaterial, TlsPaths};
 use glc_relayer::p2p::payout_view::{PartialSigner, PayoutView};
 use glc_relayer::p2p::service::pb::federation_signer_server::FederationSignerServer;
 use glc_relayer::p2p::service::SignerService;
+use glc_relayer::p2p::sweep_view::SweepView;
 use glc_relayer::p2p::view::DbLocalView;
 use glc_relayer::signer::load_validator_keypair;
 use glc_relayer::solana::epoch::{observe_epoch, run_epoch_refresher, EpochObservation};
@@ -219,6 +221,62 @@ fn payout_arm() -> anyhow::Result<Option<(PayoutView<NodePartialSigner>, Db)>> {
     Ok(Some((view, db)))
 }
 
+/// Builds the vault-sweep arm (Phase 7i-0), or explains why this signer has
+/// none.
+///
+/// Requires the same E1 proof the payout arm requires — this arm signs with
+/// the same vault key — plus an explicitly configured approvals path. Absent
+/// that path the arm is not attached and every sweep is refused, which is
+/// the right default for the operation that can move the entire vault.
+fn sweep_arm() -> anyhow::Result<Option<SweepView<NodePartialSigner>>> {
+    let Some(approvals) = env_optional("GLC_SIGNER_SWEEP_APPROVALS_PATH") else {
+        tracing::info!(
+            "GLC_SIGNER_SWEEP_APPROVALS_PATH is not set — this signer will refuse every vault \
+             sweep request"
+        );
+        return Ok(None);
+    };
+    if env_optional("GLC_VAULT_REDEEM_SCRIPT_HEX").is_none() {
+        return Err(anyhow::anyhow!(
+            "GLC_SIGNER_SWEEP_APPROVALS_PATH is set but this signer holds no vault key — refusing \
+             to start rather than appear able to sign sweeps"
+        ));
+    }
+    let cfg = withdrawal_config_from_env()?;
+    let index: u8 = env_required("GLC_SIGNER_VAULT_INDEX")?
+        .parse()
+        .map_err(|e| anyhow::anyhow!("GLC_SIGNER_VAULT_INDEX must be a u8: {e}"))?;
+    let wif = std::fs::read_to_string(env_required("GLC_SIGNER_VAULT_KEY_PATH")?)
+        .map_err(|e| anyhow::anyhow!("failed to read the vault key file: {e}"))?
+        .trim()
+        .to_string();
+    // The same E1 check the payout arm makes, made again rather than
+    // assumed: this arm can spend the whole vault, so it proves it holds the
+    // key at its configured position before it will serve.
+    cfg.vault.require_signer_at(index, &wif).map_err(|e| {
+        anyhow::anyhow!(
+            "refusing to start: this signer's vault key does not match vault position {index} — {e}"
+        )
+    })?;
+
+    // This signer's OWN node (ADR-0017 E2), like every other arm.
+    let rpc = signer_goldcoin_rpc()?;
+    tracing::warn!(
+        approvals_path = %approvals,
+        "vault SWEEP signing enabled — this signer can help move the ENTIRE vault, but only to \
+         the one sweep its operator has staged"
+    );
+    Ok(Some(
+        SweepView::new(
+            cfg,
+            index,
+            NodePartialSigner { rpc, wif },
+            PathBuf::from(approvals),
+        )
+        .map_err(|e| anyhow::anyhow!(e))?,
+    ))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -274,6 +332,12 @@ async fn main() -> anyhow::Result<()> {
     let view = DbLocalView::new(db, Arc::clone(&observation));
     let mut service = SignerService::new(keypair, view);
 
+    // Every arm binds this into the canonical messages it signs, so it is
+    // read once and shared rather than parsed per arm.
+    let protocol_version: u8 = env_required("GLC_PROTOCOL_VERSION")?
+        .parse()
+        .map_err(|e| anyhow::anyhow!("GLC_PROTOCOL_VERSION must be a u8: {e}"))?;
+
     // The Goldcoin vault-signing arm (Phase 7e). Absent when this signer
     // holds no vault key, in which case every payout request is refused.
     if let Some((payout_view, payout_db)) = payout_arm()? {
@@ -288,9 +352,6 @@ async fn main() -> anyhow::Result<()> {
             anyhow::anyhow!("GLC_WITHDRAWAL_CONFIRMATION_DEPTH must be an i64: {e}")
         })?;
         let rpc = signer_goldcoin_rpc()?;
-        let protocol_version: u8 = env_required("GLC_PROTOCOL_VERSION")?
-            .parse()
-            .map_err(|e| anyhow::anyhow!("GLC_PROTOCOL_VERSION must be a u8: {e}"))?;
         tracing::info!(
             confirmation_depth = depth,
             "completion attestation enabled (Phase 7f)"
@@ -305,6 +366,37 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!(
             "GLC_WITHDRAWAL_CONFIRMATION_DEPTH is not set — this signer will refuse every \
              withdrawal completion request"
+        );
+    }
+
+    // The governance arm (Phase 7i-0). Governance is the one decision this
+    // signer cannot derive from the chain, so it signs only what its own
+    // operator staged with `glc-admin approve-*`. Without the path
+    // configured, every governance request is refused — which is why key
+    // rotation and TVL raises were previously not executable at all.
+    if let Some(approvals) = env_optional("GLC_SIGNER_GOVERNANCE_APPROVALS_PATH") {
+        tracing::info!(
+            approvals_path = %approvals,
+            "governance signing enabled — this signer will sign ONLY staged approvals"
+        );
+        service = service.with_governance_arm(
+            GovernanceView::new(PathBuf::from(approvals)),
+            program_id.to_bytes(),
+            protocol_version,
+        );
+    } else {
+        tracing::warn!(
+            "GLC_SIGNER_GOVERNANCE_APPROVALS_PATH is not set — this signer will refuse every \
+             governance request, so key rotation and supply-cap raises cannot be executed"
+        );
+    }
+
+    // The vault-sweep arm (Phase 7i-0, ADR-0014 §8.7).
+    if let Some(view) = sweep_arm()? {
+        service = service.with_sweep_arm(
+            view,
+            Db::open(&PathBuf::from(env_required("GLC_DB_PATH")?))?,
+            protocol_version,
         );
     }
 
