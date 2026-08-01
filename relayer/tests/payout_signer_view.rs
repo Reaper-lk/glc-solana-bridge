@@ -9,6 +9,8 @@
 //! not itself derive, and takes input amounts **only** from its own UTXO
 //! rows — because the legacy sighash does not cover them (ADR-0017 §2.5).
 
+mod common;
+
 use std::sync::{Arc, Mutex};
 
 use glc_relayer::glc::db::Db;
@@ -536,4 +538,109 @@ fn a_signer_must_prove_it_holds_the_key_at_its_configured_position() {
             "position {i} must hold the key the test derives"
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// The audit record (ADR-0014 §13.3)
+// ---------------------------------------------------------------------
+
+/// A granted payout signature must leave a record.
+///
+/// Added in Phase 7l after mutation testing found the payout grant's audit
+/// call site entirely uncovered: deleting it broke nothing, because the
+/// audit suite exercised only the mint path. The fixture lives here, so the
+/// test does too.
+#[tokio::test]
+async fn granting_a_payout_signature_leaves_a_record() {
+    use glc_relayer::p2p::service::pb::PayoutSignRequest;
+    use glc_relayer::p2p::service::SignerService;
+
+    struct FreshView;
+    impl glc_relayer::p2p::policy::LocalView for FreshView {
+        fn observed_epoch(&self) -> u64 {
+            0
+        }
+        fn view_is_fresh(&self) -> bool {
+            true
+        }
+        fn derive_message(
+            &self,
+            _a: glc_relayer::p2p::policy::Action,
+            _id: &glc_relayer::p2p::policy::SigningIdentity,
+        ) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    let f = fixture(QUORUM, 0, WithdrawalState::Signing);
+    let service = SignerService::new(solana_sdk::signature::Keypair::new(), FreshView)
+        .with_payout_arm(view(&f, 0), Db::open(&f.db_path).unwrap());
+
+    let (result, grants) = common::capture_grants_async(service.handle_payout(PayoutSignRequest {
+        request_id: vec![1],
+        epoch: 0,
+        withdrawal_index: INDEX as u64,
+        quorum_attempt: 0,
+        canonical_intent: f.intent.clone(),
+        unsigned_tx_hex: f.unsigned_hex.clone(),
+        expiry_unix: glc_relayer::p2p::service::now_unix() + 60,
+        proposer_index: 0,
+    }))
+    .await;
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(grants.len(), 1, "exactly one record per granted payout");
+    assert_eq!(grants[0].get("action"), Some("payout"));
+    let id = grants[0].get("identity").unwrap();
+    assert!(
+        id.contains(&INDEX.to_string()) && id.contains("attempt 0"),
+        "the record must name the withdrawal AND the quorum attempt: {id}"
+    );
+}
+
+/// A refused payout must not be recorded as a grant.
+#[tokio::test]
+async fn a_refused_payout_produces_no_grant_record() {
+    use glc_relayer::p2p::service::pb::PayoutSignRequest;
+    use glc_relayer::p2p::service::SignerService;
+
+    struct FreshView;
+    impl glc_relayer::p2p::policy::LocalView for FreshView {
+        fn observed_epoch(&self) -> u64 {
+            0
+        }
+        fn view_is_fresh(&self) -> bool {
+            true
+        }
+        fn derive_message(
+            &self,
+            _a: glc_relayer::p2p::policy::Action,
+            _id: &glc_relayer::p2p::policy::SigningIdentity,
+        ) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    let f = fixture(QUORUM, 0, WithdrawalState::Signing);
+    let service = SignerService::new(solana_sdk::signature::Keypair::new(), FreshView)
+        .with_payout_arm(view(&f, 0), Db::open(&f.db_path).unwrap());
+
+    let (result, grants) = common::capture_grants_async(service.handle_payout(PayoutSignRequest {
+        request_id: vec![1],
+        epoch: 0,
+        withdrawal_index: INDEX as u64,
+        quorum_attempt: 0,
+        // Not the intent this validator recomputes.
+        canonical_intent: vec![0xFF; 32],
+        unsigned_tx_hex: f.unsigned_hex.clone(),
+        expiry_unix: glc_relayer::p2p::service::now_unix() + 60,
+        proposer_index: 0,
+    }))
+    .await;
+
+    assert!(result.is_err());
+    assert!(
+        grants.is_empty(),
+        "a refusal must never appear as an authorisation: {grants:?}"
+    );
 }

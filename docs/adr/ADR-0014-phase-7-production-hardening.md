@@ -862,6 +862,13 @@ Append-only, shipped off-host: every signature decision, every state
 transition (`deposit_state_log` and `withdrawal_state_log` already exist
 with forensic columns), every operator recovery action.
 
+### 13.3a Status (Phase 7l, 2026-08-01)
+
+Every **granted** signature is now recorded, not just every refusal
+(ADR-0026). Three of the five signing paths previously logged nothing on
+success, so the one path that exercised a validator's authority was the one
+that left no trace. Shipping the logs off-host remains open.
+
 ### 13.4 Backup, restore, and integrity
 
 - Hourly SQLite snapshots with **periodic restore drills**.

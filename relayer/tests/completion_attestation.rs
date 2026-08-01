@@ -7,6 +7,8 @@
 //! one it cannot see confirmed at depth, or one at a height it does not
 //! observe.
 
+mod common;
+
 use std::sync::{Arc, Mutex};
 
 use glc_relayer::glc::db::Db;
@@ -471,5 +473,75 @@ async fn the_amount_and_destination_come_from_local_state_not_the_request() {
     assert_eq!(
         a.dest_commitment,
         glc_relayer::solana::instruction::destination_commitment(f.glc_address.as_bytes())
+    );
+}
+
+// ---------------------------------------------------------------------
+// The audit record (ADR-0014 §13.3)
+// ---------------------------------------------------------------------
+
+/// A granted completion attestation must leave a record.
+///
+/// Added in Phase 7l: mutation testing found this grant's audit call site
+/// uncovered, because the audit suite exercised only the mint path.
+/// Completion is terminal and irreversible on chain, so a validator having
+/// attested to it is exactly the kind of thing an incident review needs.
+#[tokio::test]
+async fn granting_a_completion_attestation_leaves_a_record() {
+    use glc_relayer::p2p::service::pb::CompletionSignRequest;
+    use glc_relayer::p2p::service::SignerService;
+
+    struct FreshView;
+    impl glc_relayer::p2p::policy::LocalView for FreshView {
+        fn observed_epoch(&self) -> u64 {
+            0
+        }
+        fn view_is_fresh(&self) -> bool {
+            true
+        }
+        fn derive_message(
+            &self,
+            _a: glc_relayer::p2p::policy::Action,
+            _id: &glc_relayer::p2p::policy::SigningIdentity,
+        ) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    // Completed, because a validator attests only to a payout IT completed.
+    let f = fixture(
+        WithdrawalState::Completed,
+        Some(PAYOUT_TXID_HEX),
+        Some(PAYOUT_HEIGHT as i64),
+    );
+    let service = SignerService::new(solana_sdk::signature::Keypair::new(), FreshView)
+        .with_completion_arm(
+            CompletionView::new(FakeNode::with(DEPTH, Some(PAYOUT_HEIGHT as i64)), DEPTH),
+            Db::open(&f.db_path).unwrap(),
+            [0x33; 32],
+            1,
+        );
+
+    let mut txid = glc_relayer::glc::hex::decode_exact::<32>(PAYOUT_TXID_HEX).unwrap();
+    txid.reverse();
+
+    let (result, grants) =
+        common::capture_grants_async(service.handle_completion(CompletionSignRequest {
+            request_id: vec![1],
+            epoch: 0,
+            withdrawal_index: INDEX as u64,
+            payout_txid: txid.to_vec(),
+            payout_height: PAYOUT_HEIGHT,
+            expiry_unix: glc_relayer::p2p::service::now_unix() + 60,
+        }))
+        .await;
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(grants.len(), 1, "exactly one record per attestation");
+    assert_eq!(grants[0].get("action"), Some("completion"));
+    let id = grants[0].get("identity").unwrap();
+    assert!(
+        id.contains(&INDEX.to_string()),
+        "the record must name the withdrawal attested to: {id}"
     );
 }
