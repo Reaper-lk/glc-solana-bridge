@@ -45,11 +45,20 @@ use glc_relayer::orchestrator::{Orchestrator, OrchestratorError};
 use glc_relayer::p2p::collector::GrpcCollector;
 use glc_relayer::p2p::identity::{parse_peers, TlsMaterial, TlsPaths};
 use glc_relayer::solana::config::{RawSolanaConfig, SolanaConfig};
+use glc_relayer::solana::epoch::{observe_epoch, run_epoch_refresher, EpochObservation};
 use glc_relayer::solana::rpc::RealSolanaRpc;
 use glc_relayer::withdrawal::adapter::RealPayoutRpc;
 use glc_relayer::withdrawal::config::{RawWithdrawalConfig, WithdrawalConfig};
 use glc_relayer::withdrawal::discovery;
 use glc_relayer::withdrawal::executor::{ExecutorError, WithdrawalExecutor};
+use glc_relayer::withdrawal::federation::{FederationPayoutCollector, VaultSignerMap};
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 fn env_required(name: &str) -> anyhow::Result<String> {
     std::env::var(name)
@@ -198,7 +207,7 @@ fn withdrawal_config_from_env() -> anyhow::Result<WithdrawalConfig> {
 /// overlap on the same vault.
 #[allow(clippy::too_many_arguments)]
 async fn run_withdrawal_loop(
-    mut executor: WithdrawalExecutor<RealPayoutRpc>,
+    mut executor: WithdrawalExecutor<RealPayoutRpc, FederationPayoutCollector>,
     solana_rpc: RealSolanaRpc,
     program_id: Pubkey,
     config: WithdrawalConfig,
@@ -240,7 +249,7 @@ enum WithdrawalTickError {
 /// not skip execution of already-known withdrawals: a Solana outage must not
 /// strand payouts that were discovered before it started.
 async fn withdrawal_tick(
-    executor: &mut WithdrawalExecutor<RealPayoutRpc>,
+    executor: &mut WithdrawalExecutor<RealPayoutRpc, FederationPayoutCollector>,
     solana_rpc: &RealSolanaRpc,
     program_id: &Pubkey,
     config: &WithdrawalConfig,
@@ -497,11 +506,59 @@ async fn main() -> anyhow::Result<()> {
     );
     let withdrawal_poll_interval = Duration::from_millis(withdrawal_config.poll_interval_ms);
     let payout_rpc = RealPayoutRpc::new(RpcClient::new(&rpc_for_payouts)?);
-    let withdrawal_executor =
-        WithdrawalExecutor::new(Db::open(&db_path)?, payout_rpc, withdrawal_config.clone());
+
+    // Phase 7e (ADR-0017): this process holds NO vault key either. Payout
+    // signatures are collected from the designated quorum and assembled
+    // here, because Goldcoin 0.17 has no combinerawtransaction and no PSBT.
+    //
+    // The vault-signer map is validated against the configured redeem script
+    // and FAILS CLOSED (E1): every position must map to exactly one
+    // validator, and no validator may hold two positions.
+    let vault_signer_map = VaultSignerMap::parse(
+        &env_required("GLC_VAULT_SIGNER_MAP")?,
+        &withdrawal_config.vault,
+    )?;
+    tracing::info!(
+        vault_signers = vault_signer_map.len(),
+        threshold = withdrawal_config.vault.threshold,
+        "vault signer map validated against the configured redeem script"
+    );
+
+    // The epoch this relayer stamps onto signing requests — its OWN
+    // observation, refreshed in the background and never a configured
+    // constant. Startup blocks on a first successful read.
+    let epoch_rpc = RealSolanaRpc::new(solana_config.rpc_url.clone(), solana_config.commitment);
+    let first_epoch = observe_epoch(&epoch_rpc, &solana_config.program_id)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "refusing to start without a first observation of the validator epoch: {e}"
+            )
+        })?;
+    let epoch_observation = std::sync::Arc::new(EpochObservation::seeded(first_epoch, now_unix()));
+    tracing::info!(observed_epoch = first_epoch, "validator epoch observed");
+
+    let payout_collector = FederationPayoutCollector::new(
+        collector_from_env()?,
+        withdrawal_config.vault.clone(),
+        vault_signer_map,
+    );
+    let withdrawal_executor = WithdrawalExecutor::new(
+        Db::open(&db_path)?,
+        payout_rpc,
+        withdrawal_config.clone(),
+        payout_collector,
+        std::sync::Arc::clone(&epoch_observation),
+    );
     let discovery_rpc = RealSolanaRpc::new(solana_config.rpc_url.clone(), solana_config.commitment);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let epoch_task = tokio::spawn(run_epoch_refresher(
+        RealSolanaRpc::new(solana_config.rpc_url.clone(), solana_config.commitment),
+        solana_config.program_id,
+        epoch_observation,
+        shutdown_rx.clone(),
+    ));
     let mut indexer_task = tokio::spawn(run_indexer_loop(
         indexer,
         poll_interval,
@@ -531,6 +588,7 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("shutdown signal received, stopping all three services");
             let _ = shutdown_tx.send(true);
             let (i, o, w) = tokio::join!(indexer_task, orchestrator_task, withdrawal_task);
+            let _ = epoch_task.await;
             i??;
             o??;
             w??;
@@ -539,18 +597,21 @@ async fn main() -> anyhow::Result<()> {
             tracing::error!("indexer loop exited, stopping the other services");
             let _ = shutdown_tx.send(true);
             let _ = tokio::join!(orchestrator_task, withdrawal_task);
+            let _ = epoch_task.await;
             result??;
         }
         result = &mut orchestrator_task => {
             tracing::error!("orchestrator loop exited, stopping the other services");
             let _ = shutdown_tx.send(true);
             let _ = tokio::join!(indexer_task, withdrawal_task);
+            let _ = epoch_task.await;
             result??;
         }
         result = &mut withdrawal_task => {
             tracing::error!("withdrawal loop exited, stopping the other services");
             let _ = shutdown_tx.send(true);
             let _ = tokio::join!(indexer_task, orchestrator_task);
+            let _ = epoch_task.await;
             result??;
         }
     }

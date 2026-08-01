@@ -274,6 +274,137 @@ ADR-0014 recorded as finding **F4**.
   advance. This is why ADR-0014 now specifies an explicitly designated
   quorum inside the signed payout intent (owner decision, 2026-07-31).
 
+### Distributed multisig signing (verified Phase 7e, 2026-07-31)
+
+Verified against a real `goldcoind` **0.17.0** regtest node (two independent
+nodes for the cross-node check). These facts decide the Phase 7e design, so
+each is recorded with the observation that established it.
+
+#### `combinerawtransaction` and PSBT DO NOT EXIST
+
+This is the single most consequential divergence from Bitcoin Core 0.17.
+Goldcoin 0.17 ships the **Bitcoin 0.16-era** raw-transaction API:
+
+| method | Bitcoin 0.17 | Goldcoin 0.17 |
+|---|---|---|
+| `signrawtransaction` | removed (deprecated) | **PRESENT** |
+| `signrawtransactionwithkey` | present | **ABSENT** |
+| `signrawtransactionwithwallet` | present | **ABSENT** |
+| `combinerawtransaction` | present | **ABSENT** |
+| `createpsbt` / `walletprocesspsbt` / `finalizepsbt` / `converttopsbt` | present | **ABSENT** |
+| `getaddressinfo` | present | **ABSENT** — use `validateaddress` |
+
+`validateaddress` still returns the wallet fields (`pubkey`, `ismine`,
+`hdkeypath`) that Bitcoin 0.17 moved to `getaddressinfo`.
+
+> **Probe carefully.** `goldcoin-cli help <unknown-method>` prints
+> `help: unknown command: X` and **exits 0**. Testing method existence by
+> exit status reports every method as present. Match on the output text, or
+> call the method and check for JSON-RPC code `-32601`.
+
+The full `== Rawtransactions ==` section is exactly:
+`createrawtransaction`, `decoderawtransaction`, `decodescript`,
+`fundrawtransaction`, `getrawtransaction`, `sendrawtransaction`,
+`signrawtransaction`.
+
+Legacy `signrawtransaction` argument order is the 0.16 shape —
+`(hexstring, prevtxs, privkeys, sighashtype)` — with `prevtxs` **before**
+`privkeys`, the reverse of `signrawtransactionwithkey`.
+
+#### ECDSA signing is RFC6979-deterministic, including across machines
+
+Five signings of one unsigned transaction with one key produced
+**byte-identical** output (1 distinct result from 5 attempts). A second,
+entirely separate `goldcoind` instance — different datadir, empty chain,
+never having seen the transaction — produced the **identical** partial from
+the same `(unsigned tx, prevtxs, privkey)`:
+
+```
+node1 partial sha256 = 8f7b3f81375e258aa7ae1f09b8ff2bde
+node2 partial sha256 = 8f7b3f81375e258aa7ae1f09b8ff2bde
+```
+
+**Consequence:** the final txid is computable *before* any signature is
+collected, so ADR-0013's persist-txid-before-broadcast recovery model
+survives distributed signing intact. It also means a partial need never be
+persisted to survive a crash: re-requesting it returns the same bytes.
+
+#### Sequential signing merges; parallel merge is reproducible by hand
+
+With no `combinerawtransaction`, the node's only merge path is passing an
+already-partially-signed hex back into `signrawtransaction`, which preserves
+existing signatures and adds its own (`complete: true` on the second call).
+
+A signer signing the **unsigned** transaction alone returns
+`complete: false` with error `Operation not valid with the current stack
+size` — that error is the **normal, expected** result of a partial M-of-N
+signature, not a failure.
+
+Critically, the two shapes are equivalent. Extracting each signer's raw
+signature from its independent partial and assembling
+`OP_0 <sig_a> <sig_b> <redeemScript>` reproduces the node's sequential
+output **byte-for-byte**, verified on a 2-input transaction:
+
+```
+input 0: manual == node ? True
+input 1: manual == node ? True
+```
+
+**Consequence:** signers can be asked **in parallel** and merged by the
+relayer, so Phase 7d's collect/timeout/failover model applies unchanged. A
+serial relay is not required.
+
+#### Signature order inside the scriptSig is consensus-enforced
+
+`OP_CHECKMULTISIG` requires signatures in the same relative order as the
+pubkeys in the redeemScript. A wrong order is **rejected by consensus**, not
+silently accepted — each ordering tested against its own funded UTXO:
+
+```
+CORRECT {0,1} ascending: accepted=True
+WRONG   {1,0} reversed : rejected — 16: mandatory-script-verify-flag-failed
+CORRECT {0,2} ascending: accepted=True
+WRONG   {2,0} reversed : rejected — 16: mandatory-script-verify-flag-failed
+CORRECT {1,2} ascending: accepted=True
+```
+
+Note this **refines** the Phase 7b note above ("signature order does not
+matter"), which was observed through `signrawtransaction` and is true of the
+*order signers are asked in*. It is **not** true of the order signatures are
+placed in the scriptSig — the node was sorting them. Code that assembles a
+scriptSig itself must sort by redeemScript pubkey position.
+
+#### The legacy sighash does NOT commit to input amounts
+
+Signing with deliberately falsified `amount` fields in `prevtxs` produced a
+transaction **byte-identical** to one signed with correct amounts, which the
+network then accepted:
+
+```
+txid with lied amounts = 2bb23bca...c08b888f
+txid with true amounts = 2bb23bca...c08b888f
+identical = True
+sendrawtransaction -> 2bb23bca...c08b888f   (accepted)
+```
+
+**Consequence — security-critical.** A signer **cannot** verify input
+amounts from the signing request, because the amount is not covered by what
+it signs. Any fee/amount validation must be done against the signer's **own**
+UTXO view before signing. A requester-supplied amount is untrustworthy input,
+and a design that relies on it is unsound.
+
+#### What a signer needs, and does not need
+
+Needs: the unsigned transaction, the redeemScript (public; contains every
+member's public key), and each input's scriptPubKey (public, on-chain).
+
+Does **not** need: any other validator's private key. Every signature above
+was produced by `signrawtransaction` with exactly **one** WIF key.
+
+Confirmed negative: one key signing twice cannot satisfy a 2-of-3 —
+`complete: false`, and broadcast is rejected with
+`mandatory-script-verify-flag-failed`.
+
 ## Not yet verified / explicitly out of scope for Phase 4
 
 - P2SH multisig vault construction end-to-end (spend path) — custody.md #2

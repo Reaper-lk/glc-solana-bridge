@@ -10,15 +10,20 @@ Each operator runs **two** processes:
 
 | process | holds | listens | talks to |
 |---|---|---|---|
-| `signer-server` | **the** validator ed25519 key — the only key in the deployment | mTLS gRPC | nothing outbound except Solana RPC |
-| `glc-relayer` | no validator key at all | nothing | Goldcoin RPC, Solana RPC, and every peer's `signer-server` |
+| `signer-server` | **the** validator ed25519 key **and this operator's single vault key** — the only keys in the deployment | mTLS gRPC | its **own** Solana RPC and its **own** Goldcoin RPC |
+| `glc-relayer` | no validator key, no vault key | nothing | Goldcoin RPC, Solana RPC, and every peer's `signer-server` |
 
-The relayer submits transactions and pays fees; it cannot authorize
+The relayer builds, assembles, submits, and pays fees; it cannot authorize
 anything. Authority lives only in the signer processes, and only signatures
 cross the network. A fully compromised relayer can waste fees and stall
-progress — it cannot mint or move funds, because every signer independently
-re-derives what it is asked to sign and refuses anything it did not derive
-itself.
+progress — it cannot mint **or move vault funds**, because every signer
+independently re-derives what it is asked to sign and refuses anything it did
+not derive itself.
+
+> **Phase 7e:** the Goldcoin payout path is now distributed too. The
+> operator's Goldcoin node no longer needs enough vault keys to satisfy the
+> M-of-N — it holds **one**, in the signer process. See
+> [ADR-0017](adr/0017-distributed-payout-signing.md).
 
 Both processes read the same SQLite file. That is deliberate: the signer's
 answers come from **this operator's own** chain observations, written by
@@ -58,6 +63,38 @@ to running without authentication.
 | `GLC_SOLANA_RPC_URL` | for observing the validator epoch |
 | `GLC_SOLANA_COMMITMENT` | `processed` \| `confirmed` \| `finalized`; no default, by design |
 
+### Vault signing (Phase 7e) — optional, but all-or-nothing
+
+Set these only if this signer holds a vault key. If `GLC_VAULT_REDEEM_SCRIPT_HEX`
+is unset the signer serves mint requests only and **refuses every payout
+request**; if it is set, all of the following are required.
+
+| variable | meaning |
+|---|---|
+| `GLC_VAULT_REDEEM_SCRIPT_HEX` | the vault's redeem script |
+| `GLC_SIGNER_VAULT_INDEX` | this signer's position in the vault's ordered signer list |
+| `GLC_SIGNER_VAULT_KEY_PATH` | file containing this signer's WIF vault key — **one key** |
+| `GLC_SIGNER_GLC_RPC_URL` / `_USER` / `_PASSWORD` | **this signer's own Goldcoin node** |
+
+Startup **proves** the key on disk is the key the vault expects at
+`GLC_SIGNER_VAULT_INDEX`, and aborts on any mismatch. A misconfigured
+operator cannot silently participate — that check is what makes it safe to
+keep the identity-to-position mapping in configuration rather than on-chain
+(ADR-0017 E1).
+
+> ### The signer's Goldcoin node MUST NOT be the relayer's
+>
+> This is a **hard requirement**, not a tuning choice (ADR-0017 E2).
+>
+> A signer validates a payout against its **own** UTXO view. That is the
+> only defence that exists: the legacy Goldcoin sighash does **not** commit
+> to input amounts, so a signature proves nothing about what an input was
+> worth. A signer pointed at the relayer's node inherits the requester's
+> view of the chain and the check becomes circular.
+>
+> The process cannot detect a shared endpoint, so it logs the Goldcoin RPC
+> URL at startup. Check it in deployment review.
+
 Startup **fails closed**: it aborts unless every value is present and valid,
 the TLS material loads, and the on-chain validator epoch can actually be
 read. A signer that has never observed the epoch has nothing meaningful to
@@ -78,6 +115,15 @@ may have fallen behind.
 | `GLC_RELAYER_TLS_CERT_PATH` / `GLC_RELAYER_TLS_KEY_PATH` | this relayer's client certificate and key |
 | `GLC_FEDERATION_TLS_DOMAIN` | the name peer certificates must be issued for |
 | `GLC_FEDERATION_TLS` | set to `off` for loopback/regtest only; logs a warning every start |
+| `GLC_VAULT_SIGNER_MAP` | `index:base58pubkey,...` — which validator holds which vault position (Phase 7e) |
+
+`GLC_VAULT_SIGNER_MAP` is validated against the configured redeem script at
+startup and **fails closed**: every vault position must be mapped, no
+position may be claimed twice, and no validator may hold two positions. A
+gap would make some designated quorum resolve to nobody and look like a
+permanent outage; one validator holding two positions would let it satisfy
+an M-of-N by itself, which is the entire property the vault exists to
+prevent.
 
 The pubkey in each peer entry is the on-chain identity that endpoint must
 answer as. A response claiming any other identity is discarded even if its
@@ -98,12 +144,21 @@ apparent agreement by counting one party twice.
 |---|---|---|
 | signature | that validator independently derived the same bytes | — |
 | **refusal** | that validator's view of the chain **disagrees with yours** | **no** — asking again gets the same answer |
+| payout shortfall | a designated signer did not answer | yes, but see below |
 | unavailable | unreachable, timed out, throttled, or answered unusably | yes, next tick |
 
 A refusal is an alarm, not noise. It means two operators' independent views
 of the chain have diverged, which is a bug, an outage, or an attack. Falling
 short of threshold, by contrast, is an ordinary outcome that the next tick
 retries.
+
+**Payouts differ in one important way.** Only the *designated* quorum is
+asked, because the Goldcoin txid depends on which quorum signs. If a
+designated signer stays unavailable, the payout does **not** silently move to
+another signer — it waits until an operator performs an explicit, audited
+quorum reassignment (ADR-0015). That is deliberate: substituting a signer
+would change the txid, and the txid is what the recovery model reconciles
+against.
 
 ## Operational bounds
 

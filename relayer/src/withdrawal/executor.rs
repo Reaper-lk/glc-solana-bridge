@@ -38,6 +38,34 @@ use crate::withdrawal::builder::{
 };
 use crate::withdrawal::coin::{self, SelectionError};
 use crate::withdrawal::config::WithdrawalConfig;
+use crate::withdrawal::multisig::{assemble, MultisigError, Transaction};
+
+/// Collects **Goldcoin partial signatures** from the designated quorum
+/// (Phase 7e, ADR-0017).
+///
+/// The executor holds **no vault key**: it asks the designated signers, each
+/// of which independently rebuilds the transaction from its own UTXO view
+/// before signing (`p2p::payout_view`). A trait so the payout pipeline stays
+/// testable without a network, mirroring `SignatureCollector` on the mint
+/// side.
+pub trait PayoutPartialCollector {
+    /// Asks exactly the designated signers, identified by their position in
+    /// the vault's ordered signer list.
+    ///
+    /// Returning fewer than threshold is normal and not an error: the caller
+    /// retries on a later tick, or the operator reassigns the quorum
+    /// explicitly (ADR-0015). Substituting a non-designated signer is never
+    /// acceptable, because the txid depends on which quorum signs.
+    fn collect_payout_partials(
+        &self,
+        epoch: u64,
+        withdrawal_index: u64,
+        quorum_attempt: u32,
+        canonical_intent: &[u8],
+        unsigned_tx_hex: &str,
+        quorum_indices: &[u8],
+    ) -> impl std::future::Future<Output = Vec<crate::withdrawal::multisig::PartialSignature>> + Send;
+}
 
 #[derive(Debug, Error)]
 pub enum ExecutorError {
@@ -49,6 +77,8 @@ pub enum ExecutorError {
     Db(#[from] DbError),
     #[error("payout verification failed: {0}")]
     Verify(#[from] VerifyError),
+    #[error("multisig assembly failed: {0}")]
+    Assembly(#[from] MultisigError),
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -129,10 +159,14 @@ pub struct TxStatus {
     pub block_height: Option<i64>,
 }
 
-pub struct WithdrawalExecutor<R: PayoutRpc> {
+pub struct WithdrawalExecutor<R: PayoutRpc, C: PayoutPartialCollector> {
     db: Db,
     rpc: R,
     config: WithdrawalConfig,
+    collector: C,
+    /// The validator-set epoch stamped onto signing requests, read fresh
+    /// each tick from this relayer's own observation.
+    epoch: std::sync::Arc<crate::solana::epoch::EpochObservation>,
 }
 
 fn now_unix() -> i64 {
@@ -142,9 +176,24 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-impl<R: PayoutRpc> WithdrawalExecutor<R> {
-    pub fn new(db: Db, rpc: R, config: WithdrawalConfig) -> Self {
-        WithdrawalExecutor { db, rpc, config }
+impl<R: PayoutRpc, C: PayoutPartialCollector> WithdrawalExecutor<R, C> {
+    /// Note the absence of any vault key parameter: this process signs
+    /// nothing with vault authority (Phase 7e, ADR-0017). It builds,
+    /// assembles, and broadcasts; the designated signers sign.
+    pub fn new(
+        db: Db,
+        rpc: R,
+        config: WithdrawalConfig,
+        collector: C,
+        epoch: std::sync::Arc<crate::solana::epoch::EpochObservation>,
+    ) -> Self {
+        WithdrawalExecutor {
+            db,
+            rpc,
+            config,
+            collector,
+            epoch,
+        }
     }
 
     pub fn db_mut(&mut self) -> &mut Db {
@@ -489,6 +538,13 @@ impl<R: PayoutRpc> WithdrawalExecutor<R> {
         Ok(())
     }
 
+    /// Collects partial signatures from the designated quorum and assembles
+    /// the fully-signed transaction (Phase 7e, ADR-0017).
+    ///
+    /// This process holds no vault key. Goldcoin 0.17 has no
+    /// `combinerawtransaction` and no PSBT, so assembly happens here, in
+    /// `withdrawal::multisig`, pinned by a golden vector against real node
+    /// output.
     async fn sign(
         &mut self,
         index: i64,
@@ -509,34 +565,94 @@ impl<R: PayoutRpc> WithdrawalExecutor<R> {
             }
         };
 
-        // Every input needs its previous output and the vault's redeem
-        // script for a P2SH signature to be constructible at all.
-        let prevtxs: Vec<crate::glc::rpc::PrevTx> = signable
-            .inputs
-            .iter()
-            .map(|u| crate::glc::rpc::PrevTx {
-                txid: u.txid_hex.clone(),
-                vout: u.vout,
-                script_pub_key: self.config.vault.script_pubkey_hex(),
-                redeem_script: self.config.vault.redeem_script_hex(),
-            })
-            .collect();
-        let (signed_hex, complete) = self
+        // A relayer whose own view of the validator set has gone stale must
+        // not stamp an epoch it cannot currently confirm onto a request.
+        if !self.epoch.is_fresh_at(now_unix()) {
+            tracing::warn!(
+                withdrawal_index = index,
+                "validator epoch observation is stale — not requesting signatures this tick"
+            );
+            return Ok(());
+        }
+
+        let partials = self
+            .collector
+            .collect_payout_partials(
+                self.epoch.epoch(),
+                index as u64,
+                signable.quorum_attempt,
+                &signable.intent_bytes,
+                &signable.unsigned_tx_hex,
+                &signable.quorum_indices,
+            )
+            .await;
+
+        // Falling short is NORMAL, not an error and not a halt: the tick
+        // simply retries, or an operator reassigns the quorum explicitly
+        // (ADR-0015). Halting here would strand a withdrawal over an
+        // ordinary outage.
+        if partials.len() < self.config.vault.threshold {
+            tracing::warn!(
+                withdrawal_index = index,
+                collected = partials.len(),
+                threshold = self.config.vault.threshold,
+                quorum_attempt = signable.quorum_attempt,
+                "insufficient partial signatures from the designated quorum this tick"
+            );
+            return Ok(());
+        }
+
+        let unsigned = Transaction::parse_hex(&signable.unsigned_tx_hex)?;
+
+        // Assembly verifies every partial against its input's sighash,
+        // rejects strangers and duplicates, enforces the threshold exactly,
+        // and orders signatures by redeem-script position — the
+        // consensus-critical invariant (ADR-0017 D2).
+        let signed = match assemble(&unsigned, &self.config.vault, &partials) {
+            Ok(t) => t,
+            Err(e) => {
+                // An assembly failure means the collected partials cannot
+                // form a spendable transaction. That is an anomaly, not an
+                // outage: the signatures verified as coming from designated
+                // signers, so something deeper disagrees.
+                tracing::error!(
+                    withdrawal_index = index,
+                    error = %e,
+                    "could not assemble a valid scriptSig from the designated quorum — halting"
+                );
+                self.db.transition_withdrawal(
+                    index,
+                    WithdrawalState::IntegrityHalted,
+                    now_unix(),
+                    Some(&format!("multisig assembly failed: {e}")),
+                )?;
+                report.halted += 1;
+                return Ok(());
+            }
+        };
+        let signed_hex = signed.serialize_hex();
+
+        // Cross-check our own serializer against the node's decoder before
+        // anything is persisted or broadcast. If our assembly or txid
+        // computation were wrong, this is where it surfaces — not after the
+        // network has seen it.
+        let signed_decoded = self
             .rpc
-            .sign_raw_transaction(&signable.unsigned_tx_hex, &prevtxs)
+            .decode_raw_transaction(&signed_hex)
             .await
             .map_err(classify)?;
-        if !complete {
-            // Incomplete means the designated quorum has not fully signed,
-            // or an input is gone. Either way the bytes cannot move funds
-            // (the network rejects partials), and silently retrying with a
-            // different quorum is exactly what ADR-0015 forbids — that is
-            // an explicit, audited reassignment.
+        if signed_decoded.txid_hex != signed.txid_hex() {
+            tracing::error!(
+                withdrawal_index = index,
+                ours = %signed.txid_hex(),
+                node = %signed_decoded.txid_hex,
+                "assembled txid disagrees with the node's — halting rather than broadcasting"
+            );
             self.db.transition_withdrawal(
                 index,
                 WithdrawalState::IntegrityHalted,
                 now_unix(),
-                Some("signrawtransaction returned complete=false; inputs unspendable"),
+                Some("assembled txid disagrees with the node's decoding"),
             )?;
             report.halted += 1;
             return Ok(());
@@ -545,11 +661,6 @@ impl<R: PayoutRpc> WithdrawalExecutor<R> {
         let unsigned_decoded = self
             .rpc
             .decode_raw_transaction(&signable.unsigned_tx_hex)
-            .await
-            .map_err(classify)?;
-        let signed_decoded = self
-            .rpc
-            .decode_raw_transaction(&signed_hex)
             .await
             .map_err(classify)?;
 
@@ -568,7 +679,10 @@ impl<R: PayoutRpc> WithdrawalExecutor<R> {
         let txid = crate::glc::hex::decode_exact::<32>(&signed_decoded.txid_hex)
             .map_err(|e| ExecutorError::Rpc(RpcError::Malformed(e.to_string())))?;
 
-        // Durable BEFORE the network sees anything.
+        // Durable BEFORE the network sees anything (ADR-0013). RFC6979
+        // determinism is what makes this safe under crash: re-collecting
+        // from the same quorum reproduces the identical transaction and
+        // txid, so a lost broadcast response is always reconcilable.
         self.db
             .record_signed_payout(index, &signed_hex, &txid, now_unix())?;
         report.signed += 1;

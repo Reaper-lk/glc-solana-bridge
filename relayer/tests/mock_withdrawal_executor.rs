@@ -13,21 +13,46 @@ use std::sync::{Arc, Mutex};
 use glc_relayer::glc::db::{Db, DbError};
 use glc_relayer::glc::rpc::{BroadcastOutcome, RpcError};
 use glc_relayer::glc::withdrawal_db::{NewWithdrawalRequest, ObservedUtxo, WithdrawalState};
+use glc_relayer::solana::epoch::EpochObservation;
 use glc_relayer::withdrawal::address::{encode_p2pkh, p2pkh_script_hex};
 use glc_relayer::withdrawal::builder::{DecodedInput, DecodedOutput, DecodedTx};
 use glc_relayer::withdrawal::config::{RawWithdrawalConfig, WithdrawalConfig};
 use glc_relayer::withdrawal::executor::{PayoutRpc, TxStatus, WithdrawalExecutor};
+use glc_relayer::withdrawal::federation::InProcessPayoutCollector;
 
 const DEST: [u8; 20] = [0xAA; 20];
 
-/// The real 2-of-3 vault `createmultisig` produced on a regtest node during
-/// Phase 7b verification (ADR-0015). Using the genuine script keeps these
-/// tests honest about the address and script shapes the executor must emit.
-const REDEEM: &str = "5221028e7147e643d67093dc8ca6a8fb888f1a452dddc62de991c7ed72080d65a421e42102f1c88ca7176c3ffee952ee6fae697991b257b6d53c3bc88e81cfe99adbcdbee5210256220bb7865197a40c4590ac80f12ef18e9063eac2eff92c4476ec27034042f953ae";
-const VAULT_ADDR: &str = "QY9YcpypWD91BEZ37TjNHYoqrquhcnVBYV";
+/// A deterministic 2-of-3 vault this test process holds every key for, so
+/// the partial signatures it produces are REAL RFC6979 ECDSA signatures over
+/// the genuine sighash — exercising the same assembly and verification path
+/// production uses, rather than a stub that would hide a bug in it.
+fn test_vault() -> glc_relayer::withdrawal::vault::MultisigVault {
+    InProcessPayoutCollector::deterministic_test_vault(3, 2).0
+}
+
+/// The same deterministic secret derivation `deterministic_test_vault` uses,
+/// so a test can hand a collector a chosen subset — or a deliberately wrong
+/// set — of keys.
+fn deterministic_secret(i: u8) -> libsecp256k1::SecretKey {
+    let mut seed = [0u8; 32];
+    seed[31] = i + 1;
+    seed[0] = 0x42;
+    libsecp256k1::SecretKey::parse(&seed).unwrap()
+}
+
+fn test_collector() -> InProcessPayoutCollector {
+    InProcessPayoutCollector::deterministic_test_vault(3, 2).1
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 fn vault() -> glc_relayer::withdrawal::vault::MultisigVault {
-    glc_relayer::withdrawal::vault::MultisigVault::from_redeem_script_hex(REDEEM).unwrap()
+    test_vault()
 }
 
 // ---------------------------------------------------------------------
@@ -58,6 +83,8 @@ enum Tamper {
     ExtraOutput,
     DropChange,
     AlterOutputsWhenSigning,
+    /// The node reports a txid that disagrees with our own computation.
+    DisagreeOnTxid,
 }
 
 #[derive(Clone, Default)]
@@ -81,9 +108,6 @@ impl MockPayoutRpc {
     }
     fn set_tamper(&self, t: Tamper) {
         self.0.lock().unwrap().tamper = Some(t);
-    }
-    fn set_sign_incomplete(&self) {
-        self.0.lock().unwrap().sign_incomplete = true;
     }
     fn set_send_missing_inputs(&self, n: u32) {
         self.0.lock().unwrap().send_missing_inputs = n;
@@ -116,14 +140,16 @@ impl MockPayoutRpc {
 
 /// Deterministic fake txid derived from the transaction hex, so the same
 /// bytes always produce the same txid — exactly like a real chain.
-fn fake_txid_hex(hex: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let d = Sha256::digest(hex.as_bytes());
-    use std::fmt::Write;
-    d.iter().fold(String::new(), |mut acc, b| {
-        let _ = write!(acc, "{b:02x}");
-        acc
-    })
+/// The REAL txid of a raw transaction (Phase 7e).
+///
+/// Previously a hash of the mock's stand-in encoding. Now that the mock
+/// builds genuine transactions, the txid must be the genuine one — the
+/// executor persists it before broadcast and reconciles by it, so a
+/// synthetic value would make the mock disagree with its own bytes.
+fn real_txid_hex(hex: &str) -> String {
+    glc_relayer::withdrawal::multisig::Transaction::parse_hex(hex)
+        .expect("mock: raw transaction must be parseable")
+        .txid_hex()
 }
 
 impl PayoutRpc for MockPayoutRpc {
@@ -140,6 +166,7 @@ impl PayoutRpc for MockPayoutRpc {
         inputs: &[(String, i64)],
         outputs: &[(String, u64)],
     ) -> Result<String, RpcError> {
+        use glc_relayer::withdrawal::multisig::{Transaction, TxInput, TxOutput};
         let tamper = self.0.lock().unwrap().tamper;
         let mut outs: Vec<(u64, String)> = outputs
             .iter()
@@ -163,41 +190,80 @@ impl PayoutRpc for MockPayoutRpc {
             }
             _ => {}
         }
-        // Encode the whole shape into the "hex" so decode is exact.
-        let body: Vec<String> = inputs
-            .iter()
-            .map(|(t, v)| format!("i:{t}:{v}"))
-            .chain(outs.iter().map(|(v, s)| format!("o:{v}:{s}")))
-            .collect();
-        Ok(format!("RAW|{}", body.join("|")))
+
+        // A GENUINE legacy transaction, not a stand-in string: Phase 7e
+        // assembles scriptSigs and computes sighashes over these exact
+        // bytes, so a fake encoding would test none of it.
+        let tx = Transaction {
+            version: 1,
+            inputs: inputs
+                .iter()
+                .map(|(txid_hex, vout)| {
+                    let mut txid = glc_relayer::glc::hex::decode_exact::<32>(txid_hex).unwrap();
+                    // RPC txids are display-order (reversed) on the wire.
+                    txid.reverse();
+                    TxInput {
+                        prev_txid: txid,
+                        prev_vout: *vout as u32,
+                        script_sig: Vec::new(),
+                        sequence: 0xffff_ffff,
+                    }
+                })
+                .collect(),
+            outputs: outs
+                .iter()
+                .map(|(v, s)| TxOutput {
+                    value: *v,
+                    script_pubkey: glc_relayer::glc::hex::decode_vec(s).unwrap(),
+                })
+                .collect(),
+            lock_time: 0,
+        };
+        Ok(tx.serialize_hex())
     }
 
     async fn decode_raw_transaction(&self, hex: &str) -> Result<DecodedTx, RpcError> {
-        let mut inputs = Vec::new();
-        let mut outputs = Vec::new();
-        for part in hex
-            .trim_start_matches("RAW|")
-            .trim_start_matches("SIGNED|")
-            .split('|')
-        {
-            if let Some(rest) = part.strip_prefix("i:") {
-                let (t, v) = rest.rsplit_once(':').unwrap();
-                inputs.push(DecodedInput {
-                    txid_hex: t.to_string(),
-                    vout: v.parse().unwrap(),
-                });
-            } else if let Some(rest) = part.strip_prefix("o:") {
-                let (v, s) = rest.split_once(':').unwrap();
-                outputs.push(DecodedOutput {
-                    value_atomic: v.parse().unwrap(),
-                    script_pubkey_hex: s.to_string(),
-                });
-            }
-        }
+        use glc_relayer::withdrawal::multisig::Transaction;
+        let tx = Transaction::parse_hex(hex)
+            .map_err(|e| RpcError::Malformed(format!("mock decode: {e}")))?;
+
+        // A signed transaction is one whose inputs carry scriptSigs. The
+        // AlterOutputsWhenSigning tamper now models a NODE that reports
+        // different outputs for the signed bytes than for the unsigned ones
+        // — with assembly in-process, that is the only way the two can
+        // disagree, and the guard must still catch it.
+        let signed = tx.inputs.iter().any(|i| !i.script_sig.is_empty());
+        let tamper = self.0.lock().unwrap().tamper;
+        let bump = signed && matches!(tamper, Some(Tamper::AlterOutputsWhenSigning));
+        let lie_about_txid = signed && matches!(tamper, Some(Tamper::DisagreeOnTxid));
+
         Ok(DecodedTx {
-            txid_hex: fake_txid_hex(hex.trim_start_matches("SIGNED|")),
-            inputs,
-            outputs,
+            txid_hex: if lie_about_txid {
+                "00".repeat(32)
+            } else {
+                tx.txid_hex()
+            },
+            inputs: tx
+                .inputs
+                .iter()
+                .map(|i| {
+                    let mut t = i.prev_txid;
+                    t.reverse();
+                    DecodedInput {
+                        txid_hex: glc_relayer::glc::hex::encode(&t),
+                        vout: i.prev_vout as i64,
+                    }
+                })
+                .collect(),
+            outputs: tx
+                .outputs
+                .iter()
+                .enumerate()
+                .map(|(i, o)| DecodedOutput {
+                    value_atomic: o.value + u64::from(bump && i == 0),
+                    script_pubkey_hex: glc_relayer::glc::hex::encode(&o.script_pubkey),
+                })
+                .collect(),
         })
     }
 
@@ -211,20 +277,12 @@ impl PayoutRpc for MockPayoutRpc {
             s.sign_calls += 1;
             (s.sign_incomplete, s.tamper)
         };
-        if incomplete {
-            return Ok((hex.to_string(), false));
-        }
-        let mut signed = format!("SIGNED|{}", hex.trim_start_matches("RAW|"));
-        if matches!(tamper, Some(Tamper::AlterOutputsWhenSigning)) {
-            // Bump the first output's value during "signing".
-            if let Some(pos) = signed.find("|o:") {
-                let rest = &signed[pos + 3..];
-                let (v, tail) = rest.split_once(':').unwrap();
-                let bumped: u64 = v.parse::<u64>().unwrap() + 1;
-                signed = format!("{}|o:{}:{}", &signed[..pos], bumped, tail);
-            }
-        }
-        Ok((signed, true))
+        let _ = tamper;
+        // Phase 7e: the executor no longer signs through the node at all —
+        // it collects partials from the designated quorum and assembles the
+        // scriptSig itself. This remains only to satisfy the trait, and is
+        // what a SIGNER's node would do.
+        Ok((hex.to_string(), !incomplete))
     }
 
     async fn send_raw_transaction(&self, hex: &str) -> Result<BroadcastOutcome, RpcError> {
@@ -235,7 +293,7 @@ impl PayoutRpc for MockPayoutRpc {
             s.send_missing_inputs -= 1;
             return Ok(BroadcastOutcome::MissingInputs);
         }
-        let txid = fake_txid_hex(hex.trim_start_matches("SIGNED|"));
+        let txid = real_txid_hex(hex);
         if let Some(st) = s.chain.get(&txid) {
             if st.confirmations > 0 {
                 return Ok(BroadcastOutcome::AlreadyInChain);
@@ -276,9 +334,9 @@ const DUST: u64 = 5_400;
 
 fn config() -> WithdrawalConfig {
     WithdrawalConfig::validate(RawWithdrawalConfig {
-        vault_redeem_script_hex: REDEEM.into(),
-        vault_address: VAULT_ADDR.into(),
-        change_address: VAULT_ADDR.into(),
+        vault_redeem_script_hex: test_vault().redeem_script_hex(),
+        vault_address: test_vault().address.clone(),
+        change_address: test_vault().address.clone(),
         fee_rate_per_kb: RATE,
         dust_threshold_atomic: DUST,
         vault_min_confirmations: 1,
@@ -337,8 +395,36 @@ impl Harness {
     }
     /// A brand-new executor over a brand-new connection: exactly what a
     /// process restart produces.
-    fn executor(&self) -> WithdrawalExecutor<MockPayoutRpc> {
-        WithdrawalExecutor::new(Db::open(&self.db_path).unwrap(), self.rpc.clone(), config())
+    fn executor(&self) -> WithdrawalExecutor<MockPayoutRpc, InProcessPayoutCollector> {
+        self.executor_with(test_collector())
+    }
+
+    /// An executor whose epoch observation is deliberately stale.
+    fn executor_with_stale_epoch(
+        &self,
+    ) -> WithdrawalExecutor<MockPayoutRpc, InProcessPayoutCollector> {
+        WithdrawalExecutor::new(
+            Db::open(&self.db_path).unwrap(),
+            self.rpc.clone(),
+            config(),
+            test_collector(),
+            std::sync::Arc::new(EpochObservation::seeded(1, now_unix() - 100_000)),
+        )
+    }
+
+    /// An executor whose quorum is supplied by the caller, so a test can
+    /// model a partial or absent quorum.
+    fn executor_with(
+        &self,
+        collector: InProcessPayoutCollector,
+    ) -> WithdrawalExecutor<MockPayoutRpc, InProcessPayoutCollector> {
+        WithdrawalExecutor::new(
+            Db::open(&self.db_path).unwrap(),
+            self.rpc.clone(),
+            config(),
+            collector,
+            std::sync::Arc::new(EpochObservation::seeded(1, now_unix())),
+        )
     }
     fn db(&self) -> Db {
         Db::open(&self.db_path).unwrap()
@@ -497,14 +583,131 @@ async fn outputs_altered_during_signing_are_detected_and_never_broadcast() {
 }
 
 #[tokio::test]
-async fn an_incomplete_signature_halts_rather_than_broadcasting() {
+async fn an_incomplete_quorum_never_broadcasts_and_is_retried_not_halted() {
+    // Phase 7e changes what "incomplete" means. The node no longer signs;
+    // the designated quorum does, and falling short is an ORDINARY outage,
+    // retried on a later tick or resolved by explicit reassignment
+    // (ADR-0015). Halting here would strand a withdrawal over a peer being
+    // briefly unreachable.
+    //
+    // What must NOT change: nothing partial is ever broadcast.
     let h = Harness::new(vec![utxo(1, 0, 5_000_000)]);
-    h.rpc.set_sign_incomplete();
+    let (vault, _) = InProcessPayoutCollector::deterministic_test_vault(3, 2);
+    // A collector holding only ONE of the three vault keys can never reach
+    // a 2-of-3 threshold.
+    let one_key =
+        InProcessPayoutCollector::from_secret_keys(vault, vec![(0u8, deterministic_secret(0))]);
+
+    let mut e = h.executor_with(one_key);
+    e.ingest_discovered(&[withdrawal(1, 1_000_000)]).unwrap();
+    e.tick().await.unwrap();
+
+    assert_eq!(
+        h.state(1),
+        WithdrawalState::Signing,
+        "a shortfall must leave the withdrawal retriable, not halted"
+    );
+    assert_eq!(h.rpc.send_calls(), 0, "nothing partial may be broadcast");
+    assert!(
+        h.db()
+            .get_payout(1)
+            .unwrap()
+            .unwrap()
+            .signed_tx_hex
+            .is_none(),
+        "no signed bytes may be persisted from an incomplete quorum"
+    );
+
+    // And it recovers once the full quorum answers — proving the shortfall
+    // really was retriable rather than a silent dead end.
+    h.executor().tick().await.unwrap();
+    assert_eq!(h.state(1), WithdrawalState::Confirming);
+    assert_eq!(h.rpc.send_calls(), 1);
+}
+
+#[tokio::test]
+async fn a_txid_disagreement_with_the_node_halts_before_broadcast() {
+    // Assembly moved into our code (Goldcoin 0.17 has no
+    // combinerawtransaction), so our serializer is cross-checked against the
+    // node's decoder BEFORE anything is persisted or broadcast. If the two
+    // ever disagreed, persisting our txid would break ADR-0013's
+    // reconcile-by-txid model on the very first payout.
+    let h = Harness::new(vec![utxo(1, 0, 5_000_000)]);
+    h.rpc.set_tamper(Tamper::DisagreeOnTxid);
     let mut e = h.executor();
     e.ingest_discovered(&[withdrawal(1, 1_000_000)]).unwrap();
     e.tick().await.unwrap();
+
     assert_eq!(h.state(1), WithdrawalState::IntegrityHalted);
+    assert_eq!(h.rpc.send_calls(), 0, "nothing may be broadcast");
+    assert!(
+        h.db()
+            .get_payout(1)
+            .unwrap()
+            .unwrap()
+            .signed_tx_hex
+            .is_none(),
+        "no signed bytes may be persisted under a txid disagreement"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_epoch_observation_stops_signature_requests() {
+    // A relayer that has lost sight of the validator set must not stamp an
+    // epoch it cannot currently confirm onto a signing request — signers
+    // would either refuse it or, worse, agree under a superseded federation.
+    let h = Harness::new(vec![utxo(1, 0, 5_000_000)]);
+    let mut e = h.executor_with_stale_epoch();
+    e.ingest_discovered(&[withdrawal(1, 1_000_000)]).unwrap();
+    e.tick().await.unwrap();
+
+    assert_eq!(
+        h.state(1),
+        WithdrawalState::Signing,
+        "the withdrawal waits rather than being signed or halted"
+    );
     assert_eq!(h.rpc.send_calls(), 0);
+    assert!(h
+        .db()
+        .get_payout(1)
+        .unwrap()
+        .unwrap()
+        .signed_tx_hex
+        .is_none());
+
+    // And it proceeds once the observation is fresh again.
+    h.executor().tick().await.unwrap();
+    assert_eq!(h.state(1), WithdrawalState::Confirming);
+}
+
+#[tokio::test]
+async fn partials_that_cannot_assemble_halt_rather_than_broadcasting() {
+    // A quorum that answers but whose signatures cannot form a spendable
+    // scriptSig is an anomaly, not an outage: the partials came from
+    // designated signers, so something deeper disagrees.
+    let h = Harness::new(vec![utxo(1, 0, 5_000_000)]);
+    let (vault, _) = InProcessPayoutCollector::deterministic_test_vault(3, 2);
+    // Every position is answered, so the threshold IS reached — but each
+    // signature is made with a key that is not the one at that position, so
+    // none of them verifies against the vault. Reaching threshold with
+    // unusable signatures is precisely the anomaly this must catch.
+    let mismatched = InProcessPayoutCollector::from_secret_keys(
+        vault,
+        (0..3u8)
+            .map(|i| (i, deterministic_secret(50 + i)))
+            .collect(),
+    );
+
+    let mut e = h.executor_with(mismatched);
+    e.ingest_discovered(&[withdrawal(1, 1_000_000)]).unwrap();
+    e.tick().await.unwrap();
+
+    assert_eq!(h.state(1), WithdrawalState::IntegrityHalted);
+    assert_eq!(
+        h.rpc.send_calls(),
+        0,
+        "an unassemblable quorum never broadcasts"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -524,8 +727,14 @@ async fn drive_to_signing(h: &Harness, index: i64, amount: u64) {
 async fn guard_refuses_to_sign_twice_even_when_forced() {
     let h = Harness::new(vec![utxo(1, 0, 5_000_000)]);
     drive_to_signing(&h, 1, 1_000_000).await;
-    let signs_after_first = h.rpc.sign_calls();
-    assert_eq!(signs_after_first, 1);
+    let signed_once = h
+        .db()
+        .get_payout(1)
+        .unwrap()
+        .unwrap()
+        .signed_tx_hex
+        .expect("the first pass signs");
+    let sends_after_first = h.rpc.send_calls();
 
     // Force the row back to Signing as a corrupted/stale state would.
     mutate(
@@ -536,9 +745,14 @@ async fn guard_refuses_to_sign_twice_even_when_forced() {
     h.executor().tick().await.unwrap();
 
     assert_eq!(
-        h.rpc.sign_calls(),
-        signs_after_first,
-        "the already-signed guard must prevent a second signature"
+        h.db().get_payout(1).unwrap().unwrap().signed_tx_hex,
+        Some(signed_once),
+        "the already-signed guard must prevent a second, different signature"
+    );
+    assert_eq!(
+        h.rpc.send_calls(),
+        sends_after_first,
+        "and must not broadcast again"
     );
     assert_eq!(h.state(1), WithdrawalState::IntegrityHalted);
 }

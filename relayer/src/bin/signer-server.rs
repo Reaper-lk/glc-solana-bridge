@@ -32,18 +32,26 @@ use std::sync::Arc;
 use solana_sdk::pubkey::Pubkey;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
+use glc_relayer::glc::config::RpcConfigValidated;
 use glc_relayer::glc::db::Db;
+use glc_relayer::glc::rpc::{PrevTx, RpcClient};
 use glc_relayer::p2p::identity::{TlsMaterial, TlsPaths};
+use glc_relayer::p2p::payout_view::{PartialSigner, PayoutView};
 use glc_relayer::p2p::service::pb::federation_signer_server::FederationSignerServer;
 use glc_relayer::p2p::service::SignerService;
-use glc_relayer::p2p::view::{DbLocalView, EpochObservation, EPOCH_POLL_INTERVAL};
+use glc_relayer::p2p::view::DbLocalView;
 use glc_relayer::signer::load_validator_keypair;
-use glc_relayer::solana::instruction;
-use glc_relayer::solana::rpc::{self, RealSolanaRpc, SolanaRpc};
+use glc_relayer::solana::epoch::{observe_epoch, run_epoch_refresher, EpochObservation};
+use glc_relayer::solana::rpc::RealSolanaRpc;
+use glc_relayer::withdrawal::vault::MultisigVault;
 
 fn env_required(name: &str) -> anyhow::Result<String> {
     std::env::var(name)
         .map_err(|_| anyhow::anyhow!("required environment variable {name} is not set"))
+}
+
+fn env_optional(name: &str) -> Option<String> {
+    std::env::var(name).ok()
 }
 
 fn now_unix() -> i64 {
@@ -53,65 +61,98 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// Reads the on-chain validator epoch — this validator's own observation,
-/// never a configured constant.
-async fn observe_epoch(solana_rpc: &RealSolanaRpc, program_id: &Pubkey) -> anyhow::Result<u64> {
-    let (validator_set_pda, _) = instruction::validator_set_pda(program_id);
-    let account = solana_rpc
-        .get_account(&validator_set_pda)
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "the on-chain ValidatorSet account was not found — has the bridge been initialized?"
-            )
-        })?;
-    Ok(rpc::decode_validator_set(&account.data)?.epoch)
+/// Signs with **this signer's single vault key**, on **this signer's own**
+/// Goldcoin node (Phase 7e, ADR-0017 E2).
+///
+/// A partial M-of-N signature legitimately comes back with
+/// `complete: false` — that is the expected result of contributing one of M
+/// signatures, not a failure, so it is passed through rather than treated as
+/// an error.
+struct NodePartialSigner {
+    rpc: RpcClient,
+    wif: String,
 }
 
-/// Re-observes the epoch until shutdown.
-///
-/// A failed poll deliberately leaves the last observation untouched rather
-/// than substituting a guess: staleness then accumulates and the view stops
-/// answering on its own, which is the intended behaviour.
-async fn run_epoch_refresher(
-    solana_rpc: RealSolanaRpc,
-    program_id: Pubkey,
-    observation: Arc<EpochObservation>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) {
-    loop {
-        tokio::select! {
-            _ = shutdown.changed() => {
-                tracing::info!("epoch refresher: shutdown signal received, exiting");
-                return;
-            }
-            _ = tokio::time::sleep(EPOCH_POLL_INTERVAL) => {
-                match observe_epoch(&solana_rpc, &program_id).await {
-                    Ok(epoch) => {
-                        let previous = observation.epoch();
-                        observation.record(epoch, now_unix());
-                        if epoch != previous {
-                            tracing::warn!(
-                                previous,
-                                observed = epoch,
-                                "validator set epoch changed — requests quoting the old epoch will now be refused"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        // Not an error to exit on: the staleness bound is
-                        // what protects correctness here, and a signer that
-                        // died on a transient RPC blip would be worse for
-                        // availability than one that briefly refuses.
-                        tracing::warn!(
-                            error = %e,
-                            "failed to re-observe the validator epoch; this signer will refuse requests once its view goes stale"
-                        );
-                    }
-                }
-            }
-        }
+impl PartialSigner for NodePartialSigner {
+    async fn sign_partial(
+        &self,
+        unsigned_tx_hex: &str,
+        prevtxs: &[PrevTx],
+    ) -> Result<String, String> {
+        self.rpc
+            .sign_raw_transaction_with_prevtxs(
+                unsigned_tx_hex,
+                prevtxs,
+                Some(std::slice::from_ref(&self.wif)),
+            )
+            .await
+            .map(|r| r.hex)
+            .map_err(|e| e.to_string())
     }
+}
+
+/// Builds the vault-signing arm, or explains why this signer has none.
+///
+/// **Fails closed** (ADR-0017 E1): if a vault key is configured, the process
+/// proves it actually holds the key at its configured position before
+/// serving. A signer that cannot prove that refuses to start rather than
+/// discovering the mismatch when a payout fails.
+fn payout_arm() -> anyhow::Result<Option<(PayoutView<NodePartialSigner>, Db)>> {
+    let Some(redeem_hex) = env_optional("GLC_VAULT_REDEEM_SCRIPT_HEX") else {
+        tracing::warn!(
+            "GLC_VAULT_REDEEM_SCRIPT_HEX is not set — this signer serves MINT requests only and              will refuse every payout request"
+        );
+        return Ok(None);
+    };
+    let vault = MultisigVault::from_redeem_script_hex(&redeem_hex)?;
+
+    let index: u8 = env_required("GLC_SIGNER_VAULT_INDEX")?
+        .parse()
+        .map_err(|e| anyhow::anyhow!("GLC_SIGNER_VAULT_INDEX must be a u8: {e}"))?;
+
+    let wif = std::fs::read_to_string(env_required("GLC_SIGNER_VAULT_KEY_PATH")?)
+        .map_err(|e| anyhow::anyhow!("failed to read the vault key file: {e}"))?
+        .trim()
+        .to_string();
+
+    // THE E1 check: the key this process holds must be the key the vault
+    // expects at the configured position.
+    vault.require_signer_at(index, &wif).map_err(|e| {
+        anyhow::anyhow!(
+            "refusing to start: this signer's vault key does not match vault position {index} — {e}"
+        )
+    })?;
+
+    // ADR-0017 E2: this MUST be the signer's own node, never the relayer's.
+    // Independent UTXO validation is a core security property: a signer
+    // sharing the requester's node inherits the requester's view.
+    let rpc_url = env_required("GLC_SIGNER_GLC_RPC_URL")?;
+    let user = env_required("GLC_SIGNER_GLC_RPC_USER")?;
+    let password = env_required("GLC_SIGNER_GLC_RPC_PASSWORD")?;
+    if rpc_url.is_empty() || user.is_empty() || password.is_empty() {
+        return Err(anyhow::anyhow!(
+            "GLC_SIGNER_GLC_RPC_URL, _USER and _PASSWORD must all be non-empty"
+        ));
+    }
+    let rpc = RpcClient::new(&RpcConfigValidated {
+        url: rpc_url.clone(),
+        user,
+        password,
+        connect_timeout_ms: 5_000,
+        read_timeout_ms: 30_000,
+    })?;
+
+    tracing::info!(
+        vault_address = %vault.address,
+        vault_signer_index = index,
+        goldcoin_rpc = %rpc_url,
+        "payout signing enabled — this MUST be this signer's OWN Goldcoin node (ADR-0017 E2)"
+    );
+
+    let db = Db::open(&PathBuf::from(env_required("GLC_DB_PATH")?))?;
+    let view = PayoutView::new(vault, index, NodePartialSigner { rpc, wif })
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok(Some((view, db)))
 }
 
 #[tokio::main]
@@ -167,7 +208,13 @@ async fn main() -> anyhow::Result<()> {
     // else in this codebase (WAL mode + busy timeout).
     let db = Db::open(&PathBuf::from(env_required("GLC_DB_PATH")?))?;
     let view = DbLocalView::new(db, Arc::clone(&observation));
-    let service = SignerService::new(keypair, view);
+    let mut service = SignerService::new(keypair, view);
+
+    // The Goldcoin vault-signing arm (Phase 7e). Absent when this signer
+    // holds no vault key, in which case every payout request is refused.
+    if let Some((payout_view, payout_db)) = payout_arm()? {
+        service = service.with_payout_arm(payout_view, payout_db);
+    }
 
     tracing::info!(
         validator = %validator_pubkey,

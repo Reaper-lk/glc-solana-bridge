@@ -51,6 +51,8 @@ pub enum Refusal {
     UnknownPeer,
     #[error("peer exceeded its request rate limit")]
     RateLimited,
+    #[error("vault payout refused: {0}")]
+    PayoutRefused(String),
     #[error(
         "this validator's observation of the chain is stale — refusing to sign rather than \
          authorize under a federation revision it may no longer be current with"

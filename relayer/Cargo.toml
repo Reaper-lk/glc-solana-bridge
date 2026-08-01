@@ -86,6 +86,7 @@ prost = "0.13"
 # getProgramAccounts defaults to base58 encoding, which the node refuses for
 # accounts over 128 bytes (a WithdrawalRequest is 180).
 solana-account-decoder-client-types = "2.3"
+libsecp256k1 = "0.6"
 
 [build-dependencies]
 tonic-build = "0.13"
@@ -96,6 +97,7 @@ tonic-build = "0.13"
 protoc-bin-vendored = "3"
 
 [dev-dependencies]
+libsecp256k1 = "0.6"
 # Test-only certificate authority, so the mTLS transport is verified against
 # real certificates rather than assumed to work (Phase 7d).
 # Pinned below 0.14.8, which raises its MSRV to 1.88 — this workspace builds

@@ -18,10 +18,12 @@ use glc_relayer::glc::config::RpcConfigValidated;
 use glc_relayer::glc::db::Db;
 use glc_relayer::glc::rpc::RpcClient;
 use glc_relayer::glc::withdrawal_db::{NewWithdrawalRequest, WithdrawalState};
+use glc_relayer::solana::epoch::EpochObservation;
 use glc_relayer::withdrawal::adapter::RealPayoutRpc;
 use glc_relayer::withdrawal::address::decode_p2pkh_hash160;
 use glc_relayer::withdrawal::config::{RawWithdrawalConfig, WithdrawalConfig};
 use glc_relayer::withdrawal::executor::WithdrawalExecutor;
+use glc_relayer::withdrawal::federation::InProcessPayoutCollector;
 
 fn goldcoind_bin() -> Option<PathBuf> {
     std::env::var_os("GOLDCOIND_BIN").map(PathBuf::from)
@@ -162,6 +164,13 @@ fn compact_outpoints(listunspent_json: &str) -> String {
     serde_json::Value::Array(items).to_string()
 }
 
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn config(vault: &str, redeem: &str, change: &str, depth: i64) -> WithdrawalConfig {
     WithdrawalConfig::validate(RawWithdrawalConfig {
         vault_redeem_script_hex: redeem.to_string(),
@@ -200,6 +209,9 @@ struct Fixture {
     db_path: PathBuf,
     vault: String,
     redeem: String,
+    /// `(vault signer index, WIF)` for every vault key, as a real node's
+    /// `dumpprivkey` returns them.
+    wifs: Vec<(u8, String)>,
     dest: String,
 }
 
@@ -236,6 +248,15 @@ impl Fixture {
         .unwrap();
         let vault = ms["address"].as_str().unwrap().to_string();
         let redeem = ms["redeemScript"].as_str().unwrap().to_string();
+        // Phase 7e: the executor holds no vault key at all. It collects
+        // partial signatures from the designated quorum and assembles the
+        // scriptSig itself, so the test needs the KEYS, not a wallet that
+        // can sign the whole quorum in one call.
+        let wifs: Vec<(u8, String)> = signers
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (i as u8, node.cli(&["dumpprivkey", a])))
+            .collect();
         // Without these the vault is invisible to listunspent, and with only
         // the address imported its outputs stay unsolvable (verified).
         let _ = node.try_cli(&["importaddress", &vault, "vault", "false"]);
@@ -266,15 +287,31 @@ impl Fixture {
             vault,
             redeem,
             dest,
+            wifs,
         }
     }
 
-    fn executor(&self, depth: i64) -> WithdrawalExecutor<RealPayoutRpc> {
+    fn executor(&self, depth: i64) -> WithdrawalExecutor<RealPayoutRpc, InProcessPayoutCollector> {
+        self.executor_with_keys(depth, &self.wifs)
+    }
+
+    /// An executor whose quorum holds exactly `wifs`, so a test can model a
+    /// partial quorum against a real node.
+    fn executor_with_keys(
+        &self,
+        depth: i64,
+        wifs: &[(u8, String)],
+    ) -> WithdrawalExecutor<RealPayoutRpc, InProcessPayoutCollector> {
         let client = RpcClient::new(&self.node.rpc_config()).unwrap();
+        let cfg = config(&self.vault, &self.redeem, &self.vault, depth);
+        let collector = InProcessPayoutCollector::from_wifs(cfg.vault.clone(), wifs)
+            .expect("vault keys must match the vault the node built");
         WithdrawalExecutor::new(
             Db::open(&self.db_path).unwrap(),
             RealPayoutRpc::new(client),
-            config(&self.vault, &self.redeem, &self.vault, depth),
+            cfg,
+            collector,
+            std::sync::Arc::new(EpochObservation::seeded(1, now_unix())),
         )
     }
 

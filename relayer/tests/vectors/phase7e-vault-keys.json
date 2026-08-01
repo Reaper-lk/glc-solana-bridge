@@ -1,0 +1,22 @@
+{
+  "note": "Captured from goldcoind 0.17.0 regtest. WIF format as dumpprivkey returns it.",
+  "vault_address": "Qd4j7FUn5BpCVRNEUKqGbPTQqvebK94WkZ",
+  "redeem_script_hex": "522103f7ebeda62099ab2339a8517a49289010c5903b05c752e0b6443044c742c59a8f2103d635959d3b5fcc0494144c2969353b94ce18af462b6deb26bbc717d25e28a1d8210208c5feb9ae64c4f3e8773809433c97aa71df1be9888fc365374ddf72ab375e1f53ae",
+  "signers": [
+    {
+      "address": "mnGVS1W9jTUh4SWXvH2MgwUR2fZ4JiRqse",
+      "wif": "cVPnL3ct7pm1vYEupsYzDosiAt6xBJbVtNMzqG4cuPqHCjV1EgwG",
+      "pubkey": "03f7ebeda62099ab2339a8517a49289010c5903b05c752e0b6443044c742c59a8f"
+    },
+    {
+      "address": "mmPPXs4BwzprkV5KNZsZ1oSda2C3X3o4Nc",
+      "wif": "cVy2ePyVAgdo1kgNHUB7LL1gy93b7JVadtDrGWT6aS7Bu8SQ1CGf",
+      "pubkey": "03d635959d3b5fcc0494144c2969353b94ce18af462b6deb26bbc717d25e28a1d8"
+    },
+    {
+      "address": "mwA89rvhvFreyqy8Vc4r74SubDeA1HBFhn",
+      "wif": "cN2FMGJEM6GtJPBd8DrMucmCBiWJQ9MD4cVy17qYVnx4x93ETZAM",
+      "pubkey": "0208c5feb9ae64c4f3e8773809433c97aa71df1be9888fc365374ddf72ab375e1f"
+    }
+  ]
+}
