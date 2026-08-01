@@ -199,6 +199,46 @@ window, so one dead operator cannot strand a withdrawal.
 > pre-broadcast on-chain status check. The first lives in the *signer*
 > process — a different process from the executor that would cause the harm.
 
+## Health and metrics (Phase 7h)
+
+Set `GLC_OPS_LISTEN_ADDR` to expose two read-only endpoints:
+
+| path | purpose |
+|---|---|
+| `/health` | one line per invariant; **503** when any is breached |
+| `/metrics` | Prometheus text exposition |
+
+The relayer **exposes state and pages nobody**. There is no SMTP, PagerDuty,
+webhook, or vendor SDK in it, and it holds no alerting credentials. Point
+your existing uptime monitoring at `/health` — a breach turns it 503.
+
+> ### Bind it privately
+>
+> There is **no authentication**, because adding one would mean this process
+> holding another secret. The endpoint reveals balances, supply and
+> per-state counts. Bind it to a loopback or private interface behind your
+> own proxy. The relayer logs the bind address at startup with a warning so
+> a mistake is visible in review.
+>
+> Leaving `GLC_OPS_LISTEN_ADDR` unset is allowed but logged loudly: a bridge
+> nobody can observe should not be live.
+
+### The two numbers that must be zero
+
+| metric | meaning |
+|---|---|
+| `glc_solvency_breach_atomic` | wrapped supply beyond `deposits − payouts`. Measured to have **zero normal slack**, so any value here is real |
+| `glc_vault_unexplained_drift_atomic` | vault shortfall that recorded fees do **not** explain |
+
+### The number that grows on purpose
+
+`glc_vault_fee_drift_atomic` tracks `glc_vault_fees_paid_atomic`. ADR-0013 D3
+makes the vault absorb payout fees, so the vault sits below the backing bound
+by the cumulative fee and **that gap grows with every payout**. It is not a
+solvency failure ([ADR-0020](adr/0020-solvency-monitoring-and-fee-drift.md)) —
+it is the amount you replenish from an external fee reserve. Watch its slope,
+not its existence.
+
 ## What a peer's answer means
 
 | outcome | meaning | retry? |

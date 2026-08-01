@@ -1601,6 +1601,66 @@ fn row_to_payout(r: &rusqlite::Row) -> rusqlite::Result<PayoutRow> {
 }
 
 impl Db {
+    /// How many withdrawals sit in each state (ADR-0014 §13.2).
+    pub fn withdrawal_counts_by_state(&self) -> Result<Vec<(String, u64)>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT state, COUNT(*) FROM withdrawal_requests GROUP BY state")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// How many vault UTXOs are available, and their total value — the
+    /// fragmentation signal ADR-0014 §13.2 asks for.
+    pub fn vault_utxo_stats(&self) -> Result<(u64, u64), DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT amount_atomic FROM vault_utxos WHERE state = 'Available'")?;
+        let rows: Vec<Vec<u8>> = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        let count = rows.len() as u64;
+        Ok((count, rows.into_iter().map(|b| u64_from(&b)).sum()))
+    }
+
+    /// Total paid out to users across every completed payout, in atomic
+    /// units (Phase 7h). Under ADR-0013 D3 these are exactly the burned
+    /// amounts — the fee is a separate quantity.
+    pub fn completed_payout_total(&self) -> Result<u64, DbError> {
+        self.sum_payout_column("payout_atomic")
+    }
+
+    /// Cumulative Goldcoin fees the vault has absorbed (ADR-0013 D3).
+    ///
+    /// Reported separately from the solvency invariant on purpose: it is an
+    /// operational quantity an external reserve replenishes, not a breach
+    /// (ADR-0020).
+    pub fn vault_fees_paid_total(&self) -> Result<u64, DbError> {
+        self.sum_payout_column("fee_atomic")
+    }
+
+    /// Sums a `u64`-as-BLOB column over COMPLETED payouts only.
+    ///
+    /// Completed, not broadcast: a payout that has not confirmed may still
+    /// be reorged away, and counting it would understate backing at exactly
+    /// the moment accuracy matters.
+    fn sum_payout_column(&self, column: &str) -> Result<u64, DbError> {
+        let sql = format!(
+            "SELECT p.{column} FROM withdrawal_payouts p
+             JOIN withdrawal_requests w ON w.withdrawal_index = p.withdrawal_index
+             WHERE w.state = 'Completed'"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows: Vec<Vec<u8>> = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows.into_iter().map(|b| u64_from(&b)).sum())
+    }
+
     /// When this withdrawal last became eligible for building — the later
     /// of first observation and its most recent state change.
     ///

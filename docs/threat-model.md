@@ -39,6 +39,11 @@ OPEN blocks deployment.
 ## Standing invariants (testable from Phase 2 on)
 
 1. Total wrapped supply ≤ total confirmed vault deposits − completed payouts.
+   (Monitored at runtime from Phase 7h. Measured to hold with **exactly zero
+   slack**, so any breach is real — `glc_solvency_breach_atomic` must be 0.
+   Note this bound is *not* the vault's balance: ADR-0013 D3 makes the vault
+   absorb payout fees, so actual backing sits below it by the cumulative fee.
+   That drift is tracked separately as an operational quantity — ADR-0020.)
 2. A `(txid, vout)` pair mints at most once, ever.
 3. Every burn has exactly one `WithdrawalRequest` account, forever queryable.
 4. No instruction path mints without a valid M-of-N proof over the exact

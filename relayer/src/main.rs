@@ -41,6 +41,8 @@ use glc_relayer::glc::config::{
 use glc_relayer::glc::db::Db;
 use glc_relayer::glc::indexer::{Indexer, TickOutcome};
 use glc_relayer::glc::rpc::RpcClient;
+use glc_relayer::ops::collector::OpsCollector;
+use glc_relayer::ops::health;
 use glc_relayer::orchestrator::{Orchestrator, OrchestratorError};
 use glc_relayer::p2p::collector::GrpcCollector;
 use glc_relayer::p2p::identity::{parse_peers, TlsMaterial, TlsPaths};
@@ -518,6 +520,7 @@ async fn main() -> anyhow::Result<()> {
     let unavailable_interval = Duration::from_millis(config.node_unavailable_retry_interval_ms);
     let program_id_bytes = config.program_id;
     let config_protocol_version = config.protocol_version;
+    let wrapped_mint_pubkey = Pubkey::from(config.wrapped_mint);
     let db_path = config.db_path.clone();
     let indexer = Indexer::new(rpc, db, config);
 
@@ -669,11 +672,30 @@ async fn main() -> anyhow::Result<()> {
         std::sync::Arc::clone(&epoch_observation),
     );
 
+    // Fifth service: the operator-facing health and metrics endpoint
+    // (Phase 7h, ADR-0014 §13). It EXPOSES state and never pages anyone —
+    // no alerting credentials live in this process (owner decision H2).
+    //
+    // Optional so a deployment can run without it, but logged loudly when
+    // absent: a bridge nobody can observe is not one that should be live.
+    let ops_addr: Option<std::net::SocketAddr> = match std::env::var("GLC_OPS_LISTEN_ADDR") {
+        Ok(a) => Some(
+            a.parse()
+                .map_err(|e| anyhow::anyhow!("GLC_OPS_LISTEN_ADDR must be host:port: {e}"))?,
+        ),
+        Err(_) => {
+            tracing::warn!(
+                "GLC_OPS_LISTEN_ADDR is not set — health and metrics are NOT being exposed"
+            );
+            None
+        }
+    };
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let epoch_task = tokio::spawn(run_epoch_refresher(
         RealSolanaRpc::new(solana_config.rpc_url.clone(), solana_config.commitment),
         solana_config.program_id,
-        epoch_observation,
+        std::sync::Arc::clone(&epoch_observation),
         shutdown_rx.clone(),
     ));
     let mut indexer_task = tokio::spawn(run_indexer_loop(
@@ -687,6 +709,28 @@ async fn main() -> anyhow::Result<()> {
         orchestrator_poll_interval,
         shutdown_rx.clone(),
     ));
+    let ops_task = ops_addr.map(|addr| {
+        tracing::warn!(
+            %addr,
+            "health and metrics endpoint has NO authentication — bind it to a private \
+             interface, never a public one"
+        );
+        let collector = OpsCollector::new(
+            db_path.clone(),
+            RealSolanaRpc::new(solana_config.rpc_url.clone(), solana_config.commitment),
+            RealPayoutRpc::new(RpcClient::new(&rpc_for_payouts).expect("goldcoin rpc")),
+            wrapped_mint_pubkey,
+            withdrawal_config.vault_address.clone(),
+            withdrawal_config.vault_min_confirmations,
+            std::sync::Arc::clone(&epoch_observation),
+        );
+        tokio::spawn(health::serve(
+            addr,
+            std::sync::Arc::new(collector),
+            shutdown_rx.clone(),
+        ))
+    });
+
     let mut completion_task = tokio::spawn(run_completion_loop(
         completion_submitter,
         withdrawal_poll_interval,
@@ -711,6 +755,9 @@ async fn main() -> anyhow::Result<()> {
             let _ = shutdown_tx.send(true);
             let (i, o, w) = tokio::join!(indexer_task, orchestrator_task, withdrawal_task);
             let _ = tokio::join!(epoch_task, completion_task);
+            if let Some(t) = ops_task {
+                let _ = t.await;
+            }
             i??;
             o??;
             w??;
