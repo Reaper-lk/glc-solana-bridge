@@ -553,7 +553,25 @@ gated by the interim single admin key (ADR-0022 §6, custody #7 OPEN). Authorisa
 both is by **operator-staged approval** rather than derivation, because
 neither has an on-chain fact to derive from — see ADR-0021 §4.
 
-The rehearsal requirement stands and is not yet met.
+#### 8.7.2 Rehearsed (Phase 7j, 2026-08-01)
+
+**The rehearsal requirement is now met**, by automation rather than by a
+one-off exercise: `relayer/tests/rehearsal_rotation.rs` runs the rotation and
+pause procedures against a real `solana-test-validator`, and
+`relayer/tests/rehearsal_compromise.rs` runs the sweep against a real
+`goldcoind`. Both follow `docs/runbooks.md` step by step and assert the
+outcomes those runbooks promise.
+
+The compromise rehearsal **found a real defect on its first run**: the sweep
+compared previous-output txids in display order against a transaction
+carrying internal order, so `sweep-execute` would have refused every genuine
+sweep. Every unit fixture had built both sides from the same array. Exactly
+what §8.7 asks a rehearsal for (ADR-0024).
+
+Both suites **self-skip when their binaries are absent**, which is how CI
+runs them — so a green CI run is not evidence the rehearsals passed. They
+must be run deliberately, and re-run on the real deployment with the real
+operators before launch (`docs/launch-checklist.md`).
 
 ---
 
@@ -850,6 +868,13 @@ with forensic columns), every operator recovery action.
 - `PRAGMA integrity_check` plus an application-level offline auditor that
   re-verifies stored commitments using the same recompute-and-compare logic
   the signing guards already implement (ADR-0012, ADR-0013).
+
+### 13.4a Status (Phase 7j, 2026-08-01)
+
+Backup/restore drills and the offline auditor are **not built**, and the
+§13.1 (5) early warning for a reorg *approaching* `max_reorg_depth` does not
+exist — only the halt itself is exposed (ADR-0023). All three are recorded
+as open in `docs/launch-checklist.md` rather than left implied.
 
 ### 13.5 Runbooks
 

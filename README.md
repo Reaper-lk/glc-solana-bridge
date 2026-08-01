@@ -51,5 +51,6 @@ decisions in [docs/custody.md](docs/custody.md) are resolved, nothing here is
 deployable. No keys or secrets exist in this repository — report anything that
 looks like one (see [SECURITY.md](SECURITY.md) for how). Threat model:
 [docs/threat-model.md](docs/threat-model.md); operator procedures:
-[docs/runbooks.md](docs/runbooks.md); terminology:
+[docs/runbooks.md](docs/runbooks.md); launch readiness:
+[docs/launch-checklist.md](docs/launch-checklist.md); terminology:
 [docs/glossary.md](docs/glossary.md).

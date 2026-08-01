@@ -80,7 +80,7 @@ request**; if it is set, all of the following are required.
 | `GLC_VAULT_REDEEM_SCRIPT_HEX` | the vault's redeem script |
 | `GLC_SIGNER_VAULT_INDEX` | this signer's position in the vault's ordered signer list |
 | `GLC_SIGNER_VAULT_KEY_PATH` | file containing this signer's WIF vault key — **one key** |
-| `GLC_SIGNER_GLC_RPC_URL` / `_USER` / `_PASSWORD` | **this signer's own Goldcoin node** |
+| `GLC_SIGNER_GLC_RPC_URL`, `GLC_SIGNER_GLC_RPC_USER`, `GLC_SIGNER_GLC_RPC_PASSWORD` | **this signer's own Goldcoin node**, never the relayer's |
 
 ### Completion attestation (Phase 7f)
 
@@ -286,3 +286,101 @@ Run it before trusting a change to this path:
 ```
 cd relayer && cargo test --test federation_transport
 ```
+
+---
+
+# Configuration reference
+
+**Verified against the binaries.** `relayer/tests/deployment_config.rs`
+asserts on every CI run that every variable each binary reads appears here,
+and that nothing here has stopped being read. Phases 7e–7i added twelve
+variables that this document did not mention at all until Phase 7j — an
+operator deploying from the previous version got a federation that silently
+refused governance actions and vault sweeps.
+
+Every variable is `GLC_`-prefixed. **Required means the process refuses to
+start without it** — there are no defaults for anything that carries a
+security or economic decision (owner decision U6).
+
+## Shared by every process
+
+These must be **identical across all three binaries and all operators**. A
+disagreement here is not a misconfiguration that shows up as an error; it is
+two honest operators computing different canonical messages and refusing each
+other's proposals.
+
+| variable | meaning |
+|---|---|
+| `GLC_PROGRAM_ID_HEX` | the bridge program, 32 hex-encoded bytes |
+| `GLC_PROTOCOL_VERSION` | bound into every canonical message |
+| `GLC_SOLANA_RPC_URL`, `GLC_SOLANA_COMMITMENT` | this operator's own Solana access |
+| `GLC_VAULT_REDEEM_SCRIPT_HEX`, `GLC_VAULT_ADDRESS`, `GLC_VAULT_CHANGE_ADDRESS` | the P2SH vault; the address is re-derived from the script and a mismatch is refused at startup |
+| `GLC_VAULT_MIN_CONFIRMATIONS`, `GLC_WITHDRAWAL_CONFIRMATION_DEPTH` | how deep is deep enough, on the vault side and the payout side |
+| `GLC_WITHDRAWAL_DISCOVERY_COMMITMENT` | must be `finalized`; nothing else is accepted (ADR-0013 D5) |
+| `GLC_PAYOUT_FEE_RATE_PER_KB`, `GLC_PAYOUT_DUST_THRESHOLD_ATOMIC`, `GLC_PAYOUT_MAX_INPUTS`, `GLC_PAYOUT_RESERVATION_TIMEOUT_SECS` | payout construction policy; a signer checks an adopted proposal against **its own** copy, so these must match |
+| `GLC_FEDERATION_CA_CERT_PATH` | the pinned federation CA |
+
+## `glc-relayer`
+
+Holds no validator key and no vault key.
+
+| variable | required | meaning |
+|---|---|---|
+| `GLC_DB_PATH` | yes | this operator's own SQLite database |
+| `GLC_RPC_URL`, `GLC_RPC_USER`, `GLC_RPC_PASSWORD` | yes | this operator's Goldcoin node |
+| `GLC_CONFIRMATION_DEPTH` | yes | deposit confirmation depth |
+| `GLC_MAX_REORG_DEPTH` | yes | beyond this the indexer **halts** rather than guessing a fork point; widening it is the only way to clear a halt (runbook §2) |
+| `GLC_VALIDATOR_EPOCH` | yes | the epoch this relayer starts from |
+| `GLC_WRAPPED_MINT_HEX` | yes | the wrapped-GLC SPL mint |
+| `GLC_VAULT_SCRIPT_PUBKEY_HEX`, `GLC_VAULT_SIGNER_MAP` | yes | the vault's script and the validator-to-vault-key mapping |
+| `GLC_SOLANA_SUBMITTER_KEYPAIR_PATH` | yes | pays fees only; confers no authority |
+| `GLC_RELAYER_VALIDATOR_PUBKEY` | yes | this operator's federation identity, validated against the peer list at startup (ADR-0019 D1) |
+| `GLC_FEDERATION_PEERS` | yes | `base58pubkey@uri`, comma-separated; must not contain this operator |
+| `GLC_RELAYER_TLS_CERT_PATH`, `GLC_RELAYER_TLS_KEY_PATH`, `GLC_FEDERATION_TLS_DOMAIN` | yes | this process's client identity |
+| `GLC_FEDERATION_TLS` | no | `off` disables transport authentication entirely — loopback and regtest only, and loud on purpose |
+| `GLC_OPS_LISTEN_ADDR` | no | **unset means health and metrics are not exposed at all.** The endpoint has no authentication; bind it to a private interface |
+| `GLC_MAX_DEPOSIT_ATOMIC`, `GLC_ROLLING_WINDOW_CAP_ATOMIC`, `GLC_ROLLING_WINDOW_SECONDS` | no | per-deposit and rolling-window value caps |
+
+## `signer-server`
+
+The only process holding key material.
+
+| variable | required | meaning |
+|---|---|---|
+| `GLC_SIGNER_VALIDATOR_KEYPAIR_PATH` | yes | **the** validator ed25519 key. Exactly one; there is deliberately no multi-key form |
+| `GLC_SIGNER_LISTEN_ADDR` | yes | mTLS gRPC bind address |
+| `GLC_SIGNER_TLS_CERT_PATH`, `GLC_SIGNER_TLS_KEY_PATH` | yes | this signer's server identity |
+| `GLC_SIGNER_GLC_RPC_URL`, `GLC_SIGNER_GLC_RPC_USER`, `GLC_SIGNER_GLC_RPC_PASSWORD` | yes | **this signer's own** Goldcoin node — never the relayer's (ADR-0017 E2). A signer sharing the requester's node is not checking anything |
+| `GLC_SIGNER_VAULT_INDEX`, `GLC_SIGNER_VAULT_KEY_PATH` | yes | this signer's single vault key and its position; the process proves it holds that key before serving (E1) |
+| `GLC_DB_PATH` | yes | this operator's own database, written by their own indexer |
+| `GLC_SIGNER_GOVERNANCE_APPROVALS_PATH` | no | **unset means every governance request is refused**, so key rotation and supply-cap raises cannot be executed. Written by `glc-admin approve-*` |
+| `GLC_SIGNER_SWEEP_APPROVALS_PATH` | no | **unset means every vault sweep is refused.** Written by `glc-admin sweep-approve` |
+| `GLC_OPERATOR_INDEX`, `GLC_OPERATOR_COUNT` | no | this operator's place in a multi-operator federation (ADR-0019). Unset means single-operator behaviour |
+| `GLC_PAYOUT_BUILD_TIMEOUT_SECS`, `GLC_MINT_SUBMIT_TIMEOUT_SECS` | no | failover windows before a non-designated operator may act |
+
+## `glc-admin`
+
+A one-shot tool. Reads the shared set plus the federation transport
+variables, and additionally:
+
+| variable | required for | meaning |
+|---|---|---|
+| `GLC_ADMIN_KEYPAIR_PATH` | `pause`, `unpause`, `lower-tvl-cap` | the **interim single admin key** (custody #7, OPEN — see runbook §9) |
+| `GLC_SOLANA_SUBMITTER_KEYPAIR_PATH` | every governance submission | pays fees only |
+| `GLC_RPC_URL`, `GLC_RPC_USER`, `GLC_RPC_PASSWORD` | `sweep-execute` | the node that builds and broadcasts the sweep |
+| `GLC_DB_PATH` | recovery and sweep commands | this operator's own database |
+
+## The two that are easiest to get wrong
+
+**`GLC_SIGNER_GLC_RPC_URL` must not point at the relayer's node.** Both
+processes run on the same host and both need Goldcoin access, so pointing
+them at one node is the natural mistake. It defeats ADR-0017 E2: independent
+validation is the property that makes a signer's refusal meaningful.
+
+**`GLC_SIGNER_GOVERNANCE_APPROVALS_PATH` and `GLC_SIGNER_SWEEP_APPROVALS_PATH`
+are optional and fail closed.** Leaving them unset produces a federation that
+starts cleanly, serves deposits and payouts correctly, and cannot rotate its
+keys or escape a compromised vault. Nothing complains until the day it
+matters. Set them, and keep the files under the same protection as the keys
+beside them.
+
