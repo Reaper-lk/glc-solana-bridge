@@ -82,6 +82,10 @@ pub struct DecodedWithdrawal {
     pub status_tag: u8,
 }
 
+/// The on-chain `WithdrawalStatus::Completed` discriminant. Verified
+/// against a live account before being relied on (ADR-0018 §2.3).
+pub const STATUS_COMPLETED: u8 = 2;
+
 pub fn withdrawal_pda(program_id: &Pubkey, index: u64) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[SEED_WITHDRAWAL, &index.to_le_bytes()], program_id)
 }
@@ -195,6 +199,20 @@ pub async fn scan_withdrawals<R: crate::solana::rpc::SolanaRpc>(
     let mut out = Vec::with_capacity(accounts.len());
     for (address, account) in accounts {
         match decode_withdrawal(program_id, &address, &account.owner, &account.data) {
+            // Phase 7f (ADR-0018 D7): a withdrawal the chain says is
+            // Completed is definitely paid, so it is never ingested. This is
+            // the recoverability payoff — a relayer with an empty database
+            // reconstructs only the genuinely outstanding queue.
+            //
+            // The converse does NOT hold: a withdrawal the chain still
+            // reports Pending may be locally in flight, so on-chain status
+            // is a floor, never a replacement for local state.
+            Ok(w) if w.status_tag == STATUS_COMPLETED => {
+                tracing::debug!(
+                    withdrawal_index = w.index,
+                    "skipping a withdrawal already completed on-chain"
+                );
+            }
             Ok(w) => out.push(crate::glc::withdrawal_db::NewWithdrawalRequest {
                 withdrawal_index: w.index as i64,
                 pda: w.pda.to_bytes(),
@@ -223,6 +241,35 @@ pub async fn scan_withdrawals<R: crate::solana::rpc::SolanaRpc>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0018 D7: a withdrawal the chain says is Completed is definitely
+    /// paid, and must never be re-ingested.
+    #[test]
+    fn a_completed_withdrawal_decodes_but_carries_the_completed_tag() {
+        let program_id = Pubkey::new_unique();
+        let (pda, mut data) = build_account(&program_id, 0, 1_000, &addr());
+        data[8 + 113] = 2;
+        assert_eq!(STATUS_COMPLETED, 2, "matches the on-chain discriminant");
+        let w = decode_withdrawal(&program_id, &pda, &program_id, &data).unwrap();
+        assert_eq!(
+            w.status_tag, 2,
+            "the status byte must survive decoding — it is what discovery filters on"
+        );
+    }
+
+    #[test]
+    fn every_status_tag_round_trips_through_the_decoder() {
+        // Pending=0, Broadcast=1, Completed=2 — verified against a live
+        // account (ADR-0018 §2.3).
+        let program_id = Pubkey::new_unique();
+        for tag in [0u8, 1, 2] {
+            let (pda, mut data) = build_account(&program_id, 0, 1_000, &addr());
+            data[8 + 113] = tag;
+            let w = decode_withdrawal(&program_id, &pda, &program_id, &data).unwrap();
+            assert_eq!(w.status_tag, tag);
+        }
+    }
+
     use crate::withdrawal::address::encode_p2pkh;
 
     fn build_account(
@@ -413,6 +460,73 @@ mod tests {
         assert_eq!(found[0].pda, good_pda.to_bytes());
         assert_eq!(found[0].observed_at, 10);
         assert_eq!(found[0].observed_at_slot, 20);
+    }
+
+    /// ADR-0018 D7 — the recoverability payoff. A relayer with an empty
+    /// database must reconstruct only the genuinely OUTSTANDING queue.
+    #[tokio::test]
+    async fn scan_skips_withdrawals_already_completed_on_chain() {
+        use crate::solana::rpc::{SolanaRpc, SolanaRpcError};
+        use solana_sdk::account::Account;
+        use solana_sdk::commitment_config::CommitmentLevel;
+
+        let pid = Pubkey::new_unique();
+        let (pending_pda, pending) = build_account(&pid, 1, 500, &addr());
+        let (completed_pda, mut completed) = build_account(&pid, 2, 700, &addr());
+        // A LITERAL 2, not the constant: seeding from the same value the
+        // code compares against would make this test move with any change
+        // to it, and the discriminant is a fact about the on-chain program
+        // (verified against a live account), not one this crate chooses.
+        completed[8 + 113] = 2;
+        // A Broadcast withdrawal is NOT finished: only Completed is skipped.
+        let (broadcast_pda, mut broadcast) = build_account(&pid, 3, 900, &addr());
+        broadcast[8 + 113] = 1;
+
+        struct Mock(Vec<(Pubkey, Account)>);
+        impl SolanaRpc for Mock {
+            async fn get_account(&self, _: &Pubkey) -> Result<Option<Account>, SolanaRpcError> {
+                unreachable!()
+            }
+            async fn get_latest_blockhash(&self) -> Result<solana_sdk::hash::Hash, SolanaRpcError> {
+                unreachable!()
+            }
+            async fn send_transaction(
+                &self,
+                _: &solana_sdk::transaction::Transaction,
+            ) -> Result<solana_sdk::signature::Signature, SolanaRpcError> {
+                unreachable!()
+            }
+            async fn get_program_accounts_sized(
+                &self,
+                _: &Pubkey,
+                _: u64,
+                _: CommitmentLevel,
+            ) -> Result<Vec<(Pubkey, Account)>, SolanaRpcError> {
+                Ok(self.0.clone())
+            }
+        }
+        let acct = |data: Vec<u8>| Account {
+            lamports: 1,
+            data,
+            owner: pid,
+            executable: false,
+            rent_epoch: 0,
+        };
+        let mock = Mock(vec![
+            (pending_pda, acct(pending)),
+            (completed_pda, acct(completed)),
+            (broadcast_pda, acct(broadcast)),
+        ]);
+
+        let found = scan_withdrawals(&mock, &pid, CommitmentLevel::Finalized, 10, 20)
+            .await
+            .unwrap();
+        let indices: Vec<i64> = found.iter().map(|w| w.withdrawal_index).collect();
+        assert_eq!(
+            indices,
+            vec![1, 3],
+            "Completed is skipped; Pending and Broadcast are still outstanding"
+        );
     }
 
     #[test]

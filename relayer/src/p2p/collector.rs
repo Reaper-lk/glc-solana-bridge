@@ -388,6 +388,107 @@ impl GrpcCollector {
         PartialRound { partials, round }
     }
 
+    /// Collects **completion attestations** from the federation (Phase 7f,
+    /// ADR-0018).
+    ///
+    /// Unlike a payout, completion has no designated quorum: any M
+    /// validators who have independently confirmed the payout may attest,
+    /// because the on-chain proof does not depend on *which* M signed. So
+    /// this asks everyone, with Phase 7d's ordering, timeouts, and failover
+    /// unchanged.
+    pub async fn collect_completion_signatures(
+        &self,
+        epoch: u64,
+        withdrawal_index: u64,
+        payout_txid: [u8; 32],
+        payout_height: u64,
+        message: &[u8],
+    ) -> Round {
+        let identities: Vec<Pubkey> = self.peers.iter().map(|p| p.validator_pubkey).collect();
+        let mut round = Round::new();
+        let deadline = tokio::time::Instant::now() + ROUND_TIMEOUT;
+        let threshold = self.peers.len();
+        let seed =
+            withdrawal_index ^ u64::from_le_bytes(payout_txid[..8].try_into().unwrap_or([0u8; 8]));
+
+        for pubkey in ask_order(&identities, seed) {
+            if round.reached(threshold) {
+                break;
+            }
+            let Some(peer) = self.peers.iter().find(|p| p.validator_pubkey == pubkey) else {
+                continue;
+            };
+            if tokio::time::Instant::now() >= deadline {
+                round.record(
+                    pubkey,
+                    PeerOutcome::Unavailable("round timeout".to_string()),
+                );
+                continue;
+            }
+            let req = pb::CompletionSignRequest {
+                request_id: Self::next_request_id(),
+                epoch,
+                withdrawal_index,
+                payout_txid: payout_txid.to_vec(),
+                payout_height,
+                expiry_unix: crate::p2p::service::now_unix() + REQUEST_TTL_SECONDS,
+            };
+            let outcome = self.ask_completion(peer, req, message).await;
+            if let PeerOutcome::Refused(why) = &outcome {
+                tracing::warn!(
+                    peer = %pubkey,
+                    withdrawal_index,
+                    reason = %why,
+                    "peer refused to attest completion — it has not confirmed this payout"
+                );
+            }
+            round.record(pubkey, outcome);
+        }
+        tracing::info!(
+            withdrawal_index,
+            summary = %round.summary(),
+            "completion attestation collection round"
+        );
+        round
+    }
+
+    async fn ask_completion(
+        &self,
+        peer: &PeerEndpoint,
+        req: pb::CompletionSignRequest,
+        message: &[u8],
+    ) -> PeerOutcome {
+        let mut client = match self.connect(&peer.uri).await {
+            Ok(c) => c,
+            Err(e) => return PeerOutcome::Unavailable(e),
+        };
+        match tokio::time::timeout(PER_PEER_TIMEOUT, client.sign_completion(req)).await {
+            Err(_) => PeerOutcome::Unavailable("per-peer timeout".to_string()),
+            Ok(Err(status)) => {
+                if status.code() == tonic::Code::FailedPrecondition {
+                    PeerOutcome::Refused(status.message().to_string())
+                } else {
+                    PeerOutcome::Unavailable(status.to_string())
+                }
+            }
+            Ok(Ok(resp)) => {
+                let r = resp.into_inner();
+                // Reuses the mint path's acceptance check verbatim: the
+                // response must come from the registered identity AND its
+                // signature must verify over the message we asked about.
+                let as_sign = pb::SignResponse {
+                    request_id: r.request_id,
+                    validator_pubkey: r.validator_pubkey,
+                    signature: r.signature,
+                };
+                match Self::accept(&peer.validator_pubkey, message, as_sign) {
+                    Ok((_, sig)) => PeerOutcome::Signed(sig),
+                    Err(why) => PeerOutcome::Unavailable(why),
+                }
+            }
+        }
+    }
+
     async fn ask_payout(
         &self,
         peer: &PeerEndpoint,

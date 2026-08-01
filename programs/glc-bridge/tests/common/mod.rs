@@ -701,3 +701,56 @@ pub fn get_withdrawal(svm: &LiteSVM, index: u64) -> WithdrawalRequest {
         .expect("withdrawal record must exist");
     WithdrawalRequest::try_deserialize(&mut account.data.as_slice()).unwrap()
 }
+
+/// Canonical withdrawal-completion message for THIS deployment (ADR-0018).
+///
+/// `dest_commitment` is sha256 over the address bytes exactly as the account
+/// stores them — the program never decodes base58, so neither does this.
+pub fn completion_message(
+    epoch: u64,
+    index: u64,
+    payout_txid: &[u8; 32],
+    payout_height: u64,
+    amount: u64,
+    glc_address: &[u8],
+) -> Vec<u8> {
+    let dest_commitment: [u8; 32] = anchor_lang::solana_program::hash::hash(glc_address).to_bytes();
+    glc_bridge_shared::claim::withdrawal_completion_message(
+        PROTOCOL_VERSION,
+        &glc_bridge::ID.to_bytes(),
+        epoch,
+        index,
+        payout_txid,
+        payout_height,
+        amount,
+        &dest_commitment,
+    )
+    .to_vec()
+}
+
+pub fn complete_withdrawal_ix(
+    submitter: &Pubkey,
+    index: u64,
+    payout_txid: [u8; 32],
+    payout_height: u64,
+    epoch: u64,
+) -> Instruction {
+    Instruction {
+        program_id: glc_bridge::ID,
+        accounts: glc_bridge::accounts::CompleteWithdrawal {
+            submitter: *submitter,
+            bridge_config: config_pda(),
+            validator_set: validator_set_pda(),
+            withdrawal: withdrawal_pda(index),
+            instructions_sysvar: solana_sdk::sysvar::instructions::ID,
+        }
+        .to_account_metas(None),
+        data: glc_bridge::instruction::CompleteWithdrawal {
+            index,
+            payout_txid,
+            payout_height,
+            epoch,
+        }
+        .data(),
+    }
+}

@@ -127,4 +127,16 @@ pub mod glc_bridge {
     ) -> Result<()> {
         instructions::burn_wrapped(ctx, amount, glc_address)
     }
+
+    /// Records, under an M-of-N federation proof, that a withdrawal was paid
+    /// on Goldcoin (Phase 7f, ADR-0018). Terminal and irreversible.
+    pub fn complete_withdrawal(
+        ctx: Context<CompleteWithdrawal>,
+        index: u64,
+        payout_txid: [u8; 32],
+        payout_height: u64,
+        epoch: u64,
+    ) -> Result<()> {
+        instructions::complete_withdrawal(ctx, index, payout_txid, payout_height, epoch)
+    }
 }

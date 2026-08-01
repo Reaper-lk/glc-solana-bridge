@@ -101,3 +101,15 @@ pub struct GovernanceActionCancelled {
     pub action: u8,
     pub eta: i64,
 }
+
+/// A withdrawal was threshold-confirmed as paid on Goldcoin (Phase 7f,
+/// ADR-0018). Carries the payout identity so an observer can verify the
+/// claim against the Goldcoin chain independently.
+#[event]
+pub struct WithdrawalCompleted {
+    pub index: u64,
+    pub payout_txid: [u8; 32],
+    pub payout_height: u64,
+    pub amount: u64,
+    pub epoch: u64,
+}

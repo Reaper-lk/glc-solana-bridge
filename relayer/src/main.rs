@@ -48,10 +48,13 @@ use glc_relayer::solana::config::{RawSolanaConfig, SolanaConfig};
 use glc_relayer::solana::epoch::{observe_epoch, run_epoch_refresher, EpochObservation};
 use glc_relayer::solana::rpc::RealSolanaRpc;
 use glc_relayer::withdrawal::adapter::RealPayoutRpc;
+use glc_relayer::withdrawal::completion::{CompletionError, CompletionSubmitter};
 use glc_relayer::withdrawal::config::{RawWithdrawalConfig, WithdrawalConfig};
 use glc_relayer::withdrawal::discovery;
 use glc_relayer::withdrawal::executor::{ExecutorError, WithdrawalExecutor};
-use glc_relayer::withdrawal::federation::{FederationPayoutCollector, VaultSignerMap};
+use glc_relayer::withdrawal::federation::{
+    FederationCompletionCollector, FederationPayoutCollector, VaultSignerMap,
+};
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -292,6 +295,50 @@ async fn withdrawal_tick(
     Ok(())
 }
 
+/// The completion service's tick loop (Phase 7f, ADR-0018).
+///
+/// Falling short of threshold is an ordinary outcome here, not an error:
+/// peers that have not yet confirmed the payout at the required depth
+/// correctly refuse, and the next pass tries again.
+async fn run_completion_loop(
+    mut submitter: CompletionSubmitter<RealSolanaRpc, FederationCompletionCollector>,
+    poll_interval: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                tracing::info!("completion loop: shutdown signal received, exiting");
+                return Ok(());
+            }
+            result = submitter.tick() => {
+                match result {
+                    Ok(report) => {
+                        if report.submitted > 0 || report.reconciled > 0 || report.skipped > 0 {
+                            tracing::info!(
+                                submitted = report.submitted,
+                                reconciled = report.reconciled,
+                                insufficient = report.insufficient,
+                                skipped = report.skipped,
+                                "completion tick"
+                            );
+                        }
+                        tokio::time::sleep(poll_interval).await;
+                    }
+                    Err(CompletionError::Db(e)) => {
+                        tracing::error!(error = %e, "completion database error — exiting");
+                        return Err(e.into());
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "completion tick failed; retrying next tick");
+                        tokio::time::sleep(poll_interval).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Builds the peer collector from configuration (Phase 7d).
 ///
 /// `GLC_FEDERATION_PEERS` is comma-separated `base58pubkey@uri`: the pubkey
@@ -461,6 +508,7 @@ async fn main() -> anyhow::Result<()> {
     let poll_interval = Duration::from_millis(config.poll_interval_ms);
     let unavailable_interval = Duration::from_millis(config.node_unavailable_retry_interval_ms);
     let program_id_bytes = config.program_id;
+    let config_protocol_version = config.protocol_version;
     let db_path = config.db_path.clone();
     let indexer = Indexer::new(rpc, db, config);
 
@@ -552,6 +600,21 @@ async fn main() -> anyhow::Result<()> {
     );
     let discovery_rpc = RealSolanaRpc::new(solana_config.rpc_url.clone(), solana_config.commitment);
 
+    // Fourth service: recording completed payouts on Solana (Phase 7f,
+    // ADR-0018). Runs on its own tick so a Solana outage never stalls
+    // Goldcoin payouts, and vice versa.
+    let completion_submitter = CompletionSubmitter::new(
+        Db::open(&db_path)?,
+        RealSolanaRpc::new(solana_config.rpc_url.clone(), solana_config.commitment),
+        FederationCompletionCollector::new(collector_from_env()?),
+        solana_config.program_id,
+        read_keypair_file(&solana_config.submitter_keypair_path).map_err(|e| {
+            anyhow::anyhow!("failed to read submitter keypair for completions: {e}")
+        })?,
+        config_protocol_version,
+        std::sync::Arc::clone(&epoch_observation),
+    );
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let epoch_task = tokio::spawn(run_epoch_refresher(
         RealSolanaRpc::new(solana_config.rpc_url.clone(), solana_config.commitment),
@@ -568,6 +631,11 @@ async fn main() -> anyhow::Result<()> {
     let mut orchestrator_task = tokio::spawn(run_orchestrator_loop(
         orchestrator,
         orchestrator_poll_interval,
+        shutdown_rx.clone(),
+    ));
+    let mut completion_task = tokio::spawn(run_completion_loop(
+        completion_submitter,
+        withdrawal_poll_interval,
         shutdown_rx.clone(),
     ));
     let mut withdrawal_task = tokio::spawn(run_withdrawal_loop(
@@ -588,7 +656,7 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("shutdown signal received, stopping all three services");
             let _ = shutdown_tx.send(true);
             let (i, o, w) = tokio::join!(indexer_task, orchestrator_task, withdrawal_task);
-            let _ = epoch_task.await;
+            let _ = tokio::join!(epoch_task, completion_task);
             i??;
             o??;
             w??;
@@ -596,21 +664,28 @@ async fn main() -> anyhow::Result<()> {
         result = &mut indexer_task => {
             tracing::error!("indexer loop exited, stopping the other services");
             let _ = shutdown_tx.send(true);
-            let _ = tokio::join!(orchestrator_task, withdrawal_task);
+            let _ = tokio::join!(orchestrator_task, withdrawal_task, completion_task);
             let _ = epoch_task.await;
             result??;
         }
         result = &mut orchestrator_task => {
             tracing::error!("orchestrator loop exited, stopping the other services");
             let _ = shutdown_tx.send(true);
-            let _ = tokio::join!(indexer_task, withdrawal_task);
+            let _ = tokio::join!(indexer_task, withdrawal_task, completion_task);
+            let _ = epoch_task.await;
+            result??;
+        }
+        result = &mut completion_task => {
+            tracing::error!("completion loop exited, stopping the other services");
+            let _ = shutdown_tx.send(true);
+            let _ = tokio::join!(indexer_task, orchestrator_task, withdrawal_task);
             let _ = epoch_task.await;
             result??;
         }
         result = &mut withdrawal_task => {
             tracing::error!("withdrawal loop exited, stopping the other services");
             let _ = shutdown_tx.send(true);
-            let _ = tokio::join!(indexer_task, orchestrator_task);
+            let _ = tokio::join!(indexer_task, orchestrator_task, completion_task);
             let _ = epoch_task.await;
             result??;
         }

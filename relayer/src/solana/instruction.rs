@@ -114,6 +114,65 @@ pub fn mint_wrapped_instruction(
     }
 }
 
+/// The accounts `complete_withdrawal` reads and writes (Phase 7f,
+/// ADR-0018). Five, versus `mint_wrapped`'s eleven — which is why the
+/// completion transaction fits two more signatures.
+pub struct CompleteWithdrawalAccounts {
+    /// Pays fees only; confers no authority (the federation proof does).
+    pub submitter: Pubkey,
+    pub bridge_config: Pubkey,
+    pub validator_set: Pubkey,
+    pub withdrawal: Pubkey,
+}
+
+/// Derives a withdrawal record's PDA. Mirrors the on-chain seeds exactly.
+pub fn withdrawal_pda(program_id: &Pubkey, index: u64) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"withdrawal", &index.to_le_bytes()], program_id)
+}
+
+/// Hand-builds the `complete_withdrawal` instruction.
+///
+/// Hand-built rather than generated, like every other instruction here:
+/// owner decision R1 keeps this workspace free of `anchor-lang` (ADR-0012).
+pub fn complete_withdrawal_instruction(
+    program_id: &Pubkey,
+    accounts: &CompleteWithdrawalAccounts,
+    index: u64,
+    payout_txid: [u8; 32],
+    payout_height: u64,
+    epoch: u64,
+) -> Instruction {
+    let mut data = Vec::with_capacity(8 + 8 + 32 + 8 + 8);
+    data.extend_from_slice(&anchor_discriminator("complete_withdrawal"));
+    data.extend_from_slice(&index.to_le_bytes());
+    data.extend_from_slice(&payout_txid);
+    data.extend_from_slice(&payout_height.to_le_bytes());
+    data.extend_from_slice(&epoch.to_le_bytes());
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(accounts.submitter, true),
+            AccountMeta::new_readonly(accounts.bridge_config, false),
+            AccountMeta::new_readonly(accounts.validator_set, false),
+            AccountMeta::new(accounts.withdrawal, false),
+            AccountMeta::new_readonly(INSTRUCTIONS_SYSVAR_ID, false),
+        ],
+        data,
+    }
+}
+
+/// The destination commitment bound into a completion message (ADR-0018 D2):
+/// `sha256` over the withdrawal's Goldcoin address **exactly as the on-chain
+/// account stores it**.
+///
+/// Hashing the stored bytes rather than a decoded `hash160` is what lets the
+/// program stay ignorant of address formats — so this must hash the same
+/// bytes, never a re-encoded or normalised form.
+pub fn destination_commitment(glc_address_bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(glc_address_bytes).into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

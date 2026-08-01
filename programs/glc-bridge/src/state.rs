@@ -333,7 +333,58 @@ pub struct WithdrawalRequest {
     pub reserved: [u8; 48],
 }
 
+/// Byte offsets of the payout record inside [`WithdrawalRequest::reserved`]
+/// (ADR-0018 D5). Verified against a live account before adoption: the field
+/// is 48 bytes and all-zero until completion writes to it, so recording the
+/// payout needs no migration and no `PROTOCOL_VERSION` bump.
+const PAYOUT_TXID_OFFSET: usize = 0;
+const PAYOUT_TXID_LEN: usize = 32;
+const PAYOUT_HEIGHT_OFFSET: usize = 32;
+const PAYOUT_HEIGHT_LEN: usize = 8;
+/// 32 + 8 = 40 of the 48 available bytes; the remaining 8 stay zero and stay
+/// reserved.
+const PAYOUT_RECORD_LEN: usize = PAYOUT_TXID_LEN + PAYOUT_HEIGHT_LEN;
+
 impl WithdrawalRequest {
+    /// The recorded Goldcoin payout, or `None` while the withdrawal is not
+    /// completed.
+    ///
+    /// Reads from `reserved` rather than adding fields, so the account
+    /// layout — and therefore every existing decoder, including the
+    /// relayer's — is unchanged.
+    pub fn payout_record(&self) -> Option<([u8; 32], u64)> {
+        if self.status != WithdrawalStatus::Completed {
+            return None;
+        }
+        let mut txid = [0u8; PAYOUT_TXID_LEN];
+        txid.copy_from_slice(
+            &self.reserved[PAYOUT_TXID_OFFSET..PAYOUT_TXID_OFFSET + PAYOUT_TXID_LEN],
+        );
+        let mut height = [0u8; PAYOUT_HEIGHT_LEN];
+        height.copy_from_slice(
+            &self.reserved[PAYOUT_HEIGHT_OFFSET..PAYOUT_HEIGHT_OFFSET + PAYOUT_HEIGHT_LEN],
+        );
+        Some((txid, u64::from_le_bytes(height)))
+    }
+
+    /// Whether the payout region is still untouched.
+    ///
+    /// Checked before writing: a non-zero region on a `Pending` withdrawal
+    /// means an unknown migration has already assigned meaning to these
+    /// bytes, and overwriting them blindly would destroy whatever it wrote.
+    pub fn payout_record_is_unset(&self) -> bool {
+        self.reserved[..PAYOUT_RECORD_LEN].iter().all(|b| *b == 0)
+    }
+
+    /// Writes the payout record. Callers must have verified the federation
+    /// proof and that the record is unset.
+    pub fn set_payout_record(&mut self, payout_txid: &[u8; 32], payout_height: u64) {
+        self.reserved[PAYOUT_TXID_OFFSET..PAYOUT_TXID_OFFSET + PAYOUT_TXID_LEN]
+            .copy_from_slice(payout_txid);
+        self.reserved[PAYOUT_HEIGHT_OFFSET..PAYOUT_HEIGHT_OFFSET + PAYOUT_HEIGHT_LEN]
+            .copy_from_slice(&payout_height.to_le_bytes());
+    }
+
     /// 8 (discriminator) + 8 + 8 + 32 + 64 + 1 + 1 + 8 + 1 + 1 + 48 = 180.
     pub const SPACE: usize = 8 // Anchor discriminator
         + 8 // index

@@ -26,6 +26,14 @@ service FederationSigner {
   // confused.
   rpc SignPayout(PayoutSignRequest) returns (PayoutSignResponse);
 
+  // Requests this validator's ed25519 signature attesting that a
+  // withdrawal was paid on Goldcoin (Phase 7f, ADR-0018).
+  //
+  // Distinct from Sign because the responder must verify a GOLDCOIN fact —
+  // that a specific payout is confirmed at depth — before it will sign,
+  // which is a different check from re-deriving a deposit claim.
+  rpc SignCompletion(CompletionSignRequest) returns (CompletionSignResponse);
+
   // Liveness and identity probe, used to decide quorum availability BEFORE
   // designating one (ADR-0015: reassignment must be explicit, so the
   // executor prefers to designate a quorum it believes is reachable).
@@ -132,4 +140,30 @@ message PayoutSignResponse {
   // that input's sighash, which is a stronger guarantee than any
   // transport-level attestation could give.
   repeated bytes signatures = 4;
+}
+
+// A request for one validator's attestation that a withdrawal was paid
+// (Phase 7f, ADR-0018).
+//
+// Completion is TERMINAL on-chain, so nothing here is trusted: the
+// responder checks the payout against its own Goldcoin node at the
+// configured confirmation depth and refuses anything it cannot confirm.
+message CompletionSignRequest {
+  bytes request_id = 1;
+  uint64 epoch = 2;
+  uint64 withdrawal_index = 3;
+  // The Goldcoin payout being attested, in INTERNAL byte order (as it
+  // appears in the canonical message), and the height it was mined at.
+  // Both are COMPARED against the responder's own observation.
+  bytes payout_txid = 4;
+  uint64 payout_height = 5;
+  int64 expiry_unix = 6;
+}
+
+message CompletionSignResponse {
+  bytes request_id = 1;
+  bytes validator_pubkey = 2;
+  // ed25519 signature over the canonical completion message the responder
+  // built from ITS OWN state — never from the request.
+  bytes signature = 3;
 }

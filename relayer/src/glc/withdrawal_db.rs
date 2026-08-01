@@ -29,6 +29,24 @@ use super::hex;
 /// `quorum_attempt` makes an explicit reassignment produce a different
 /// commitment; `superseded_at` records that a previous attempt existed
 /// rather than overwriting it, so reassignment is auditable.
+/// Schema v6 (Phase 7f, ADR-0018): records that a payout has been confirmed
+/// **on Solana** as well as on Goldcoin.
+///
+/// Deliberately a column on the payout row rather than a new withdrawal
+/// state: the on-chain account's status is authoritative (checked every
+/// tick, exactly as the mint path checks the claim PDA), and this only
+/// records what has already been observed so a completed withdrawal stops
+/// being re-examined forever.
+pub(super) fn apply_v6_schema(tx: &rusqlite::Transaction) -> Result<(), DbError> {
+    tx.execute_batch(
+        "
+        ALTER TABLE withdrawal_payouts ADD COLUMN onchain_completed_at INTEGER;
+        ALTER TABLE withdrawal_payouts ADD COLUMN onchain_completion_signature TEXT;
+        ",
+    )?;
+    Ok(())
+}
+
 pub(super) fn apply_v5_schema(tx: &rusqlite::Transaction) -> Result<(), DbError> {
     tx.execute_batch(
         "
@@ -1578,6 +1596,59 @@ fn row_to_payout(r: &rusqlite::Row) -> rusqlite::Result<PayoutRow> {
     })
 }
 
+impl Db {
+    /// Withdrawals whose payout is locally `Completed` but which have not
+    /// yet been observed completed on Solana (ADR-0018 D7).
+    pub fn payouts_awaiting_onchain_completion(&self) -> Result<Vec<i64>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT w.withdrawal_index
+             FROM withdrawal_requests w
+             JOIN withdrawal_payouts p ON p.withdrawal_index = w.withdrawal_index
+             WHERE w.state = 'Completed'
+               AND p.onchain_completed_at IS NULL
+             ORDER BY w.withdrawal_index",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Records that the on-chain account now reads `Completed`.
+    ///
+    /// `signature` is `None` when the completion was observed rather than
+    /// submitted by this relayer — another operator may have got there
+    /// first, which is normal and not an error.
+    pub fn record_onchain_completion(
+        &mut self,
+        index: i64,
+        signature: Option<&str>,
+        at: i64,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE withdrawal_payouts
+             SET onchain_completed_at = ?1, onchain_completion_signature = ?2
+             WHERE withdrawal_index = ?3",
+            params![at, signature, index],
+        )?;
+        Ok(())
+    }
+
+    /// Whether this withdrawal has been observed completed on Solana.
+    pub fn is_onchain_completed(&self, index: i64) -> Result<bool, DbError> {
+        let at: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT onchain_completed_at FROM withdrawal_payouts WHERE withdrawal_index = ?1",
+                params![index],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(at.is_some())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1706,9 +1777,9 @@ mod tests {
     }
 
     #[test]
-    fn schema_is_at_v5_and_withdrawal_tables_exist() {
+    fn schema_is_at_v6_and_withdrawal_tables_exist() {
         let db = mem_db();
-        assert_eq!(db.schema_version().unwrap(), 5);
+        assert_eq!(db.schema_version().unwrap(), 6);
         for t in [
             "withdrawal_requests",
             "withdrawal_payouts",

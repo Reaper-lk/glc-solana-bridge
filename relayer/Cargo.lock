@@ -1556,6 +1556,7 @@ name = "glc-relayer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "glc-bridge-shared",
  "libsecp256k1",
  "prost",

@@ -8,6 +8,12 @@ this way.
 
 Each operator runs **two** processes:
 
+> **Phase 7f:** withdrawals are now marked `Completed` on Solana under an
+> M-of-N federation proof, so a relayer starting from an **empty database**
+> can tell paid from unpaid by reading chain state
+> ([ADR-0018](adr/0018-withdrawal-completion.md)). Completion is
+> **irreversible**: there is no un-complete instruction, deliberately.
+
 | process | holds | listens | talks to |
 |---|---|---|---|
 | `signer-server` | **the** validator ed25519 key **and this operator's single vault key** — the only keys in the deployment | mTLS gRPC | its **own** Solana RPC and its **own** Goldcoin RPC |
@@ -75,6 +81,24 @@ request**; if it is set, all of the following are required.
 | `GLC_SIGNER_VAULT_INDEX` | this signer's position in the vault's ordered signer list |
 | `GLC_SIGNER_VAULT_KEY_PATH` | file containing this signer's WIF vault key — **one key** |
 | `GLC_SIGNER_GLC_RPC_URL` / `_USER` / `_PASSWORD` | **this signer's own Goldcoin node** |
+
+### Completion attestation (Phase 7f)
+
+`GLC_WITHDRAWAL_CONFIRMATION_DEPTH` and `GLC_PROTOCOL_VERSION` enable the
+completion arm. Without the depth set, the signer **refuses every completion
+request** and logs a warning at startup.
+
+There is deliberately **no separate completion depth** (ADR-0018 Q2): the
+depth that governs treating a payout as confirmed locally is the same one
+that gates a completion signature. Two knobs could be configured
+inconsistently, and the dangerous direction is silent — an operator could
+complete on-chain something they do not consider confirmed locally, and
+nothing would report the contradiction.
+
+The completion arm uses the **same** Goldcoin node as the payout arm, and
+for the same reason: a completion attestation is the last word on whether a
+payment happened, so inheriting the requester's view would make the check
+circular.
 
 Startup **proves** the key on disk is the key the vault expects at
 `GLC_SIGNER_VAULT_INDEX`, and aborts on any mismatch. A misconfigured
@@ -145,6 +169,7 @@ apparent agreement by counting one party twice.
 | signature | that validator independently derived the same bytes | — |
 | **refusal** | that validator's view of the chain **disagrees with yours** | **no** — asking again gets the same answer |
 | payout shortfall | a designated signer did not answer | yes, but see below |
+| completion shortfall | peers have not yet confirmed the payout at depth | yes — ordinary, not an alarm |
 | unavailable | unreachable, timed out, throttled, or answered unusably | yes, next tick |
 
 A refusal is an alarm, not noise. It means two operators' independent views
