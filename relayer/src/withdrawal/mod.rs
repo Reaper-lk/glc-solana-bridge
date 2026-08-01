@@ -18,6 +18,7 @@ pub mod adapter;
 pub mod address;
 pub mod builder;
 pub mod coin;
+pub mod completion;
 pub mod config;
 pub mod discovery;
 pub mod executor;

@@ -97,6 +97,7 @@ tonic-build = "0.13"
 protoc-bin-vendored = "3"
 
 [dev-dependencies]
+bincode = "1"
 libsecp256k1 = "0.6"
 # Test-only certificate authority, so the mTLS transport is verified against
 # real certificates rather than assumed to work (Phase 7d).

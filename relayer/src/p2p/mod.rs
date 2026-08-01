@@ -37,9 +37,11 @@
 //! | [`collector`] | the client: mTLS, timeouts, failover |
 //! | [`ratelimit`] | per-peer request limits, so one peer cannot starve the rest |
 //! | [`payout_view`] | what this validator will sign for a vault payout (7e) |
+//! | [`completion_view`] | what this validator will attest a completion for (7f) |
 
 pub mod aggregation;
 pub mod collector;
+pub mod completion_view;
 pub mod identity;
 pub mod payout_view;
 pub mod policy;

@@ -329,6 +329,44 @@ impl PayoutPartialCollector for InProcessPayoutCollector {
     }
 }
 
+/// Collects completion attestations over the federation transport
+/// (Phase 7f, ADR-0018).
+///
+/// Unlike payouts, completion has no designated quorum: the on-chain proof
+/// does not depend on which M validators signed, so any M who have
+/// independently confirmed the payout may attest.
+pub struct FederationCompletionCollector {
+    collector: GrpcCollector,
+}
+
+impl FederationCompletionCollector {
+    pub fn new(collector: GrpcCollector) -> Self {
+        FederationCompletionCollector { collector }
+    }
+}
+
+impl crate::withdrawal::completion::CompletionSignatureCollector for FederationCompletionCollector {
+    async fn collect_completion_signatures(
+        &self,
+        epoch: u64,
+        withdrawal_index: u64,
+        payout_txid: [u8; 32],
+        payout_height: u64,
+        message: &[u8],
+    ) -> Vec<(Pubkey, solana_sdk::signature::Signature)> {
+        self.collector
+            .collect_completion_signatures(
+                epoch,
+                withdrawal_index,
+                payout_txid,
+                payout_height,
+                message,
+            )
+            .await
+            .signatures
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

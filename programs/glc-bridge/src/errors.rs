@@ -75,4 +75,16 @@ pub enum BridgeError {
     GovernanceTimelockNotElapsed,
     #[msg("Pending governance action was approved under a different validator-set epoch")]
     StaleGovernanceProposal,
+
+    // ---- Withdrawal completion (Phase 7f, ADR-0018) ----
+    #[msg("Withdrawal is already completed; completion is terminal and irreversible")]
+    WithdrawalAlreadyCompleted,
+    #[msg("Withdrawal is not in the Pending state and cannot be completed")]
+    WithdrawalNotPending,
+    #[msg("Withdrawal's reserved payout region is not empty; refusing to overwrite it")]
+    PayoutRecordAlreadySet,
+    #[msg("Payout txid must not be all zeroes")]
+    ZeroPayoutTxid,
+    #[msg("Payout block height must be greater than zero")]
+    ZeroPayoutHeight,
 }

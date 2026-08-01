@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use solana_sdk::signature::{Keypair, Signer as _};
 use tonic::{Request, Response, Status};
 
+use super::completion_view::{CompletionRefusal, CompletionView};
 use super::payout_view::{PartialSigner, PayoutRefusal, PayoutView};
 use super::policy::{
     self, Action, Decision, LocalView, Refusal, SeenSet, SigningIdentity, SigningRequest,
@@ -33,6 +34,7 @@ pub mod pb {
 }
 
 use pb::federation_signer_server::FederationSigner;
+use pb::{CompletionSignRequest, CompletionSignResponse};
 use pb::{
     HealthRequest, HealthResponse, PayoutSignRequest, PayoutSignResponse, SignRequest, SignResponse,
 };
@@ -80,6 +82,46 @@ pub struct SignerService<V: LocalView + Send + Sync + 'static> {
     /// outright — the correct behaviour for a validator that holds no vault
     /// key, and a fail-closed default rather than a silent no-op.
     payout: Option<PayoutArm>,
+    /// The completion-attestation arm (Phase 7f, ADR-0018). `None` refuses
+    /// completion requests, for the same fail-closed reason.
+    completion: Option<CompletionArm>,
+}
+
+/// The completion-attestation half of a signer. Needs its own database
+/// handle and its own Goldcoin node, like the payout arm.
+struct CompletionArm {
+    view: Box<dyn ErasedCompletionView>,
+    db: Arc<tokio::sync::Mutex<Db>>,
+    /// The program this deployment targets, bound into every attestation so
+    /// a signature cannot be replayed against a different bridge.
+    program_id: [u8; 32],
+    protocol_version: u8,
+}
+
+#[tonic::async_trait]
+trait ErasedCompletionView: Send + Sync {
+    async fn attest(
+        &self,
+        db: &mut Db,
+        withdrawal_index: u64,
+        payout_txid: [u8; 32],
+        payout_height: u64,
+    ) -> Result<super::completion_view::CompletionAttestation, CompletionRefusal>;
+}
+
+#[tonic::async_trait]
+impl<R: crate::withdrawal::executor::PayoutRpc + Send + Sync + 'static> ErasedCompletionView
+    for CompletionView<R>
+{
+    async fn attest(
+        &self,
+        db: &mut Db,
+        withdrawal_index: u64,
+        payout_txid: [u8; 32],
+        payout_height: u64,
+    ) -> Result<super::completion_view::CompletionAttestation, CompletionRefusal> {
+        CompletionView::attest(self, db, withdrawal_index, payout_txid, payout_height).await
+    }
 }
 
 /// The vault-signing half of a signer, kept separate because it is optional
@@ -161,7 +203,107 @@ impl<V: LocalView + Send + Sync + 'static> SignerService<V> {
                 burst,
             ))),
             payout: None,
+            completion: None,
         }
+    }
+
+    /// Attaches the completion-attestation arm (Phase 7f, ADR-0018).
+    ///
+    /// `db` and the view's Goldcoin node must both be **this validator's
+    /// own** — a completion attestation is the last word on whether a
+    /// payment happened, so inheriting the requester's view would make the
+    /// check circular.
+    pub fn with_completion_arm<
+        R: crate::withdrawal::executor::PayoutRpc + Send + Sync + 'static,
+    >(
+        mut self,
+        view: CompletionView<R>,
+        db: Db,
+        program_id: [u8; 32],
+        protocol_version: u8,
+    ) -> Self {
+        self.completion = Some(CompletionArm {
+            view: Box::new(view),
+            db: Arc::new(tokio::sync::Mutex::new(db)),
+            program_id,
+            protocol_version,
+        });
+        self
+    }
+
+    /// Handles a completion attestation request. Exposed directly so the
+    /// decision path is testable without standing up a server.
+    pub async fn handle_completion(
+        &self,
+        req: CompletionSignRequest,
+    ) -> Result<CompletionSignResponse, Refusal> {
+        let now = now_unix();
+        if now > req.expiry_unix {
+            return Err(Refusal::Expired {
+                expiry_unix: req.expiry_unix,
+                now,
+            });
+        }
+        if !self.view.view_is_fresh() {
+            return Err(Refusal::StaleView);
+        }
+        let observed = self.view.observed_epoch();
+        if req.epoch != observed {
+            return Err(Refusal::EpochMismatch {
+                requested: req.epoch,
+                observed,
+            });
+        }
+
+        let Some(arm) = &self.completion else {
+            return Err(Refusal::Underivable(
+                "this validator cannot attest withdrawal completions",
+            ));
+        };
+
+        let payout_txid: [u8; 32] = req
+            .payout_txid
+            .as_slice()
+            .try_into()
+            .map_err(|_| Refusal::Underivable("payout txid is not 32 bytes"))?;
+
+        let mut db = arm.db.lock().await;
+        let attestation = arm
+            .view
+            .attest(
+                &mut db,
+                req.withdrawal_index,
+                payout_txid,
+                req.payout_height,
+            )
+            .await
+            .map_err(|refusal| {
+                tracing::warn!(
+                    withdrawal_index = req.withdrawal_index,
+                    %refusal,
+                    "refused a withdrawal completion attestation"
+                );
+                Refusal::CompletionRefused(refusal.to_string())
+            })?;
+
+        // The message is built from the ATTESTATION — this validator's own
+        // verified facts — never from the request.
+        let message = glc_bridge_shared::claim::withdrawal_completion_message(
+            arm.protocol_version,
+            &arm.program_id,
+            observed,
+            attestation.withdrawal_index,
+            &attestation.payout_txid,
+            attestation.payout_height,
+            attestation.amount,
+            &attestation.dest_commitment,
+        );
+
+        Ok(CompletionSignResponse {
+            request_id: req.request_id,
+            validator_pubkey: self.validator_pubkey().to_vec(),
+            signature: self.keypair.sign_message(&message).as_ref().to_vec(),
+        })
     }
 
     /// Attaches the Goldcoin payout arm (Phase 7e).
@@ -385,6 +527,24 @@ impl<V: LocalView + Send + Sync + 'static> FederationSigner for SignerService<V>
         }
     }
 
+    async fn sign_completion(
+        &self,
+        request: Request<CompletionSignRequest>,
+    ) -> Result<Response<CompletionSignResponse>, Status> {
+        let peer = peer_key(&request);
+        if let Err(refusal) = self.check_rate_limit(&peer) {
+            tracing::warn!(%peer, "rate-limited a completion signing request");
+            return Err(Status::resource_exhausted(refusal.to_string()));
+        }
+        match self.handle_completion(request.into_inner()).await {
+            Ok(resp) => Ok(Response::new(resp)),
+            Err(refusal) => {
+                tracing::warn!(%peer, %refusal, "refused a completion signing request");
+                Err(Status::failed_precondition(refusal.to_string()))
+            }
+        }
+    }
+
     async fn health(
         &self,
         _request: Request<HealthRequest>,
@@ -551,6 +711,7 @@ mod tests {
                 messages: m2,
             },
             payout: None,
+            completion: None,
             seen: {
                 let mut seen = SeenSet::new();
                 seen.record(

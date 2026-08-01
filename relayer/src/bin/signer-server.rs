@@ -35,6 +35,7 @@ use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use glc_relayer::glc::config::RpcConfigValidated;
 use glc_relayer::glc::db::Db;
 use glc_relayer::glc::rpc::{PrevTx, RpcClient};
+use glc_relayer::p2p::completion_view::CompletionView;
 use glc_relayer::p2p::identity::{TlsMaterial, TlsPaths};
 use glc_relayer::p2p::payout_view::{PartialSigner, PayoutView};
 use glc_relayer::p2p::service::pb::federation_signer_server::FederationSignerServer;
@@ -43,6 +44,7 @@ use glc_relayer::p2p::view::DbLocalView;
 use glc_relayer::signer::load_validator_keypair;
 use glc_relayer::solana::epoch::{observe_epoch, run_epoch_refresher, EpochObservation};
 use glc_relayer::solana::rpc::RealSolanaRpc;
+use glc_relayer::withdrawal::adapter::RealPayoutRpc;
 use glc_relayer::withdrawal::vault::MultisigVault;
 
 fn env_required(name: &str) -> anyhow::Result<String> {
@@ -97,6 +99,29 @@ impl PartialSigner for NodePartialSigner {
 /// proves it actually holds the key at its configured position before
 /// serving. A signer that cannot prove that refuses to start rather than
 /// discovering the mismatch when a payout fails.
+/// This signer's OWN Goldcoin node (ADR-0017 E2, reused by ADR-0018 D6).
+///
+/// Both the payout arm and the completion arm validate against it, and both
+/// depend on it being independent of the relayer's node — a signer that
+/// inherits the requester's view of the chain is not checking anything.
+fn signer_goldcoin_rpc() -> anyhow::Result<RpcClient> {
+    let url = env_required("GLC_SIGNER_GLC_RPC_URL")?;
+    let user = env_required("GLC_SIGNER_GLC_RPC_USER")?;
+    let password = env_required("GLC_SIGNER_GLC_RPC_PASSWORD")?;
+    if url.is_empty() || user.is_empty() || password.is_empty() {
+        return Err(anyhow::anyhow!(
+            "GLC_SIGNER_GLC_RPC_URL, _USER and _PASSWORD must all be non-empty"
+        ));
+    }
+    Ok(RpcClient::new(&RpcConfigValidated {
+        url,
+        user,
+        password,
+        connect_timeout_ms: 5_000,
+        read_timeout_ms: 30_000,
+    })?)
+}
+
 fn payout_arm() -> anyhow::Result<Option<(PayoutView<NodePartialSigner>, Db)>> {
     let Some(redeem_hex) = env_optional("GLC_VAULT_REDEEM_SCRIPT_HEX") else {
         tracing::warn!(
@@ -124,23 +149,10 @@ fn payout_arm() -> anyhow::Result<Option<(PayoutView<NodePartialSigner>, Db)>> {
     })?;
 
     // ADR-0017 E2: this MUST be the signer's own node, never the relayer's.
-    // Independent UTXO validation is a core security property: a signer
-    // sharing the requester's node inherits the requester's view.
+    // Independent validation is a core security property: a signer sharing
+    // the requester's node inherits the requester's view.
+    let rpc = signer_goldcoin_rpc()?;
     let rpc_url = env_required("GLC_SIGNER_GLC_RPC_URL")?;
-    let user = env_required("GLC_SIGNER_GLC_RPC_USER")?;
-    let password = env_required("GLC_SIGNER_GLC_RPC_PASSWORD")?;
-    if rpc_url.is_empty() || user.is_empty() || password.is_empty() {
-        return Err(anyhow::anyhow!(
-            "GLC_SIGNER_GLC_RPC_URL, _USER and _PASSWORD must all be non-empty"
-        ));
-    }
-    let rpc = RpcClient::new(&RpcConfigValidated {
-        url: rpc_url.clone(),
-        user,
-        password,
-        connect_timeout_ms: 5_000,
-        read_timeout_ms: 30_000,
-    })?;
 
     tracing::info!(
         vault_address = %vault.address,
@@ -214,6 +226,34 @@ async fn main() -> anyhow::Result<()> {
     // holds no vault key, in which case every payout request is refused.
     if let Some((payout_view, payout_db)) = payout_arm()? {
         service = service.with_payout_arm(payout_view, payout_db);
+    }
+
+    // The completion-attestation arm (Phase 7f, ADR-0018). Uses the SAME
+    // confirmation depth as the payout pipeline (owner decision Q2), and
+    // the same own-node requirement as the payout arm (E2).
+    if let Some(depth) = env_optional("GLC_WITHDRAWAL_CONFIRMATION_DEPTH") {
+        let depth: i64 = depth.parse().map_err(|e| {
+            anyhow::anyhow!("GLC_WITHDRAWAL_CONFIRMATION_DEPTH must be an i64: {e}")
+        })?;
+        let rpc = signer_goldcoin_rpc()?;
+        let protocol_version: u8 = env_required("GLC_PROTOCOL_VERSION")?
+            .parse()
+            .map_err(|e| anyhow::anyhow!("GLC_PROTOCOL_VERSION must be a u8: {e}"))?;
+        tracing::info!(
+            confirmation_depth = depth,
+            "completion attestation enabled (Phase 7f)"
+        );
+        service = service.with_completion_arm(
+            CompletionView::new(RealPayoutRpc::new(rpc), depth),
+            Db::open(&PathBuf::from(env_required("GLC_DB_PATH")?))?,
+            program_id.to_bytes(),
+            protocol_version,
+        );
+    } else {
+        tracing::warn!(
+            "GLC_WITHDRAWAL_CONFIRMATION_DEPTH is not set — this signer will refuse every \
+             withdrawal completion request"
+        );
     }
 
     tracing::info!(

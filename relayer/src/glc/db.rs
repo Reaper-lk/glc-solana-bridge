@@ -98,7 +98,7 @@ pub enum DbError {
 
 /// Current schema version this build understands. Bumping this must be
 /// paired with a migration step in [`Db::run_migrations`].
-const CURRENT_SCHEMA_VERSION: i64 = 5;
+const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 /// The eight states of the deposit lifecycle (ADR-0011, extended by
 /// ADR-0012 with `IntegrityHalted`). `Submitted`/`Minted` are written from
@@ -352,6 +352,7 @@ impl Db {
                 3 => apply_v3_schema(&tx)?,
                 4 => super::withdrawal_db::apply_v4_schema(&tx)?,
                 5 => super::withdrawal_db::apply_v5_schema(&tx)?,
+                6 => super::withdrawal_db::apply_v6_schema(&tx)?,
                 other => unreachable!("no migration defined for schema version {other}"),
             }
         }
