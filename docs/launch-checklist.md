@@ -45,6 +45,7 @@ runs against real nodes. "Verified" here means *mechanically checked*, not
 |---|---|
 | Every runbook command exists and every variable/metric it names is real | `runbook_commands.rs` |
 | Every variable the binaries read is documented | `deployment_config.rs` |
+| Every granted signature leaves an audit record (§13.3) | `signature_audit_log.rs`, and the payout/completion suites |
 | A halted indexer is an alarm, not a log line | `ops::indexer_status`, `ops::health` |
 | Reorg depth is visible *before* the halt (§13.1 (5)) | `ops::indexer_status`, `ops::health` |
 | Every stored commitment re-verifies offline (§13.4) | `offline_audit.rs`, `ops::audit` |
@@ -98,7 +99,7 @@ otherwise imply it exists.
 | item | ADR | status |
 |---|---|---|
 | **Restore drill** | §13.4 | the procedure is written (runbook §13); **it has never been performed** |
-| Audit logs shipped off-host, append-only | §13.3 | logs exist and are structured; shipping is a deployment concern with no procedure written |
+| Audit logs **shipped off-host**, append-only | §13.3 | every signature decision, state transition and operator action is now emitted (ADR-0026); **shipping them off-host has no procedure written** and a log lost before shipping is gone |
 
 ### Unset security parameters
 

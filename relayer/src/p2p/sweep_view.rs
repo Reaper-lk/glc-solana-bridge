@@ -45,6 +45,19 @@ use crate::withdrawal::vault::MultisigVault;
 
 use super::payout_view::{PartialSigner, PayoutPartial};
 
+/// What a signer authorised, alongside the signatures themselves.
+///
+/// The amount is carried out of the view deliberately: the audit record for
+/// the most dangerous operation in the system must state what left the
+/// vault, and only the view knows it. Logging a placeholder there would put
+/// a number in an audit trail that is not true.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweepPartial {
+    pub partial: PayoutPartial,
+    pub swept_atomic: u64,
+    pub inputs: usize,
+}
+
 /// How long a staged sweep approval stays usable. Shorter than the
 /// governance TTL: a sweep's commitment pins the exact UTXO set, so a stale
 /// approval stops matching as soon as the vault receives anything, and a
@@ -295,7 +308,7 @@ impl<S: PartialSigner> SweepView<S> {
         unsigned_tx_hex: &str,
         protocol_version: u8,
         now_unix: i64,
-    ) -> Result<PayoutPartial, SweepRefusal> {
+    ) -> Result<SweepPartial, SweepRefusal> {
         let tx = Transaction::parse_hex(unsigned_tx_hex)
             .map_err(|e: MultisigError| SweepRefusal::Malformed(e.to_string()))?;
 
@@ -362,9 +375,13 @@ impl<S: PartialSigner> SweepView<S> {
         let signatures = extract_signatures(&partial, &self.vault.redeem_script)
             .map_err(|e| SweepRefusal::MalformedPartial(e.to_string()))?;
 
-        Ok(PayoutPartial {
-            vault_pubkey: self.vault_pubkey(),
-            signatures,
+        Ok(SweepPartial {
+            swept_atomic: plan.swept_atomic,
+            inputs: plan.inputs.len(),
+            partial: PayoutPartial {
+                vault_pubkey: self.vault_pubkey(),
+                signatures,
+            },
         })
     }
 }
@@ -839,8 +856,16 @@ mod tests {
             .sign_sweep(&mut db, &first.serialize_hex(), 1, 1_000)
             .await
             .expect("the staged sweep is signed");
-        assert_eq!(partial.signatures.len(), 2, "one signature per input");
-        assert_eq!(partial.vault_pubkey, vault.signer_pubkeys[0]);
+        assert_eq!(
+            partial.partial.signatures.len(),
+            2,
+            "one signature per input"
+        );
+        assert_eq!(partial.partial.vault_pubkey, vault.signer_pubkeys[0]);
+        // The audit record for a sweep must state what actually left the
+        // vault, so the view carries it out rather than the service guessing.
+        assert_eq!(partial.inputs, 2);
+        assert!(partial.swept_atomic > 0);
 
         // A retry of the SAME sweep stays free.
         v.sign_sweep(&mut db, &first.serialize_hex(), 1, 1_000)

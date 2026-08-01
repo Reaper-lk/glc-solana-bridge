@@ -39,9 +39,11 @@
 //! | [`payout_view`] | what this validator will sign for a vault payout (7e) |
 //! | [`completion_view`] | what this validator will attest a completion for (7f) |
 //! | [`governance_view`] | what this validator will sign for governance — operator-staged, not derived (7i-0) |
+//! | [`audit_log`] | the record a validator leaves when it GRANTS a signature (§13.3) |
 //! | [`sweep_view`] | what this validator will sign for a vault sweep — operator-staged, plus its own UTXO view (7i-0) |
 
 pub mod aggregation;
+pub mod audit_log;
 pub mod collector;
 pub mod completion_view;
 pub mod governance_view;

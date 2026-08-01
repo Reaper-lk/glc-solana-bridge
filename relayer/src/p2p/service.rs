@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use solana_sdk::signature::{Keypair, Signer as _};
 use tonic::{Request, Response, Status};
 
+use super::audit_log::{self, Granted};
 use super::completion_view::{CompletionRefusal, CompletionView};
 use super::governance_view::GovernanceView;
 use super::payout_view::{PartialSigner, PayoutRefusal, PayoutView};
@@ -28,7 +29,7 @@ use super::policy::{
     self, Action, Decision, LocalView, Refusal, SeenSet, SigningIdentity, SigningRequest,
 };
 use super::ratelimit::RateLimiter;
-use super::sweep_view::{SweepRefusal, SweepView};
+use super::sweep_view::{SweepPartial, SweepRefusal, SweepView};
 use crate::glc::db::Db;
 
 pub mod pb {
@@ -118,7 +119,7 @@ trait ErasedSweepView: Send + Sync {
         unsigned_tx_hex: &str,
         protocol_version: u8,
         now_unix: i64,
-    ) -> Result<super::payout_view::PayoutPartial, SweepRefusal>;
+    ) -> Result<SweepPartial, SweepRefusal>;
 }
 
 #[tonic::async_trait]
@@ -129,7 +130,7 @@ impl<S: PartialSigner + Send + Sync + 'static> ErasedSweepView for SweepView<S> 
         unsigned_tx_hex: &str,
         protocol_version: u8,
         now_unix: i64,
-    ) -> Result<super::payout_view::PayoutPartial, SweepRefusal> {
+    ) -> Result<SweepPartial, SweepRefusal> {
         SweepView::sign_sweep(self, db, unsigned_tx_hex, protocol_version, now_unix).await
     }
 }
@@ -359,6 +360,14 @@ impl<V: LocalView + Send + Sync + 'static> SignerService<V> {
             &attestation.dest_commitment,
         );
 
+        audit_log::record(
+            Granted::Completion {
+                withdrawal_index: attestation.withdrawal_index,
+                payout_txid: &attestation.payout_txid,
+            },
+            &self.validator_pubkey(),
+        );
+
         Ok(CompletionSignResponse {
             request_id: req.request_id,
             validator_pubkey: self.validator_pubkey().to_vec(),
@@ -434,10 +443,12 @@ impl<V: LocalView + Send + Sync + 'static> SignerService<V> {
             action,
             &commitment,
         );
-        tracing::warn!(
-            action,
-            epoch = observed,
-            "SIGNED a governance action — this changes federation policy"
+        audit_log::record(
+            Granted::Governance {
+                action,
+                epoch: observed,
+            },
+            &self.validator_pubkey(),
         );
 
         Ok(GovernanceSignResponse {
@@ -499,12 +510,21 @@ impl<V: LocalView + Send + Sync + 'static> SignerService<V> {
             .sign_sweep(&mut db, &req.unsigned_tx_hex, arm.protocol_version, now)
             .await
         {
-            Ok(partial) => Ok(SweepSignResponse {
-                request_id: req.request_id,
-                validator_pubkey: self.validator_pubkey().to_vec(),
-                vault_pubkey: partial.vault_pubkey.to_vec(),
-                signatures: partial.signatures,
-            }),
+            Ok(swept) => {
+                audit_log::record(
+                    Granted::Sweep {
+                        inputs: swept.inputs,
+                        swept_atomic: swept.swept_atomic,
+                    },
+                    &self.validator_pubkey(),
+                );
+                Ok(SweepSignResponse {
+                    request_id: req.request_id,
+                    validator_pubkey: self.validator_pubkey().to_vec(),
+                    vault_pubkey: swept.partial.vault_pubkey.to_vec(),
+                    signatures: swept.partial.signatures,
+                })
+            }
             Err(refusal) => {
                 tracing::warn!(%refusal, "refused a vault sweep signing request");
                 Err(Refusal::SweepRefused(refusal.to_string()))
@@ -580,12 +600,21 @@ impl<V: LocalView + Send + Sync + 'static> SignerService<V> {
             )
             .await
         {
-            Ok(partial) => Ok(PayoutSignResponse {
-                request_id: req.request_id,
-                validator_pubkey: self.validator_pubkey().to_vec(),
-                vault_pubkey: partial.vault_pubkey.to_vec(),
-                signatures: partial.signatures,
-            }),
+            Ok(partial) => {
+                audit_log::record(
+                    Granted::Payout {
+                        withdrawal_index: req.withdrawal_index,
+                        quorum_attempt: req.quorum_attempt,
+                    },
+                    &self.validator_pubkey(),
+                );
+                Ok(PayoutSignResponse {
+                    request_id: req.request_id,
+                    validator_pubkey: self.validator_pubkey().to_vec(),
+                    vault_pubkey: partial.vault_pubkey.to_vec(),
+                    signatures: partial.signatures,
+                })
+            }
             Err(refusal) => {
                 tracing::warn!(
                     withdrawal_index = req.withdrawal_index,
@@ -647,6 +676,16 @@ impl<V: LocalView + Send + Sync + 'static> SignerService<V> {
             Decision::AlreadySigned(bytes) => bytes,
             Decision::Refuse(r) => return Err(r),
         };
+
+        // §13.3: the grant is recorded, not just the refusal. Placed after
+        // the decision and before the signature is handed back, so nothing
+        // leaves this process unrecorded.
+        if let SigningIdentity::Deposit { txid, vout } = &parsed.identity {
+            audit_log::record(
+                Granted::Mint { txid, vout: *vout },
+                &self.validator_pubkey(),
+            );
+        }
 
         Ok(SignResponse {
             request_id: req.request_id,

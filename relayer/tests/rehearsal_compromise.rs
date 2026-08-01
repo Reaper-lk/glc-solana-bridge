@@ -36,7 +36,7 @@ use glc_relayer::glc::config::RpcConfigValidated;
 use glc_relayer::glc::db::Db;
 use glc_relayer::glc::rpc::{BroadcastOutcome, PrevTx, RpcClient};
 use glc_relayer::glc::withdrawal_db::ObservedUtxo;
-use glc_relayer::p2p::payout_view::{PartialSigner, PayoutPartial};
+use glc_relayer::p2p::payout_view::PartialSigner;
 use glc_relayer::p2p::sweep_view::{SweepApproval, SweepRefusal, SweepView};
 use glc_relayer::withdrawal::config::{RawWithdrawalConfig, WithdrawalConfig};
 use glc_relayer::withdrawal::multisig::{assemble, PartialSignature, Transaction};
@@ -456,14 +456,18 @@ async fn the_documented_compromise_response_moves_the_whole_vault() {
             sync_vault(&mut d, &node, &old);
             d
         };
-        let partial: PayoutPartial = view
+        let swept = view
             .sign_sweep(&mut db, &unsigned_hex, PROTOCOL_VERSION, 1_000)
             .await
             .unwrap_or_else(|e| panic!("operator {i} approved but did not sign: {e}"));
-        assert_eq!(partial.signatures.len(), 3, "one signature per input");
+        assert_eq!(swept.partial.signatures.len(), 3, "one signature per input");
+        // What the audit record will state (§13.3) must be what actually
+        // leaves the vault, so it is checked against the plan here too.
+        assert_eq!(swept.swept_atomic, plan.swept_atomic);
+        assert_eq!(swept.inputs, plan.inputs.len());
         partials.push(PartialSignature {
-            vault_pubkey: partial.vault_pubkey,
-            signatures: partial.signatures,
+            vault_pubkey: swept.partial.vault_pubkey,
+            signatures: swept.partial.signatures,
         });
     }
 
