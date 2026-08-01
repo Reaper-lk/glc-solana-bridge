@@ -868,8 +868,12 @@ the supply-cap controls had no caller either (ADR-0022 §2).
 - **7i-0** (ADR-0021): `glc-admin`, `SignGovernance`, `SignSweep`.
 - **7i-1** (ADR-0022): on-chain submission — pause/unpause, supply-cap
   controls, the rotation lifecycle, and `sweep-execute`.
-- **7i**: the runbooks, documenting **only** procedures an operator can
-  carry out with supported tools.
+- **7i** (ADR-0023): the runbooks — `docs/runbooks.md` — documenting **only**
+  procedures an operator can carry out with supported tools, and tested
+  against the binaries on every CI run. Writing them exposed one further
+  gap: a halted indexer was invisible to `/health`, so a bridge that had
+  stopped observing Goldcoin reported healthy. Fixed before the runbook was
+  written (ADR-0023 §2).
 
 ---
 

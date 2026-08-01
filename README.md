@@ -50,5 +50,6 @@ This project moves user funds when complete; until audits and the custody
 decisions in [docs/custody.md](docs/custody.md) are resolved, nothing here is
 deployable. No keys or secrets exist in this repository — report anything that
 looks like one (see [SECURITY.md](SECURITY.md) for how). Threat model:
-[docs/threat-model.md](docs/threat-model.md); terminology:
+[docs/threat-model.md](docs/threat-model.md); operator procedures:
+[docs/runbooks.md](docs/runbooks.md); terminology:
 [docs/glossary.md](docs/glossary.md).

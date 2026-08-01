@@ -96,11 +96,23 @@ impl HealthReport {
 /// Pure: takes measurements, returns a report. Everything that touches a
 /// database or a chain happens in the caller, which is what makes the
 /// reporting logic testable without either.
+/// The indexer facts the report needs, flattened by the caller so
+/// [`build_report`] stays free of shared state and remains a pure function
+/// of its measurements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexerSummary {
+    pub halted: bool,
+    /// Meaningless unless `halted`.
+    pub halted_depth: i64,
+    pub seconds_since_tick: i64,
+}
+
 pub fn build_report(
     snapshot: &SolvencySnapshot,
     halted_deposits: u64,
     halted_withdrawals: u64,
     epoch_is_fresh: bool,
+    indexer: Option<IndexerSummary>,
     extra: &[(&str, f64, &'static str)],
 ) -> HealthReport {
     let mut invariants = Vec::new();
@@ -170,7 +182,43 @@ pub fn build_report(
         },
     });
 
+    // Phase 7i — a halted indexer stops crediting deposits and never
+    // resolves on its own, yet the process stays alive for liveness probes.
+    // Without this the bridge could stop observing Goldcoin entirely and
+    // still report 200 (ops::indexer_status).
+    if let Some(i) = indexer {
+        invariants.push(Invariant {
+            name: "indexer_not_halted",
+            healthy: !i.halted,
+            detail: if i.halted {
+                format!(
+                    "HALTED on a reorg deeper than max_reorg_depth (attempted {}); \
+                     deposits are no longer being indexed and an operator must intervene",
+                    i.halted_depth
+                )
+            } else {
+                format!("last tick {}s ago", i.seconds_since_tick)
+            },
+        });
+    }
+
     let mut r = Registry::new();
+    if let Some(i) = indexer {
+        r.gauge(
+            "glc_indexer_halted",
+            "1 when the Goldcoin indexer has halted on an over-deep reorg and requires an operator",
+            u8::from(i.halted) as f64,
+        );
+        // A gauge, deliberately not an invariant: a quiet chain produces no
+        // blocks and a brief node outage is retried, so this crate has no
+        // basis for the threshold that separates slow from broken. The
+        // operator's scraper decides (owner decision H2).
+        r.gauge(
+            "glc_indexer_seconds_since_tick",
+            "Seconds since the Goldcoin indexer last completed a tick without halting",
+            i.seconds_since_tick as f64,
+        );
+    }
     r.gauge(
         "glc_wrapped_supply_atomic",
         "Wrapped GLC supply reported by the SPL mint, atomic units",
@@ -375,11 +423,105 @@ mod tests {
     fn the_normal_measured_state_is_reported_healthy() {
         // Fee drift is present and must NOT make the endpoint unhealthy —
         // otherwise the alarm is red from the first payout and useless.
-        let r = build_report(&healthy_snapshot(), 0, 0, true, &[]);
+        let r = build_report(&healthy_snapshot(), 0, 0, true, None, &[]);
         assert!(r.healthy(), "{}", r.text());
         assert_eq!(r.status(), StatusCode::OK);
         assert!(r.text().contains("OK   solvency"));
         assert!(r.text().contains("fully explained by 904 in fees"));
+    }
+
+    #[test]
+    fn a_halted_indexer_is_unhealthy_even_when_everything_else_holds() {
+        // The gap this closes: before Phase 7i the bridge could stop
+        // observing Goldcoin entirely and still report 200, because the
+        // halt lived in the indexer task's own memory and the process stays
+        // alive for liveness probes.
+        let r = build_report(
+            &healthy_snapshot(),
+            0,
+            0,
+            true,
+            Some(IndexerSummary {
+                halted: true,
+                halted_depth: 120,
+                seconds_since_tick: 5,
+            }),
+            &[],
+        );
+        assert!(!r.healthy(), "a halted indexer must fail the health check");
+        let halt = r
+            .invariants
+            .iter()
+            .find(|i| i.name == "indexer_not_halted")
+            .expect("the invariant is present");
+        assert!(!halt.healthy);
+        assert!(halt.detail.contains("120"), "{}", halt.detail);
+        assert!(
+            r.metrics.contains("glc_indexer_halted 1\n"),
+            "{}",
+            r.metrics
+        );
+    }
+
+    #[test]
+    fn a_working_indexer_is_healthy_and_reports_its_freshness() {
+        let r = build_report(
+            &healthy_snapshot(),
+            0,
+            0,
+            true,
+            Some(IndexerSummary {
+                halted: false,
+                halted_depth: 0,
+                seconds_since_tick: 42,
+            }),
+            &[],
+        );
+        assert!(r.healthy());
+        assert!(
+            r.metrics.contains("glc_indexer_halted 0\n"),
+            "{}",
+            r.metrics
+        );
+        assert!(
+            r.metrics.contains("glc_indexer_seconds_since_tick 42\n"),
+            "{}",
+            r.metrics
+        );
+    }
+
+    #[test]
+    fn staleness_alone_is_a_gauge_and_never_an_alarm() {
+        // A quiet chain produces no blocks and a brief node outage is
+        // retried. This crate has no basis for the threshold that separates
+        // slow from broken, so it exposes the number and pages on nothing
+        // (owner decision H2).
+        let r = build_report(
+            &healthy_snapshot(),
+            0,
+            0,
+            true,
+            Some(IndexerSummary {
+                halted: false,
+                halted_depth: 0,
+                seconds_since_tick: 86_400,
+            }),
+            &[],
+        );
+        assert!(
+            r.healthy(),
+            "one day of silence is not, by itself, a breach"
+        );
+        assert!(r.metrics.contains("glc_indexer_seconds_since_tick 86400\n"));
+    }
+
+    #[test]
+    fn a_report_without_an_indexer_omits_the_invariant_rather_than_assuming_health() {
+        // Claiming an indexer is healthy when this process cannot see one
+        // would be worse than saying nothing about it.
+        let r = build_report(&healthy_snapshot(), 0, 0, true, None, &[]);
+        assert!(!r.invariants.iter().any(|i| i.name == "indexer_not_halted"));
+        assert!(!r.metrics.contains("glc_indexer_halted"));
     }
 
     #[test]
@@ -389,6 +531,7 @@ mod tests {
             0,
             0,
             true,
+            None,
             &[],
         );
         assert!(!r.healthy());
@@ -406,6 +549,7 @@ mod tests {
             0,
             0,
             true,
+            None,
             &[],
         );
         assert!(!r.healthy());
@@ -419,7 +563,7 @@ mod tests {
 
     #[test]
     fn an_integrity_halt_is_a_page() {
-        let r = build_report(&healthy_snapshot(), 1, 0, true, &[]);
+        let r = build_report(&healthy_snapshot(), 1, 0, true, None, &[]);
         assert!(!r.healthy());
         assert!(
             r.text().contains("BREACH no_integrity_halts"),
@@ -431,7 +575,7 @@ mod tests {
 
     #[test]
     fn a_stale_epoch_is_a_page() {
-        let r = build_report(&healthy_snapshot(), 0, 0, false, &[]);
+        let r = build_report(&healthy_snapshot(), 0, 0, false, None, &[]);
         assert!(!r.healthy());
         assert!(r.text().contains("BREACH validator_epoch_fresh"));
         assert!(r.metrics.contains("glc_validator_epoch_fresh 0"));
@@ -454,6 +598,7 @@ mod tests {
             0,
             0,
             true,
+            None,
             &[],
         );
         assert!(
@@ -468,7 +613,7 @@ mod tests {
     #[test]
     fn the_fee_drift_is_always_exported_even_when_healthy() {
         // The whole point of ADR-0020: visible, bounded, auditable.
-        let r = build_report(&healthy_snapshot(), 0, 0, true, &[]);
+        let r = build_report(&healthy_snapshot(), 0, 0, true, None, &[]);
         assert!(r.metrics.contains("glc_vault_fees_paid_atomic 904"));
         assert!(r.metrics.contains("glc_vault_fee_drift_atomic 904"));
         assert!(r.metrics.contains("glc_vault_unexplained_drift_atomic 0"));
@@ -476,10 +621,10 @@ mod tests {
 
     #[test]
     fn the_health_gauge_tracks_the_endpoint_status() {
-        assert!(build_report(&healthy_snapshot(), 0, 0, true, &[])
+        assert!(build_report(&healthy_snapshot(), 0, 0, true, None, &[])
             .metrics
             .contains("glc_health 1"));
-        assert!(build_report(&healthy_snapshot(), 1, 0, true, &[])
+        assert!(build_report(&healthy_snapshot(), 1, 0, true, None, &[])
             .metrics
             .contains("glc_health 0"));
     }
@@ -491,6 +636,7 @@ mod tests {
             0,
             0,
             true,
+            None,
             &[("glc_custom", 7.0, "help")],
         );
         assert!(r.metrics.contains("glc_custom 7"));
@@ -499,7 +645,7 @@ mod tests {
 
     #[test]
     fn every_exported_metric_carries_help_and_type() {
-        let r = build_report(&healthy_snapshot(), 0, 0, true, &[]);
+        let r = build_report(&healthy_snapshot(), 0, 0, true, None, &[]);
         let names: Vec<&str> = r
             .metrics
             .lines()
