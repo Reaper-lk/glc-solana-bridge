@@ -46,6 +46,8 @@ runs against real nodes. "Verified" here means *mechanically checked*, not
 | Every runbook command exists and every variable/metric it names is real | `runbook_commands.rs` |
 | Every variable the binaries read is documented | `deployment_config.rs` |
 | A halted indexer is an alarm, not a log line | `ops::indexer_status`, `ops::health` |
+| Reorg depth is visible *before* the halt (§13.1 (5)) | `ops::indexer_status`, `ops::health` |
+| Every stored commitment re-verifies offline (§13.4) | `offline_audit.rs`, `ops::audit` |
 | The solvency invariant and fee drift are reported separately | `ops::solvency`, `ops_endpoint.rs` |
 | The instruction encoding matches Anchor's, across the workspace split | `admin_governance_encoding.rs` + `solana::instruction` tests |
 
@@ -95,10 +97,8 @@ otherwise imply it exists.
 
 | item | ADR | status |
 |---|---|---|
-| Backup, restore, and **restore drills** | §13.4 | no tooling; no drill has been performed |
-| Offline auditor re-verifying stored commitments (`PRAGMA integrity_check` plus recompute-and-compare) | §13.4 | not built |
+| **Restore drill** | §13.4 | the procedure is written (runbook §13); **it has never been performed** |
 | Audit logs shipped off-host, append-only | §13.3 | logs exist and are structured; shipping is a deployment concern with no procedure written |
-| Reorg depth *approaching* `max_reorg_depth` | §13.1 (5) | only the **halt** is exposed. There is no early warning before the indexer stops |
 
 ### Unset security parameters
 

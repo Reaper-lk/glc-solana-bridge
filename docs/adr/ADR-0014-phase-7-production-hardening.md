@@ -869,12 +869,18 @@ with forensic columns), every operator recovery action.
   re-verifies stored commitments using the same recompute-and-compare logic
   the signing guards already implement (ADR-0012, ADR-0013).
 
-### 13.4a Status (Phase 7j, 2026-08-01)
+### 13.4a Status (Phase 7k, 2026-08-01)
 
-Backup/restore drills and the offline auditor are **not built**, and the
-§13.1 (5) early warning for a reorg *approaching* `max_reorg_depth` does not
-exist — only the halt itself is exposed (ADR-0023). All three are recorded
-as open in `docs/launch-checklist.md` rather than left implied.
+The **offline auditor is built** (`glc-audit`, ADR-0025): it re-verifies
+every frozen claim commitment and payout intent with the same
+recompute-and-compare logic the signing guards use, plus
+`PRAGMA integrity_check`, strictly read-only so it can be run against a
+backup. The **§13.1 (5) early warning is exposed** as
+`glc_reorg_deepest_observed` alongside the configured ceiling.
+
+The **restore drill remains unperformed**. Its procedure is written
+(`docs/runbooks.md` §13) and is recorded as open in
+`docs/launch-checklist.md` rather than ticked.
 
 ### 13.5 Runbooks
 

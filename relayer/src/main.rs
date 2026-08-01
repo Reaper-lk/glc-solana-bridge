@@ -411,10 +411,16 @@ async fn run_indexer_loop(
                     Ok(TickOutcome::Progressed { blocks_indexed, reorg }) => {
                         status.record_tick(now_unix());
                         if let Some(r) = reorg {
+                            // §13.1 (5): published so an operator sees a
+                            // chain trending toward max_reorg_depth before
+                            // the indexer halts on it.
+                            let depth = r.old_tip_height - r.fork_height;
+                            status.record_reorg(depth);
                             tracing::warn!(
                                 fork_height = r.fork_height,
                                 old_tip_height = r.old_tip_height,
                                 orphaned_count = r.orphaned_count,
+                                depth,
                                 "reorg detected and rolled back"
                             );
                         }

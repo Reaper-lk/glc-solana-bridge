@@ -105,6 +105,13 @@ pub struct IndexerSummary {
     /// Meaningless unless `halted`.
     pub halted_depth: i64,
     pub seconds_since_tick: i64,
+    /// ADR-0014 §13.1 item 5 — the deepest reorg rolled back so far, and the
+    /// ceiling beyond which the indexer halts. Gauges, not an invariant: a
+    /// deep-but-survivable reorg is a fact about the chain, not a fault in
+    /// the bridge, and the threshold that should worry a given deployment is
+    /// the operator's to set (owner decision H2).
+    pub deepest_reorg: i64,
+    pub max_reorg_depth: i64,
 }
 
 pub fn build_report(
@@ -217,6 +224,18 @@ pub fn build_report(
             "glc_indexer_seconds_since_tick",
             "Seconds since the Goldcoin indexer last completed a tick without halting",
             i.seconds_since_tick as f64,
+        );
+        // §13.1 (5): the early warning. The halt above is the failure; this
+        // is what lets an operator see it coming.
+        r.gauge(
+            "glc_reorg_deepest_observed",
+            "Deepest Goldcoin reorg this process has rolled back, in blocks",
+            i.deepest_reorg as f64,
+        );
+        r.gauge(
+            "glc_reorg_max_depth_configured",
+            "Configured max_reorg_depth; beyond this the indexer halts",
+            i.max_reorg_depth as f64,
         );
     }
     r.gauge(
@@ -445,6 +464,8 @@ mod tests {
                 halted: true,
                 halted_depth: 120,
                 seconds_since_tick: 5,
+                deepest_reorg: 0,
+                max_reorg_depth: 0,
             }),
             &[],
         );
@@ -474,6 +495,8 @@ mod tests {
                 halted: false,
                 halted_depth: 0,
                 seconds_since_tick: 42,
+                deepest_reorg: 0,
+                max_reorg_depth: 0,
             }),
             &[],
         );
@@ -505,6 +528,8 @@ mod tests {
                 halted: false,
                 halted_depth: 0,
                 seconds_since_tick: 86_400,
+                deepest_reorg: 0,
+                max_reorg_depth: 0,
             }),
             &[],
         );
@@ -513,6 +538,43 @@ mod tests {
             "one day of silence is not, by itself, a breach"
         );
         assert!(r.metrics.contains("glc_indexer_seconds_since_tick 86400\n"));
+    }
+
+    #[test]
+    fn reorg_depth_is_exposed_as_an_early_warning_and_never_as_a_breach() {
+        // ADR-0014 §13.1 (5). A deep-but-survivable reorg is a fact about
+        // the chain, not a fault in the bridge: the operator's scraper picks
+        // the threshold that should worry their deployment (owner decision
+        // H2). The halt is the failure; this is what lets them see it
+        // coming.
+        let r = build_report(
+            &healthy_snapshot(),
+            0,
+            0,
+            true,
+            Some(IndexerSummary {
+                halted: false,
+                halted_depth: 0,
+                seconds_since_tick: 5,
+                deepest_reorg: 48,
+                max_reorg_depth: 50,
+            }),
+            &[],
+        );
+        assert!(
+            r.healthy(),
+            "a reorg at 48 of 50 is alarming but is not a bridge fault"
+        );
+        assert!(
+            r.metrics.contains("glc_reorg_deepest_observed 48\n"),
+            "{}",
+            r.metrics
+        );
+        assert!(
+            r.metrics.contains("glc_reorg_max_depth_configured 50\n"),
+            "the ceiling must be exposed too, or 48 cannot be read as a ratio: {}",
+            r.metrics
+        );
     }
 
     #[test]

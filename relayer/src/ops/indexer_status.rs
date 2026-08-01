@@ -48,6 +48,14 @@ pub struct IndexerStatus {
     halted_depth: AtomicI64,
     /// Unix seconds of the last tick that completed **without** halting.
     last_tick_unix: AtomicI64,
+    /// The deepest reorg this process has rolled back (ADR-0014 §13.1 item
+    /// 5). Exposed so an operator sees a chain trending toward
+    /// `max_reorg_depth` **before** the indexer halts on it — the halt is
+    /// the failure, not the warning.
+    deepest_reorg: AtomicI64,
+    /// The configured ceiling, so the gauge can be read as a ratio without
+    /// the scraper having to know the deployment's configuration.
+    max_reorg_depth: AtomicI64,
 }
 
 impl IndexerStatus {
@@ -61,7 +69,29 @@ impl IndexerStatus {
             halted: AtomicBool::new(false),
             halted_depth: AtomicI64::new(0),
             last_tick_unix: AtomicI64::new(started_at),
+            deepest_reorg: AtomicI64::new(0),
+            max_reorg_depth: AtomicI64::new(0),
         }
+    }
+
+    /// Records the configured ceiling once at startup.
+    pub fn set_max_reorg_depth(&self, depth: i64) {
+        self.max_reorg_depth.store(depth, Ordering::SeqCst);
+    }
+
+    /// Records a rolled-back reorg. Keeps the **deepest** seen, not the
+    /// most recent: a single 40-block reorg an hour ago is what an operator
+    /// needs to know about, and a later 1-block reorg must not erase it.
+    pub fn record_reorg(&self, depth: i64) {
+        self.deepest_reorg.fetch_max(depth, Ordering::SeqCst);
+    }
+
+    pub fn deepest_reorg(&self) -> i64 {
+        self.deepest_reorg.load(Ordering::SeqCst)
+    }
+
+    pub fn max_reorg_depth(&self) -> i64 {
+        self.max_reorg_depth.load(Ordering::SeqCst)
     }
 
     /// Records a tick that did real work (or found nothing to do).
@@ -104,6 +134,27 @@ impl IndexerStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_deepest_reorg_is_kept_not_the_most_recent() {
+        // A 40-block reorg an hour ago is the fact an operator needs; a
+        // later 1-block reorg must not erase it.
+        let s = IndexerStatus::new(1_000);
+        assert_eq!(s.deepest_reorg(), 0);
+        s.record_reorg(40);
+        s.record_reorg(1);
+        assert_eq!(s.deepest_reorg(), 40);
+        s.record_reorg(41);
+        assert_eq!(s.deepest_reorg(), 41);
+    }
+
+    #[test]
+    fn the_configured_ceiling_is_reported_alongside_it() {
+        // Without it a scraper cannot tell 40 out of 50 from 40 out of 500.
+        let s = IndexerStatus::new(1_000);
+        s.set_max_reorg_depth(50);
+        assert_eq!(s.max_reorg_depth(), 50);
+    }
 
     #[test]
     fn a_fresh_status_is_not_halted() {

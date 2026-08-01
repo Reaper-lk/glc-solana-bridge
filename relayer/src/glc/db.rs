@@ -236,6 +236,26 @@ pub struct NewClaimArtifact {
     pub created_at: i64,
 }
 
+/// One deposit's stored claim artifact, exactly as persisted.
+///
+/// Read-only input to [`crate::ops::audit`]. Unlike [`SignableClaim`], this
+/// is explicitly **unverified** — it is the thing being checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredClaim {
+    pub deposit_id: i64,
+    pub txid: [u8; 32],
+    pub vout: i64,
+    pub amount_atomic: u64,
+    pub recipient: [u8; 32],
+    pub state: String,
+    pub canonical_message: Vec<u8>,
+    pub message_hash: Vec<u8>,
+    pub protocol_version: u8,
+    pub validator_epoch: u64,
+    pub program_id: [u8; 32],
+    pub wrapped_mint: [u8; 32],
+}
+
 /// The verified, freshly recomputed message and fields to sign — the
 /// output of [`Db::verify_and_load_signable_message`]. Never constructed
 /// from a cached/stored blob directly (ADR-0012).
@@ -862,6 +882,54 @@ impl Db {
             )
             .optional()?;
         Ok(row.map(|h| to_array32(&h)))
+    }
+
+    /// Every deposit that has a frozen claim artifact, for the **read-only**
+    /// offline auditor (ADR-0014 §13.4).
+    ///
+    /// Deliberately returns raw stored fields rather than a verified type:
+    /// the auditor's whole job is to check whether they still agree, so
+    /// handing it something already validated would defeat the purpose.
+    pub fn all_claim_artifacts(&self) -> Result<Vec<StoredClaim>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.id, d.txid, d.vout, d.amount_atomic, d.recipient, d.state,
+                    a.canonical_message, a.message_hash, a.protocol_version,
+                    a.validator_epoch, a.program_id, a.wrapped_mint
+             FROM deposit_candidates d
+             JOIN claim_artifacts a ON a.deposit_id = d.id
+             ORDER BY d.id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let epoch: Vec<u8> = r.get(9)?;
+                let amount: Vec<u8> = r.get(3)?;
+                Ok(StoredClaim {
+                    deposit_id: r.get(0)?,
+                    txid: to_array32(&r.get::<_, Vec<u8>>(1)?),
+                    vout: r.get(2)?,
+                    amount_atomic: u64::from_le_bytes(amount.try_into().unwrap_or([0u8; 8])),
+                    recipient: to_array32(&r.get::<_, Vec<u8>>(4)?),
+                    state: r.get(5)?,
+                    canonical_message: r.get(6)?,
+                    message_hash: r.get(7)?,
+                    protocol_version: r.get(8)?,
+                    validator_epoch: u64::from_le_bytes(epoch.try_into().unwrap_or([0u8; 8])),
+                    program_id: to_array32(&r.get::<_, Vec<u8>>(10)?),
+                    wrapped_mint: to_array32(&r.get::<_, Vec<u8>>(11)?),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// SQLite's own structural check. Returns its verbatim output; `"ok"` is
+    /// the only healthy answer.
+    pub fn integrity_check(&self) -> Result<String, DbError> {
+        let mut stmt = self.conn.prepare("PRAGMA integrity_check")?;
+        let rows: Vec<String> = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows.join("; "))
     }
 
     pub fn candidates_by_state(&self, state: DepositState) -> Result<Vec<DepositRow>, DbError> {

@@ -166,6 +166,8 @@ impl<R: SolanaRpc, P: PayoutRpc> OpsCollector<R, P> {
                 halted: i.is_halted(),
                 halted_depth: i.halted_depth(),
                 seconds_since_tick: i.seconds_since_tick(now_unix()),
+                deepest_reorg: i.deepest_reorg(),
+                max_reorg_depth: i.max_reorg_depth(),
             }),
             &borrowed,
         );
