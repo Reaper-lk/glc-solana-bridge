@@ -23,6 +23,27 @@ decided. See ADR-0008.
 
 ## Decision log
 
+- **2026-08-01 — #2, #3 and #4 answered by implementation; formal sign-off
+  outstanding (Phases 7b/7e/7i/7j).** This register had not been updated
+  since 2026-07-30 and still presented all three as open, so a reader would
+  conclude the vault question was undecided when the code had long since
+  settled it.
+  - **#2 vault construction** — P2SH M-of-N, resolved by
+    [ADR-0015](adr/0015-goldcoin-vault-custody.md), which says so explicitly.
+  - **#3 vault signing model** — script multisig, with TSS rejected in
+    ADR-0014 §8.1 and distributed partial signing delivered in
+    [ADR-0017](adr/0017-distributed-payout-signing.md). No process holds
+    enough key material to spend the vault.
+  - **#4 key rotation and vault migration** — implemented
+    ([ADR-0021](adr/0021-operator-tooling-and-staged-approvals.md),
+    [ADR-0022](adr/0022-on-chain-operator-tooling.md)), documented
+    (`runbooks.md` §5, §7) and **rehearsed against real nodes**
+    ([ADR-0024](adr/0024-launch-readiness-and-rehearsal.md)).
+
+  These are recorded as *implemented*, not as *decided*: writing a decision
+  into this register is the owner's act. What is outstanding is the sign-off,
+  not the work.
+
 - **2026-08-01 — #7 remains OPEN, and is now reachable (Phase 7i-1,
   ADR-0022 §6).** Until this phase, `set_paused` had no caller outside the
   program's own tests: the circuit breaker existed on-chain and could not be

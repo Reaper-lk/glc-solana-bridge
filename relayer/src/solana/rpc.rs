@@ -85,6 +85,119 @@ pub fn decode_validator_set(data: &[u8]) -> Result<ValidatorSetSnapshot, SolanaR
     })
 }
 
+/// The bridge's configuration, decoded from `BridgeConfig` (ADR-0008,
+/// extended by ADR-0009 and ADR-0014 §11).
+///
+/// Read by `glc-admin show-config` so launch step 3 — "verify `initialize`
+/// recorded the intended validator set, threshold, timelock and supply
+/// ceiling by reading the accounts back" — is something an operator can
+/// actually do. Every field here is a launch-time security decision with no
+/// default, so confirming what landed on chain is not optional.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeConfigSnapshot {
+    pub protocol_version: u8,
+    pub admin: Pubkey,
+    pub pending_admin: Option<Pubkey>,
+    pub paused: bool,
+    pub withdrawal_count: u64,
+    pub min_deposit: u64,
+    pub min_withdrawal: u64,
+    pub wrapped_mint: Pubkey,
+    pub governance_timelock_seconds: i64,
+    pub max_wrapped_supply: u64,
+}
+
+impl BridgeConfigSnapshot {
+    /// Whether `create_wrapped_mint` has run. The program stores
+    /// `Pubkey::default()` as the "not yet" sentinel and every mint path
+    /// rejects it, so an operator must be able to see it.
+    pub fn mint_is_configured(&self) -> bool {
+        self.wrapped_mint != Pubkey::default()
+    }
+}
+
+/// Hand-decodes the `BridgeConfig` Borsh body, skipping the 8-byte Anchor
+/// discriminator. Layout is a verbatim copy of
+/// `programs/glc-bridge/src/state.rs`:
+/// `protocol_version: u8, admin: Pubkey, pending_admin: Option<Pubkey>,
+/// paused: bool, withdrawal_count: u64, min_deposit: u64,
+/// min_withdrawal: u64, bump: u8, wrapped_mint: Pubkey,
+/// mint_authority_bump: u8, governance_timelock_seconds: i64,
+/// max_wrapped_supply: u64, reserved: [u8; N]`.
+///
+/// `Option<Pubkey>` is Borsh's one-byte tag followed by the value only when
+/// the tag is 1 — so every field after it sits at a different offset
+/// depending on whether a handover is pending. Reading them from fixed
+/// offsets would silently return the wrong numbers exactly while an admin
+/// handover is in flight, which is precisely when an operator is checking.
+pub fn decode_bridge_config(data: &[u8]) -> Result<BridgeConfigSnapshot, SolanaRpcError> {
+    const DISCRIMINATOR_LEN: usize = 8;
+    let body = data
+        .get(DISCRIMINATOR_LEN..)
+        .ok_or_else(|| SolanaRpcError::Malformed("account shorter than discriminator".into()))?;
+    let need = |what: &str| SolanaRpcError::Malformed(format!("bridge config: missing {what}"));
+    let pk = |b: &[u8]| Pubkey::try_from(b).expect("32 bytes");
+
+    let protocol_version = *body.first().ok_or_else(|| need("protocol version"))?;
+    let admin = pk(body.get(1..33).ok_or_else(|| need("admin"))?);
+
+    let tag = *body.get(33).ok_or_else(|| need("pending admin tag"))?;
+    let (pending_admin, mut off) = match tag {
+        0 => (None, 34usize),
+        1 => (
+            Some(pk(body.get(34..66).ok_or_else(|| need("pending admin"))?)),
+            66usize,
+        ),
+        other => {
+            return Err(SolanaRpcError::Malformed(format!(
+                "bridge config: pending_admin has an invalid Borsh option tag {other}"
+            )))
+        }
+    };
+
+    let paused = *body.get(off).ok_or_else(|| need("paused"))? != 0;
+    off += 1;
+    let u64_at = |off: &mut usize, what: &str| -> Result<u64, SolanaRpcError> {
+        let v = body
+            .get(*off..*off + 8)
+            .ok_or_else(|| need(what))?
+            .try_into()
+            .unwrap();
+        *off += 8;
+        Ok(u64::from_le_bytes(v))
+    };
+    let withdrawal_count = u64_at(&mut off, "withdrawal count")?;
+    let min_deposit = u64_at(&mut off, "min deposit")?;
+    let min_withdrawal = u64_at(&mut off, "min withdrawal")?;
+    off += 1; // bump
+    let wrapped_mint = pk(body
+        .get(off..off + 32)
+        .ok_or_else(|| need("wrapped mint"))?);
+    off += 32;
+    off += 1; // mint_authority_bump
+    let governance_timelock_seconds = i64::from_le_bytes(
+        body.get(off..off + 8)
+            .ok_or_else(|| need("governance timelock"))?
+            .try_into()
+            .unwrap(),
+    );
+    off += 8;
+    let max_wrapped_supply = u64_at(&mut off, "max wrapped supply")?;
+
+    Ok(BridgeConfigSnapshot {
+        protocol_version,
+        admin,
+        pending_admin,
+        paused,
+        withdrawal_count,
+        min_deposit,
+        min_withdrawal,
+        wrapped_mint,
+        governance_timelock_seconds,
+        max_wrapped_supply,
+    })
+}
+
 /// A queued governance action, decoded from the singleton
 /// `PendingGovernanceAction` account (Phase 7a, extended 7h-0).
 ///
@@ -310,6 +423,91 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `BridgeConfig` body as the program serialises it.
+    fn bridge_config_bytes(pending: Option<Pubkey>, mint: Pubkey, cap: u64) -> Vec<u8> {
+        let mut d = vec![0u8; 8]; // discriminator
+        d.push(1); // protocol_version
+        d.extend_from_slice(Pubkey::new_from_array([0x11; 32]).as_ref());
+        match pending {
+            None => d.push(0),
+            Some(p) => {
+                d.push(1);
+                d.extend_from_slice(p.as_ref());
+            }
+        }
+        d.push(1); // paused
+        d.extend_from_slice(&9u64.to_le_bytes()); // withdrawal_count
+        d.extend_from_slice(&1_000u64.to_le_bytes()); // min_deposit
+        d.extend_from_slice(&2_000u64.to_le_bytes()); // min_withdrawal
+        d.push(0xFD); // bump
+        d.extend_from_slice(mint.as_ref());
+        d.push(0xFE); // mint_authority_bump
+        d.extend_from_slice(&3_600i64.to_le_bytes());
+        d.extend_from_slice(&cap.to_le_bytes());
+        d.extend_from_slice(&[0u8; 15]); // reserved
+        d
+    }
+
+    #[test]
+    fn decodes_a_config_with_no_handover_pending() {
+        let mint = Pubkey::new_unique();
+        let c = decode_bridge_config(&bridge_config_bytes(None, mint, 21_000)).unwrap();
+        assert_eq!(c.protocol_version, 1);
+        assert_eq!(c.pending_admin, None);
+        assert!(c.paused);
+        assert_eq!(c.min_deposit, 1_000);
+        assert_eq!(c.min_withdrawal, 2_000);
+        assert_eq!(c.wrapped_mint, mint);
+        assert_eq!(c.governance_timelock_seconds, 3_600);
+        assert_eq!(c.max_wrapped_supply, 21_000);
+        assert!(c.mint_is_configured());
+    }
+
+    #[test]
+    fn a_pending_handover_shifts_every_later_field_by_32_bytes() {
+        // THE reason this is decoded at computed offsets. Reading from fixed
+        // ones would return wrong numbers exactly while an admin handover is
+        // in flight — which is precisely when an operator checks.
+        let pending = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let c = decode_bridge_config(&bridge_config_bytes(Some(pending), mint, 21_000)).unwrap();
+        assert_eq!(c.pending_admin, Some(pending));
+        assert_eq!(
+            c.wrapped_mint, mint,
+            "the mint must not be read from the wrong offset"
+        );
+        assert_eq!(c.max_wrapped_supply, 21_000);
+        assert_eq!(c.governance_timelock_seconds, 3_600);
+    }
+
+    #[test]
+    fn an_uncreated_mint_is_visible_as_such() {
+        // The program stores the default pubkey as "not yet" and every mint
+        // path rejects it, so an operator must be able to see it.
+        let c = decode_bridge_config(&bridge_config_bytes(None, Pubkey::default(), 1)).unwrap();
+        assert!(!c.mint_is_configured());
+    }
+
+    #[test]
+    fn an_invalid_option_tag_is_an_error_rather_than_a_guess() {
+        // A corrupt tag would otherwise silently pick one of the two layouts
+        // and report every subsequent field wrong.
+        let mut d = bridge_config_bytes(None, Pubkey::new_unique(), 1);
+        d[8 + 33] = 7;
+        assert!(decode_bridge_config(&d).is_err());
+    }
+
+    #[test]
+    fn a_truncated_config_is_an_error_rather_than_panicking() {
+        let full = bridge_config_bytes(Some(Pubkey::new_unique()), Pubkey::new_unique(), 1);
+        for cut in [0, 8, 20, 40, 70, 90] {
+            assert!(
+                decode_bridge_config(&full[..cut.min(full.len())]).is_err(),
+                "a {cut}-byte account must not decode"
+            );
+        }
+    }
 
     /// The `PendingGovernanceAction` body an operator's node would return.
     fn pending_action_bytes(

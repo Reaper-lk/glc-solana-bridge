@@ -564,3 +564,173 @@ async fn the_documented_rotation_and_pause_procedures_work_on_a_real_validator()
         })
     );
 }
+
+/// **Bootstrap, end to end on a real validator** (Phase 7m).
+///
+/// Runs the launch sequence's steps 3 and the custody #5 handover with the
+/// shipped builders: initialize, create the wrapped mint, read the config
+/// back, then hand the admin key over in two steps.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_documented_bootstrap_sequence_works_on_a_real_validator() {
+    let Some(so_path) = program_so_path() else {
+        eprintln!("SKIP: build the program first");
+        return;
+    };
+    if !solana_test_validator_available() {
+        eprintln!("SKIP: solana-test-validator is not on PATH");
+        return;
+    }
+
+    let program_id: Pubkey = DECLARED_PROGRAM_ID.parse().unwrap();
+    let admin = Keypair::new();
+    let _validator = LocalValidator::start(&so_path, &program_id, &admin.pubkey());
+    let client = BlockingRpcClient::new_with_commitment(
+        _validator.rpc_url.clone(),
+        CommitmentConfig::confirmed(),
+    );
+    airdrop(&client, &admin.pubkey(), 10_000_000_000);
+
+    let validators: Vec<Pubkey> = (0..3).map(|_| Keypair::new().pubkey()).collect();
+    send(
+        &client,
+        &[glc_ix::initialize_instruction(
+            &program_id,
+            &admin.pubkey(),
+            &validators,
+            2,
+            1_000,
+            2_000,
+            TIMELOCK_SECONDS,
+            21_000_000_000_000,
+        )],
+        &admin,
+    )
+    .expect("the shipped initialize builder stands the bridge up");
+
+    let read_config = || {
+        let (pda, _) = glc_ix::bridge_config_pda(&program_id);
+        let acct = client.get_account(&pda).unwrap();
+        glc_relayer::solana::rpc::decode_bridge_config(&acct.data).unwrap()
+    };
+
+    let cfg = read_config();
+    assert_eq!(cfg.min_deposit, 1_000);
+    assert_eq!(cfg.min_withdrawal, 2_000);
+    assert_eq!(cfg.max_wrapped_supply, 21_000_000_000_000);
+    assert!(!cfg.mint_is_configured());
+    assert_eq!(validators_of(&client, &program_id), validators);
+
+    // --- create the wrapped mint -----------------------------------------
+    let mint = Keypair::new();
+    let bh = client.get_latest_blockhash().unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[glc_ix::create_wrapped_mint_instruction(
+            &program_id,
+            &admin.pubkey(),
+            &mint.pubkey(),
+        )],
+        Some(&admin.pubkey()),
+        &[&admin, &mint],
+        bh,
+    );
+    client
+        .send_and_confirm_transaction(&tx)
+        .expect("the mint account signs its own creation");
+
+    let cfg = read_config();
+    assert!(cfg.mint_is_configured(), "the config records the new mint");
+    assert_eq!(cfg.wrapped_mint, mint.pubkey());
+
+    // --- custody #5: two-step admin handover ------------------------------
+    let successor = Keypair::new();
+    airdrop(&client, &successor.pubkey(), 10_000_000_000);
+
+    send(
+        &client,
+        &[glc_ix::transfer_admin_instruction(
+            &program_id,
+            &admin.pubkey(),
+            &successor.pubkey(),
+        )],
+        &admin,
+    )
+    .expect("the outgoing admin nominates a successor");
+
+    let cfg = read_config();
+    assert_eq!(
+        cfg.pending_admin,
+        Some(successor.pubkey()),
+        "the nomination is visible to show-config"
+    );
+    assert_eq!(
+        cfg.admin,
+        admin.pubkey(),
+        "nothing changes until the successor accepts — that is what stops a typo bricking \
+         governance"
+    );
+    // And the decoder must still read every later field correctly with the
+    // Option now occupying 33 bytes instead of one.
+    assert_eq!(cfg.wrapped_mint, mint.pubkey());
+    assert_eq!(cfg.max_wrapped_supply, 21_000_000_000_000);
+
+    // The outgoing admin still holds authority until the handover completes.
+    send(
+        &client,
+        &[glc_ix::set_paused_instruction(
+            &program_id,
+            &admin.pubkey(),
+            true,
+        )],
+        &admin,
+    )
+    .expect("the outgoing admin still governs mid-handover");
+    send(
+        &client,
+        &[glc_ix::set_paused_instruction(
+            &program_id,
+            &admin.pubkey(),
+            false,
+        )],
+        &admin,
+    )
+    .unwrap();
+
+    send(
+        &client,
+        &[glc_ix::accept_admin_instruction(
+            &program_id,
+            &successor.pubkey(),
+        )],
+        &successor,
+    )
+    .expect("the incoming admin accepts");
+
+    let cfg = read_config();
+    assert_eq!(cfg.admin, successor.pubkey(), "authority moved");
+    assert_eq!(cfg.pending_admin, None, "the nomination is consumed");
+
+    // The old key must no longer govern.
+    assert!(
+        send(
+            &client,
+            &[glc_ix::set_paused_instruction(
+                &program_id,
+                &admin.pubkey(),
+                true
+            )],
+            &admin,
+        )
+        .is_err(),
+        "the previous admin must lose authority once the handover completes"
+    );
+    send(
+        &client,
+        &[glc_ix::set_paused_instruction(
+            &program_id,
+            &successor.pubkey(),
+            true,
+        )],
+        &successor,
+    )
+    .expect("the new admin governs");
+}

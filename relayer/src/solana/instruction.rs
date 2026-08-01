@@ -360,6 +360,129 @@ pub fn execute_cap_raise_instruction(program_id: &Pubkey, executor: &Pubkey) -> 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bootstrap (Phase 7m)
+// ---------------------------------------------------------------------------
+//
+// `initialize` and `create_wrapped_mint` had **no caller outside the
+// program's own tests** — the bridge could not be stood up at all with the
+// shipped binaries, which made step 3 of the documented launch sequence
+// impossible. `transfer_admin`/`accept_admin` were in the same state, and
+// they are how custody #5 hands the admin key to a multisig.
+//
+// Account order and mutability are verbatim copies of the Anchor-generated
+// builders in `programs/glc-bridge/tests/common/mod.rs`, pinned on both
+// sides by `admin_governance_encoding.rs` and this module's tests.
+
+/// The `ProgramData` account the upgradeable loader keeps for a program.
+/// `initialize` reads it to prove the caller is the upgrade authority.
+pub fn program_data_address(program_id: &Pubkey) -> Pubkey {
+    #[allow(deprecated)]
+    Pubkey::find_program_address(
+        &[program_id.as_ref()],
+        &solana_sdk::bpf_loader_upgradeable::id(),
+    )
+    .0
+}
+
+/// `initialize` — creates the bridge config and the validator set.
+///
+/// Every parameter here is a launch-time security decision with **no
+/// default** (owner decision U6): the program rejects a zero timelock and a
+/// zero supply cap outright rather than inventing a value.
+#[allow(clippy::too_many_arguments)]
+pub fn initialize_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    validators: &[Pubkey],
+    threshold: u8,
+    min_deposit: u64,
+    min_withdrawal: u64,
+    governance_timelock_seconds: i64,
+    max_wrapped_supply: u64,
+) -> Instruction {
+    let mut data = Vec::with_capacity(8 + 4 + validators.len() * 32 + 1 + 8 * 4);
+    data.extend_from_slice(&anchor_discriminator("initialize"));
+    data.extend_from_slice(&(validators.len() as u32).to_le_bytes());
+    for v in validators {
+        data.extend_from_slice(v.as_ref());
+    }
+    data.push(threshold);
+    data.extend_from_slice(&min_deposit.to_le_bytes());
+    data.extend_from_slice(&min_withdrawal.to_le_bytes());
+    data.extend_from_slice(&governance_timelock_seconds.to_le_bytes());
+    data.extend_from_slice(&max_wrapped_supply.to_le_bytes());
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(*authority, true),
+            AccountMeta::new(bridge_config_pda(program_id).0, false),
+            AccountMeta::new(validator_set_pda(program_id).0, false),
+            AccountMeta::new_readonly(*program_id, false),
+            AccountMeta::new_readonly(program_data_address(program_id), false),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+        data,
+    }
+}
+
+/// `create_wrapped_mint` — one-time creation of the wrapped-GLC SPL mint.
+///
+/// The mint account is a **signer**: it is created by this instruction, so
+/// the caller must hold its keypair for exactly this one transaction and
+/// never again. Mint authority becomes the program's PDA and freeze
+/// authority is `None` (custody #6, ADR-0009).
+pub fn create_wrapped_mint_instruction(
+    program_id: &Pubkey,
+    admin: &Pubkey,
+    wrapped_mint: &Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(*admin, true),
+            AccountMeta::new(bridge_config_pda(program_id).0, false),
+            AccountMeta::new_readonly(mint_authority_pda(program_id).0, false),
+            AccountMeta::new(*wrapped_mint, true),
+            AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+        data: anchor_discriminator("create_wrapped_mint").to_vec(),
+    }
+}
+
+/// `transfer_admin` — step 1 of the two-step handover (custody #5).
+///
+/// Two steps exist so a typoed key cannot brick governance: nothing changes
+/// until the named key proves it exists by signing `accept_admin`.
+pub fn transfer_admin_instruction(
+    program_id: &Pubkey,
+    admin: &Pubkey,
+    new_admin: &Pubkey,
+) -> Instruction {
+    let mut data = Vec::with_capacity(40);
+    data.extend_from_slice(&anchor_discriminator("transfer_admin"));
+    data.extend_from_slice(new_admin.as_ref());
+    Instruction {
+        program_id: *program_id,
+        accounts: admin_config_metas(admin, program_id),
+        data,
+    }
+}
+
+/// `accept_admin` — step 2, signed by the incoming admin.
+pub fn accept_admin_instruction(program_id: &Pubkey, new_admin: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(*new_admin, true),
+            AccountMeta::new(bridge_config_pda(program_id).0, false),
+        ],
+        data: anchor_discriminator("accept_admin").to_vec(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,5 +788,128 @@ mod tests {
         let b = Pubkey::new_unique();
         assert_ne!(governance_action_pda(&a).0, governance_action_pda(&b).0);
         assert_eq!(governance_action_pda(&a).0, governance_action_pda(&a).0);
+    }
+
+    // --- bootstrap (Phase 7m) ---------------------------------------------
+
+    #[test]
+    fn initialize_encodes_its_arguments_in_declaration_order() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let validators = vec![Pubkey::new_unique(), Pubkey::new_unique()];
+        let ix = initialize_instruction(
+            &program_id,
+            &authority,
+            &validators,
+            2,
+            1_000,
+            2_000,
+            3_600,
+            77,
+        );
+        assert_eq!(&ix.data[..8], &anchor_discriminator("initialize"));
+        assert_eq!(&ix.data[8..12], &2u32.to_le_bytes());
+        assert_eq!(&ix.data[12..44], validators[0].as_ref());
+        assert_eq!(&ix.data[44..76], validators[1].as_ref());
+        assert_eq!(ix.data[76], 2);
+        assert_eq!(&ix.data[77..85], &1_000u64.to_le_bytes());
+        assert_eq!(&ix.data[85..93], &2_000u64.to_le_bytes());
+        assert_eq!(&ix.data[93..101], &3_600i64.to_le_bytes());
+        assert_eq!(&ix.data[101..109], &77u64.to_le_bytes());
+        assert_eq!(ix.data.len(), 109);
+
+        assert_eq!(
+            shape(&ix),
+            vec![
+                (authority, true, true),
+                (bridge_config_pda(&program_id).0, false, true),
+                (validator_set_pda(&program_id).0, false, true),
+                (program_id, false, false),
+                (program_data_address(&program_id), false, false),
+                (system_program::id(), false, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn initialize_preserves_validator_order() {
+        // Order fixes each validator's bitmask index for the whole life of
+        // the federation, so the bootstrap must not sort.
+        let program_id = Pubkey::new_unique();
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        let k = Pubkey::new_unique();
+        let ab = initialize_instruction(&program_id, &k, &[a, b], 1, 0, 0, 1, 1);
+        let ba = initialize_instruction(&program_id, &k, &[b, a], 1, 0, 0, 1, 1);
+        assert_ne!(ab.data, ba.data);
+        assert_eq!(&ab.data[12..44], a.as_ref());
+    }
+
+    #[test]
+    fn create_wrapped_mint_requires_the_mint_itself_to_sign() {
+        // The mint account is created by this instruction; marking it
+        // non-signing fails only against a live cluster.
+        let program_id = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let ix = create_wrapped_mint_instruction(&program_id, &admin, &mint);
+        assert_eq!(
+            ix.data,
+            anchor_discriminator("create_wrapped_mint").to_vec()
+        );
+        assert_eq!(
+            shape(&ix),
+            vec![
+                (admin, true, true),
+                (bridge_config_pda(&program_id).0, false, true),
+                (mint_authority_pda(&program_id).0, false, false),
+                (mint, true, true),
+                (TOKEN_PROGRAM_ID, false, false),
+                (system_program::id(), false, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_admin_handover_is_signed_by_each_side_in_turn() {
+        // Two steps so a typoed key cannot brick governance: the outgoing
+        // admin names the successor, and nothing changes until the successor
+        // proves it exists by signing.
+        let program_id = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
+        let new_admin = Pubkey::new_unique();
+
+        let t = transfer_admin_instruction(&program_id, &admin, &new_admin);
+        assert_eq!(&t.data[..8], &anchor_discriminator("transfer_admin"));
+        assert_eq!(&t.data[8..40], new_admin.as_ref());
+        assert_eq!(t.data.len(), 40);
+        assert_eq!(
+            shape(&t)[0],
+            (admin, true, false),
+            "the OUTGOING admin signs"
+        );
+
+        let a = accept_admin_instruction(&program_id, &new_admin);
+        assert_eq!(a.data, anchor_discriminator("accept_admin").to_vec());
+        assert_eq!(
+            shape(&a)[0],
+            (new_admin, true, false),
+            "the INCOMING admin signs"
+        );
+    }
+
+    #[test]
+    fn the_program_data_address_is_derived_from_the_upgradeable_loader() {
+        // `initialize` reads it to prove the caller is the upgrade
+        // authority; deriving it from the wrong program id would make every
+        // bootstrap fail with an opaque constraint error.
+        let program_id = Pubkey::new_unique();
+        #[allow(deprecated)]
+        let expected = Pubkey::find_program_address(
+            &[program_id.as_ref()],
+            &solana_sdk::bpf_loader_upgradeable::id(),
+        )
+        .0;
+        assert_eq!(program_data_address(&program_id), expected);
     }
 }
