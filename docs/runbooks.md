@@ -490,7 +490,9 @@ chain — it is what makes their signer's refusal mean anything — so a backup
 that turns out to be corrupt is worse than no backup, because it is trusted.
 
 **Snapshot.** SQLite is in WAL mode, so copying the file while the relayer
-runs produces a torn database. Use SQLite's own consistent-snapshot support:
+runs produces a torn database. Use SQLite's own consistent-snapshot support
+— this needs the `sqlite3` CLI on the host, which the bridge does not ship
+and which is not otherwise required:
 
 ```
 sqlite3 "$GLC_DB_PATH" ".backup '/backups/relayer-$(date -u +%Y%m%dT%H%M%SZ).sqlite3'"

@@ -52,5 +52,6 @@ deployable. No keys or secrets exist in this repository — report anything that
 looks like one (see [SECURITY.md](SECURITY.md) for how). Threat model:
 [docs/threat-model.md](docs/threat-model.md); operator procedures:
 [docs/runbooks.md](docs/runbooks.md); launch readiness:
-[docs/launch-checklist.md](docs/launch-checklist.md); terminology:
+[docs/launch-checklist.md](docs/launch-checklist.md) and
+[docs/remaining-before-launch.md](docs/remaining-before-launch.md); terminology:
 [docs/glossary.md](docs/glossary.md).
