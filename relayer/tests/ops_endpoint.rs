@@ -62,7 +62,7 @@ async fn get(url: &str) -> (u16, String, String) {
 
 #[tokio::test]
 async fn a_healthy_bridge_serves_200_on_health() {
-    let report = build_report(&snapshot(Some(SUPPLY - FEES)), 0, 0, true, &[]);
+    let report = build_report(&snapshot(Some(SUPPLY - FEES)), 0, 0, true, None, &[]);
     let (base, _tx) = spawn(report).await;
     let (status, ctype, body) = get(&format!("{base}/health")).await;
     assert_eq!(status, 200);
@@ -76,7 +76,7 @@ async fn a_breached_invariant_serves_503_so_uptime_checks_alarm() {
     // HTTP check the operator is already watching.
     let mut bad = snapshot(Some(SUPPLY));
     bad.wrapped_supply = SUPPLY + 1;
-    let (base, _tx) = spawn(build_report(&bad, 0, 0, true, &[])).await;
+    let (base, _tx) = spawn(build_report(&bad, 0, 0, true, None, &[])).await;
     let (status, _, body) = get(&format!("{base}/health")).await;
     assert_eq!(status, 503);
     assert!(body.contains("BREACH solvency"), "{body}");
@@ -91,6 +91,7 @@ async fn metrics_serve_200_even_when_the_bridge_is_unhealthy() {
         5,
         2,
         false,
+        None,
         &[],
     ))
     .await;
@@ -110,6 +111,7 @@ async fn the_fee_drift_is_exported_on_a_healthy_bridge() {
         0,
         0,
         true,
+        None,
         &[],
     ))
     .await;
@@ -130,6 +132,7 @@ async fn an_unknown_path_is_404() {
         0,
         0,
         true,
+        None,
         &[],
     ))
     .await;
@@ -145,6 +148,7 @@ async fn nothing_is_cacheable() {
         0,
         0,
         true,
+        None,
         &[],
     ))
     .await;
@@ -177,6 +181,7 @@ async fn the_endpoint_survives_many_sequential_scrapes() {
         0,
         0,
         true,
+        None,
         &[],
     ))
     .await;

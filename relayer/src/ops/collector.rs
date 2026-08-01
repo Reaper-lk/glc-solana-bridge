@@ -19,7 +19,8 @@ use std::sync::Arc;
 use solana_sdk::pubkey::Pubkey;
 
 use crate::glc::db::Db;
-use crate::ops::health::{build_report, HealthReport, ReportSource};
+use crate::ops::health::{build_report, HealthReport, IndexerSummary, ReportSource};
+use crate::ops::indexer_status::IndexerStatus;
 use crate::ops::solvency::snapshot_from_db;
 use crate::solana::epoch::EpochObservation;
 use crate::solana::rpc::SolanaRpc;
@@ -39,6 +40,11 @@ pub struct OpsCollector<R: SolanaRpc, P: PayoutRpc> {
     vault_address: String,
     vault_min_confirmations: i64,
     epoch: Arc<EpochObservation>,
+    /// Shared with the indexer loop. `None` for a deployment that reports on
+    /// a database it does not itself index — the invariant is then omitted
+    /// rather than guessed, since claiming an indexer is healthy when this
+    /// process cannot see one would be worse than saying nothing.
+    indexer: Option<Arc<IndexerStatus>>,
 }
 
 impl<R: SolanaRpc, P: PayoutRpc> OpsCollector<R, P> {
@@ -60,7 +66,15 @@ impl<R: SolanaRpc, P: PayoutRpc> OpsCollector<R, P> {
             vault_address,
             vault_min_confirmations,
             epoch,
+            indexer: None,
         }
+    }
+
+    /// Attaches the indexer's shared status (Phase 7i), so `/health` reports
+    /// a halted indexer instead of 200.
+    pub fn with_indexer_status(mut self, status: Arc<IndexerStatus>) -> Self {
+        self.indexer = Some(status);
+        self
     }
 
     /// Wrapped supply from the SPL mint account, or `None` if unreadable.
@@ -148,6 +162,11 @@ impl<R: SolanaRpc, P: PayoutRpc> OpsCollector<R, P> {
             halted_deposits,
             halted_withdrawals,
             self.epoch.is_fresh_at(now_unix()),
+            self.indexer.as_ref().map(|i| IndexerSummary {
+                halted: i.is_halted(),
+                halted_depth: i.halted_depth(),
+                seconds_since_tick: i.seconds_since_tick(now_unix()),
+            }),
             &borrowed,
         );
 

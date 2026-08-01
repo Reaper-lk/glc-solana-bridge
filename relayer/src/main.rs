@@ -397,6 +397,7 @@ async fn run_indexer_loop(
     mut indexer: Indexer<RpcClient>,
     poll_interval: Duration,
     unavailable_interval: Duration,
+    status: std::sync::Arc<glc_relayer::ops::indexer_status::IndexerStatus>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     loop {
@@ -408,6 +409,7 @@ async fn run_indexer_loop(
             result = indexer.tick() => {
                 match result {
                     Ok(TickOutcome::Progressed { blocks_indexed, reorg }) => {
+                        status.record_tick(now_unix());
                         if let Some(r) = reorg {
                             tracing::warn!(
                                 fork_height = r.fork_height,
@@ -422,6 +424,10 @@ async fn run_indexer_loop(
                         tokio::time::sleep(poll_interval).await;
                     }
                     Ok(TickOutcome::Halted { attempted_depth }) => {
+                        // Published so /health reports it. Before this the
+                        // halt was a single log line and the endpoint kept
+                        // returning 200 while nothing was being indexed.
+                        status.record_halt(attempted_depth);
                         tracing::error!(
                             attempted_depth,
                             "reorg deeper than max_reorg_depth: indexer halted, manual intervention required"
@@ -698,10 +704,14 @@ async fn main() -> anyhow::Result<()> {
         std::sync::Arc::clone(&epoch_observation),
         shutdown_rx.clone(),
     ));
+    let indexer_status = std::sync::Arc::new(glc_relayer::ops::indexer_status::IndexerStatus::new(
+        now_unix(),
+    ));
     let mut indexer_task = tokio::spawn(run_indexer_loop(
         indexer,
         poll_interval,
         unavailable_interval,
+        std::sync::Arc::clone(&indexer_status),
         shutdown_rx.clone(),
     ));
     let mut orchestrator_task = tokio::spawn(run_orchestrator_loop(
@@ -723,7 +733,8 @@ async fn main() -> anyhow::Result<()> {
             withdrawal_config.vault_address.clone(),
             withdrawal_config.vault_min_confirmations,
             std::sync::Arc::clone(&epoch_observation),
-        );
+        )
+        .with_indexer_status(std::sync::Arc::clone(&indexer_status));
         tokio::spawn(health::serve(
             addr,
             std::sync::Arc::new(collector),
