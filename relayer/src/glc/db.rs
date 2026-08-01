@@ -925,6 +925,39 @@ impl Db {
             .sum())
     }
 
+    /// How many deposits sit in each state, for the per-state gauges
+    /// (ADR-0014 §13.2).
+    pub fn deposit_counts_by_state(&self) -> Result<Vec<(String, u64)>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT state, COUNT(*) FROM deposit_candidates GROUP BY state")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Total value of every deposit this relayer has seen MINTED, in atomic
+    /// units (Phase 7h).
+    ///
+    /// `Minted`, not `ReadyForSignature`: only a deposit whose wrapped GLC
+    /// actually exists backs any supply, and counting earlier states would
+    /// overstate backing.
+    pub fn minted_deposit_total(&self) -> Result<u64, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT amount_atomic FROM deposit_candidates WHERE state = 'Minted'")?;
+        let rows: Vec<Vec<u8>> = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+            .sum())
+    }
+
     pub fn schema_version(&self) -> Result<i64, DbError> {
         Ok(self
             .conn

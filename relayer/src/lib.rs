@@ -6,6 +6,7 @@
 //! environment-wiring binary over this library.
 
 pub mod glc;
+pub mod ops;
 pub mod orchestrator;
 pub mod p2p;
 pub mod signer;

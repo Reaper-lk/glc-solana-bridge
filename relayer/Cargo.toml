@@ -87,6 +87,9 @@ prost = "0.13"
 # accounts over 128 bytes (a WithdrawalRequest is 180).
 solana-account-decoder-client-types = "2.3"
 libsecp256k1 = "0.6"
+hyper = { version = "1.11.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+http-body-util = "0.1.4"
 
 [build-dependencies]
 tonic-build = "0.13"
