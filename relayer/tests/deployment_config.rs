@@ -261,3 +261,125 @@ fn the_checklist_states_its_own_limits() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The v1.0 readiness document
+// ---------------------------------------------------------------------------
+
+/// The readiness document is what an auditor and a new operator read first,
+/// so every ADR, sibling document and `glc-admin` command it names must
+/// exist. A front door that points at missing rooms is worse than no front
+/// door: it is read with more trust, not less.
+#[test]
+fn everything_the_readiness_document_points_at_exists() {
+    let doc = read("../docs/release-readiness-v1.0.md");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    // ADRs, by number — the filenames are prefixed inconsistently (0014 is
+    // `ADR-0014-...`), so match on the number rather than a constructed name.
+    let mut adrs = BTreeSet::new();
+    for (i, _) in doc.match_indices("ADR-") {
+        let n: String = doc[i + 4..].chars().take(4).collect();
+        if n.len() == 4 && n.chars().all(|c| c.is_ascii_digit()) {
+            adrs.insert(n);
+        }
+    }
+    assert!(
+        adrs.len() > 10,
+        "parsed only {} ADRs — extractor broken",
+        adrs.len()
+    );
+    let adr_dir = root.join("../docs/adr");
+    let present: Vec<String> = std::fs::read_dir(&adr_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+        .collect();
+    let missing_adrs: Vec<&String> = adrs
+        .iter()
+        .filter(|n| !present.iter().any(|f| f.contains(n.as_str())))
+        .collect();
+    assert!(
+        missing_adrs.is_empty(),
+        "the readiness document cites ADRs that do not exist: {missing_adrs:?}"
+    );
+
+    // Sibling documents.
+    let mut docs = BTreeSet::new();
+    for (i, _) in doc.match_indices(".md") {
+        let start = doc[..i].rfind(['`', '/', '(']);
+        if let Some(st) = start {
+            let name = &doc[st + 1..i + 3];
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+            {
+                docs.insert(name.to_string());
+            }
+        }
+    }
+    let missing_docs: Vec<&String> = docs
+        .iter()
+        .filter(|f| !adr_dir.join(f).exists() && !root.join("../docs").join(f).exists())
+        .collect();
+    assert!(
+        missing_docs.is_empty(),
+        "the readiness document cites files that do not exist: {missing_docs:?}"
+    );
+
+    // Commands.
+    let admin = read("src/bin/glc-admin.rs");
+    let mut cmds = BTreeSet::new();
+    for (i, _) in doc.match_indices("glc-admin ") {
+        let w: String = doc[i + 10..]
+            .chars()
+            .take_while(|c| c.is_ascii_lowercase() || *c == '-')
+            .collect();
+        if w.len() > 2 && !w.ends_with('-') {
+            cmds.insert(w);
+        }
+    }
+    let missing_cmds: Vec<&String> = cmds
+        .iter()
+        .filter(|c| !admin.contains(&format!("\"{c}\" =>")))
+        .collect();
+    assert!(
+        missing_cmds.is_empty(),
+        "the readiness document names commands glc-admin does not accept: {missing_cmds:?}"
+    );
+}
+
+/// The readiness document must keep stating that the bridge is not ready.
+///
+/// It is the document most likely to be quoted out of context, and the one
+/// where an omission reads as clearance.
+#[test]
+fn the_readiness_document_states_it_is_not_ready() {
+    // Markdown wraps prose, so a claim can be split across lines and a
+    // naive `contains` would miss it. Normalise whitespace first: the
+    // requirement is that the document SAYS this, not how it is laid out.
+    // Strip blockquote markers first — they are markdown syntax, not prose,
+    // and a wrapped sentence inside a `>` block would otherwise normalise to
+    // "not ready to > launch" and never match.
+    let raw = read("../docs/release-readiness-v1.0.md");
+    let stripped: String = raw
+        .lines()
+        .map(|l| l.trim_start().trim_start_matches('>').trim_start())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let doc = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    for claim in [
+        "not ready to launch",
+        "No federation exists",
+        "No external security audit has been performed",
+        "single key",
+        // The M-of-N assumption is the whole trust model; losing this
+        // sentence would let a reader mistake it for a trustless bridge.
+        "federated",
+    ] {
+        assert!(
+            doc.contains(claim),
+            "docs/release-readiness-v1.0.md no longer records: {claim:?}"
+        );
+    }
+}
