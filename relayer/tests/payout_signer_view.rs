@@ -100,6 +100,7 @@ struct Fixture {
     _dir: tempfile::TempDir,
     db_path: std::path::PathBuf,
     vault: MultisigVault,
+    cfg: glc_relayer::withdrawal::config::WithdrawalConfig,
     intent: Vec<u8>,
     unsigned_hex: String,
     signer: RecordingSigner,
@@ -244,9 +245,27 @@ fn fixture(quorum: &[u8], quorum_attempt: u32, state: WithdrawalState) -> Fixtur
     let signer = RecordingSigner::default();
     *signer.keys.lock().unwrap() = Some((vault.clone(), 0));
 
+    let cfg = glc_relayer::withdrawal::config::WithdrawalConfig::validate(
+        glc_relayer::withdrawal::config::RawWithdrawalConfig {
+            vault_redeem_script_hex: vault.redeem_script_hex(),
+            vault_address: vault.address.clone(),
+            change_address: vault.address.clone(),
+            fee_rate_per_kb: 100_000,
+            dust_threshold_atomic: 5_400,
+            vault_min_confirmations: 1,
+            confirmation_depth: 2,
+            max_inputs_per_payout: 20,
+            reservation_timeout_secs: 900,
+            discovery_commitment: "finalized".into(),
+            poll_interval_ms: 500,
+        },
+    )
+    .unwrap();
+
     Fixture {
         _dir: dir,
         db_path,
+        cfg,
         vault,
         intent,
         unsigned_hex,
@@ -255,7 +274,7 @@ fn fixture(quorum: &[u8], quorum_attempt: u32, state: WithdrawalState) -> Fixtur
 }
 
 fn view(f: &Fixture, signer_index: u8) -> PayoutView<RecordingSigner> {
-    PayoutView::new(f.vault.clone(), signer_index, f.signer.clone()).unwrap()
+    PayoutView::new(f.cfg.clone(), signer_index, f.signer.clone()).unwrap()
 }
 
 async fn sign(
@@ -267,7 +286,7 @@ async fn sign(
 ) -> Result<glc_relayer::p2p::payout_view::PayoutPartial, PayoutRefusal> {
     let mut db = Db::open(&f.db_path).unwrap();
     view(f, signer_index)
-        .sign_payout(&mut db, INDEX as u64, attempt, intent, unsigned, now())
+        .sign_payout(&mut db, INDEX as u64, attempt, intent, unsigned, 0, now())
         .await
 }
 
@@ -434,7 +453,7 @@ async fn refuses_a_withdrawal_it_has_never_observed() {
     let f = fixture(QUORUM, 0, WithdrawalState::Signing);
     let mut db = Db::open(&f.db_path).unwrap();
     let err = view(&f, 0)
-        .sign_payout(&mut db, 9_999, 0, &f.intent, &f.unsigned_hex, now())
+        .sign_payout(&mut db, 9_999, 0, &f.intent, &f.unsigned_hex, 0, now())
         .await
         .unwrap_err();
     assert!(
@@ -498,9 +517,9 @@ async fn a_disappeared_utxo_halts_rather_than_signing() {
 fn a_vault_index_outside_the_signer_set_is_refused_at_construction() {
     // ADR-0017 E1: fail closed rather than run with a mapping that could
     // route a signing request to the wrong key.
-    let (vault, _) = InProcessPayoutCollector::deterministic_test_vault(3, 2);
-    assert!(PayoutView::new(vault.clone(), 3, RecordingSigner::default()).is_err());
-    assert!(PayoutView::new(vault, 2, RecordingSigner::default()).is_ok());
+    let f = fixture(QUORUM, 0, WithdrawalState::Signing);
+    assert!(PayoutView::new(f.cfg.clone(), 3, RecordingSigner::default()).is_err());
+    assert!(PayoutView::new(f.cfg.clone(), 2, RecordingSigner::default()).is_ok());
 }
 
 #[test]

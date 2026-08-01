@@ -48,6 +48,7 @@ use glc_relayer::solana::config::{RawSolanaConfig, SolanaConfig};
 use glc_relayer::solana::epoch::{observe_epoch, run_epoch_refresher, EpochObservation};
 use glc_relayer::solana::rpc::RealSolanaRpc;
 use glc_relayer::withdrawal::adapter::RealPayoutRpc;
+use glc_relayer::withdrawal::assignment::OperatorAssignment;
 use glc_relayer::withdrawal::completion::{CompletionError, CompletionSubmitter};
 use glc_relayer::withdrawal::config::{RawWithdrawalConfig, WithdrawalConfig};
 use glc_relayer::withdrawal::discovery;
@@ -55,6 +56,7 @@ use glc_relayer::withdrawal::executor::{ExecutorError, WithdrawalExecutor};
 use glc_relayer::withdrawal::federation::{
     FederationCompletionCollector, FederationPayoutCollector, VaultSignerMap,
 };
+use glc_relayer::withdrawal::status::SolanaWithdrawalStatus;
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -350,6 +352,13 @@ async fn run_completion_loop(
 /// exists for loopback and regtest, and is loud on purpose: without it a
 /// relayer talks to its signers in plaintext, with no transport
 /// authentication at all.
+/// Whether `who` appears in a raw `GLC_FEDERATION_PEERS` string.
+fn peers_contain(raw: &str, who: &Pubkey) -> bool {
+    parse_peers(raw, None)
+        .map(|ps| ps.iter().any(|p| p.validator_pubkey == *who))
+        .unwrap_or(false)
+}
+
 fn collector_from_env() -> anyhow::Result<GrpcCollector> {
     let peers = parse_peers(&env_required("GLC_FEDERATION_PEERS")?, None)?;
 
@@ -566,6 +575,44 @@ async fn main() -> anyhow::Result<()> {
         &env_required("GLC_VAULT_SIGNER_MAP")?,
         &withdrawal_config.vault,
     )?;
+
+    // Phase 7g (ADR-0019 D1): this relayer's own federation identity, stated
+    // EXPLICITLY and never derived. It decides who acts first, and inferring
+    // it from the shape of another setting is how two configurations drift
+    // apart without anyone noticing.
+    let relayer_identity: Pubkey = env_required("GLC_RELAYER_VALIDATOR_PUBKEY")?
+        .parse()
+        .map_err(|e| anyhow::anyhow!("GLC_RELAYER_VALIDATOR_PUBKEY is not a pubkey: {e}"))?;
+    // Fails closed both ways: we must not be listed among our own peers, and
+    // we must appear in the vault signer map — that map is what gives us an
+    // operator index at all.
+    let peers_raw = env_required("GLC_FEDERATION_PEERS")?;
+    if peers_contain(&peers_raw, &relayer_identity) {
+        return Err(anyhow::anyhow!(
+            "GLC_RELAYER_VALIDATOR_PUBKEY {relayer_identity} appears in GLC_FEDERATION_PEERS; \
+             peers are the OTHER operators"
+        ));
+    }
+    let operator_index = vault_signer_map
+        .index_of(&relayer_identity)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "GLC_RELAYER_VALIDATOR_PUBKEY {relayer_identity} does not appear in \
+                 GLC_VAULT_SIGNER_MAP — refusing to start without an operator index"
+            )
+        })?;
+    let assignment = OperatorAssignment::new(
+        operator_index as usize,
+        vault_signer_map.len(),
+        env_optional_u64("GLC_PAYOUT_BUILD_TIMEOUT_SECS", 120)? as i64,
+        env_optional_u64("GLC_MINT_SUBMIT_TIMEOUT_SECS", 60)? as i64,
+    )?;
+    tracing::info!(
+        validator = %relayer_identity,
+        operator_index,
+        operator_count = vault_signer_map.len(),
+        "relayer identity validated against the federation configuration"
+    );
     tracing::info!(
         vault_signers = vault_signer_map.len(),
         threshold = withdrawal_config.vault.threshold,
@@ -590,6 +637,7 @@ async fn main() -> anyhow::Result<()> {
         collector_from_env()?,
         withdrawal_config.vault.clone(),
         vault_signer_map,
+        operator_index as u32,
     );
     let withdrawal_executor = WithdrawalExecutor::new(
         Db::open(&db_path)?,
@@ -597,7 +645,13 @@ async fn main() -> anyhow::Result<()> {
         withdrawal_config.clone(),
         payout_collector,
         std::sync::Arc::clone(&epoch_observation),
-    );
+    )
+    .with_assignment(assignment)
+    // ADR-0019 D4: the last check before funds move.
+    .with_onchain_status(std::sync::Arc::new(SolanaWithdrawalStatus::new(
+        RealSolanaRpc::new(solana_config.rpc_url.clone(), solana_config.commitment),
+        solana_config.program_id,
+    )));
     let discovery_rpc = RealSolanaRpc::new(solana_config.rpc_url.clone(), solana_config.commitment);
 
     // Fourth service: recording completed payouts on Solana (Phase 7f,

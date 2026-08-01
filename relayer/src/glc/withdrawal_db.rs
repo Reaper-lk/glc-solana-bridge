@@ -323,6 +323,9 @@ pub struct WithdrawalRow {
     pub protocol_version: u8,
     pub state: WithdrawalState,
     pub failure_reason: Option<String>,
+    /// When this relayer first observed the withdrawal. The failover window
+    /// for builder assignment is measured from here (ADR-0019 D2).
+    pub observed_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -607,7 +610,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT withdrawal_index, pda, amount_atomic, requester, glc_address,
                     glc_address_hash160, requested_at_slot, protocol_version, state,
-                    failure_reason
+                    failure_reason, observed_at
              FROM withdrawal_requests WHERE state = ?1 ORDER BY withdrawal_index",
         )?;
         let rows = stmt
@@ -620,7 +623,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT withdrawal_index, pda, amount_atomic, requester, glc_address,
                     glc_address_hash160, requested_at_slot, protocol_version, state,
-                    failure_reason
+                    failure_reason, observed_at
              FROM withdrawal_requests WHERE withdrawal_index = ?1",
         )?;
         let row = stmt
@@ -1547,6 +1550,7 @@ fn row_to_withdrawal(r: &rusqlite::Row) -> rusqlite::Result<WithdrawalRow> {
         glc_address_hash160: to_array20(&h160),
         requested_at_slot: r.get(6)?,
         protocol_version: r.get(7)?,
+        observed_at: r.get(10)?,
         state: WithdrawalState::parse(&state).map_err(|_| {
             rusqlite::Error::FromSqlConversionFailure(
                 8,
@@ -1597,6 +1601,33 @@ fn row_to_payout(r: &rusqlite::Row) -> rusqlite::Result<PayoutRow> {
 }
 
 impl Db {
+    /// When this withdrawal last became eligible for building — the later
+    /// of first observation and its most recent state change.
+    ///
+    /// The failover window (ADR-0019 D2) is measured from HERE, not from
+    /// `observed_at`. Measuring from observation looks right and is wrong:
+    /// a withdrawal that sat in `AwaitingFunds` for an hour would have a
+    /// long-expired window the moment funds arrived, so every operator would
+    /// build it at once and assignment would decide nothing. Caught by the
+    /// dual-executor harness, not by reasoning.
+    pub fn withdrawal_eligible_since(&self, index: i64) -> Result<i64, DbError> {
+        let observed: i64 = self.conn.query_row(
+            "SELECT observed_at FROM withdrawal_requests WHERE withdrawal_index = ?1",
+            params![index],
+            |r| r.get(0),
+        )?;
+        let last_change: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT MAX(at) FROM withdrawal_state_log WHERE withdrawal_index = ?1",
+                params![index],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(observed.max(last_change.unwrap_or(observed)))
+    }
+
     /// Withdrawals whose payout is locally `Completed` but which have not
     /// yet been observed completed on Solana (ADR-0018 D7).
     pub fn payouts_awaiting_onchain_completion(&self) -> Result<Vec<i64>, DbError> {
@@ -1774,6 +1805,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(logged, 1, "the anomaly must be audited exactly once");
+    }
+
+    #[test]
+    fn eligibility_is_measured_from_the_last_state_change_not_from_observation() {
+        // ADR-0019 D2. A withdrawal that sat in AwaitingFunds for an hour
+        // must NOT have a long-expired failover window the moment funds
+        // arrive — otherwise every operator builds at once and assignment
+        // decides nothing. Caught by the dual-executor harness, not by
+        // reasoning about it.
+        let mut db = mem_db();
+        db.observe_withdrawal(&new_withdrawal(1, 100_000)).unwrap();
+        assert_eq!(
+            db.withdrawal_eligible_since(1).unwrap(),
+            1_000,
+            "with no transitions yet, observation is the mark"
+        );
+
+        db.transition_withdrawal(1, WithdrawalState::Validated, 5_000, None)
+            .unwrap();
+        assert_eq!(
+            db.withdrawal_eligible_since(1).unwrap(),
+            5_000,
+            "a later transition moves the mark forward"
+        );
+
+        db.transition_withdrawal(1, WithdrawalState::AwaitingFunds, 9_999, None)
+            .unwrap();
+        assert_eq!(
+            db.withdrawal_eligible_since(1).unwrap(),
+            9_999,
+            "and keeps moving it, so a long wait does not expire the window"
+        );
     }
 
     #[test]

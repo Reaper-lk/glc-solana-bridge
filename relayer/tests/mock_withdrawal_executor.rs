@@ -625,6 +625,95 @@ async fn an_incomplete_quorum_never_broadcasts_and_is_retried_not_halted() {
     assert_eq!(h.rpc.send_calls(), 1);
 }
 
+/// A controllable on-chain status oracle (Phase 7g, ADR-0019 D4).
+#[derive(Clone, Default)]
+struct FakeChainStatus {
+    completed: Arc<Mutex<bool>>,
+    fail: Arc<Mutex<bool>>,
+    calls: Arc<Mutex<usize>>,
+}
+
+#[tonic::async_trait]
+impl glc_relayer::withdrawal::executor::OnChainWithdrawalStatus for FakeChainStatus {
+    async fn is_completed(&self, _index: u64) -> Result<bool, String> {
+        *self.calls.lock().unwrap() += 1;
+        if *self.fail.lock().unwrap() {
+            return Err("chain unavailable".into());
+        }
+        Ok(*self.completed.lock().unwrap())
+    }
+}
+
+impl FakeChainStatus {
+    fn calls(&self) -> usize {
+        *self.calls.lock().unwrap()
+    }
+}
+
+#[tokio::test]
+async fn a_payout_already_completed_on_chain_is_never_broadcast() {
+    // ADR-0019 D4. Phase 7g measured two operators paying one withdrawal
+    // twice with NOTHING in the executor to stop it (§2.2). This is the
+    // guard that closes that gap in the process that would cause the harm.
+    let h = Harness::new(vec![utxo(1, 0, 5_000_000)]);
+    let status = FakeChainStatus::default();
+    *status.completed.lock().unwrap() = true;
+
+    let mut e = h
+        .executor()
+        .with_onchain_status(std::sync::Arc::new(status.clone()));
+    e.ingest_discovered(&[withdrawal(1, 1_000_000)]).unwrap();
+    e.tick().await.unwrap();
+
+    assert!(status.calls() > 0, "the chain must actually be consulted");
+    assert_eq!(
+        h.rpc.send_calls(),
+        0,
+        "a withdrawal already Completed on-chain must never be broadcast again"
+    );
+}
+
+#[tokio::test]
+async fn a_payout_not_yet_completed_on_chain_broadcasts_normally() {
+    let h = Harness::new(vec![utxo(1, 0, 5_000_000)]);
+    let status = FakeChainStatus::default(); // not completed
+    let mut e = h
+        .executor()
+        .with_onchain_status(std::sync::Arc::new(status.clone()));
+    e.ingest_discovered(&[withdrawal(1, 1_000_000)]).unwrap();
+    e.tick().await.unwrap();
+
+    assert!(status.calls() > 0);
+    assert_eq!(h.rpc.send_calls(), 1, "the ordinary path is unaffected");
+    assert_eq!(h.state(1), WithdrawalState::Confirming);
+}
+
+#[tokio::test]
+async fn an_unreadable_chain_withholds_the_broadcast_rather_than_guessing() {
+    // Waiting is always safe; broadcasting on a guess is not. An error must
+    // never be read as "not completed".
+    let h = Harness::new(vec![utxo(1, 0, 5_000_000)]);
+    let status = FakeChainStatus::default();
+    *status.fail.lock().unwrap() = true;
+
+    let mut e = h
+        .executor()
+        .with_onchain_status(std::sync::Arc::new(status.clone()));
+    e.ingest_discovered(&[withdrawal(1, 1_000_000)]).unwrap();
+    e.tick().await.unwrap();
+
+    assert_eq!(h.rpc.send_calls(), 0, "no broadcast on an unreadable chain");
+
+    // ...and it recovers once the chain is readable again.
+    *status.fail.lock().unwrap() = false;
+    h.executor()
+        .with_onchain_status(std::sync::Arc::new(status))
+        .tick()
+        .await
+        .unwrap();
+    assert_eq!(h.rpc.send_calls(), 1, "the withheld payout is retried");
+}
+
 #[tokio::test]
 async fn a_txid_disagreement_with_the_node_halts_before_broadcast() {
     // Assembly moved into our code (Goldcoin 0.17 has no

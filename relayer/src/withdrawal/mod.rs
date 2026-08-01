@@ -16,6 +16,7 @@
 
 pub mod adapter;
 pub mod address;
+pub mod assignment;
 pub mod builder;
 pub mod coin;
 pub mod completion;
@@ -24,4 +25,5 @@ pub mod discovery;
 pub mod executor;
 pub mod federation;
 pub mod multisig;
+pub mod status;
 pub mod vault;

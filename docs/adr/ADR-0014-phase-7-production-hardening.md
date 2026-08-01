@@ -666,12 +666,61 @@ election protocol, no distributed lock, no shared database.
 | Concern | Mechanism |
 |---|---|
 | Observation and signing | Fully parallel — every validator independently observes and signs. This *is* the federation model. |
-| Mint submission | Designated submitter = `deposit_id mod N`; others wait `T_submit` then any may submit. Duplicates are already harmless — the claim PDA's `init` prevents double-mint (ADR-0003); only fees are wasted. |
+| Mint submission | Designated submitter = `deposit_id mod N`; others wait `T_submit` then any may submit. Duplicate **mints** are harmless — the claim PDA's `init` prevents double-mint (ADR-0003); only fees are wasted. |
 | Payout construction | Designated builder = `withdrawal_index mod N`, with `T_build` failover. |
-| **Two executors building different payouts** | Prevented by construction: ADR-0013 made coin selection **deterministic and reproducible on replay** (exact-match → smallest-covering → greedy, tie-broken on `(txid, vout)`). Validators independently re-run selection against the confirmed UTXO set at the stated height and refuse to sign any intent that does not reproduce exactly. A divergent intent simply never reaches threshold. |
+| **Two executors building different payouts** | ~~Prevented by construction by deterministic coin selection.~~ **CORRECTED — see §10.1.** Determinism is necessary but NOT sufficient: selection runs over each operator's *locally reserved* UTXO set, so discovery-order skew alone produces different transactions. Measured, not argued. |
 | UTXO reservation | Local to each validator's own database. Cross-validator agreement comes from the signed intent; the **UTXO set is the final arbiter** (`-25 Missing inputs`, verified in Phase 6). |
 | Database independence | Each validator keeps its own SQLite. No shared state, no cross-node locking, no consensus. |
 | Failover | Timeout-based promotion. Worst case is a duplicate broadcast of the **identical** transaction, which Phase 6 verified is idempotent (`-27` = already in chain). |
+
+### 10.1 CORRECTION (Phase 7g, 2026-08-01) — measured, and worse than stated
+
+Two claims above were wrong. Both were corrected only because Phase 7g
+measured them against a real regtest node instead of reasoning about them
+(`docs/experiments/` harness; results in ADR-0019 §2).
+
+**Wrong claim 1 — "prevented by construction".** Deterministic coin
+selection does not make two executors agree. Selection runs over
+`available_utxos`, which filters on `state = 'Available'` — **local
+reservation state**. Two operators that observe withdrawals in a different
+order reserve different UTXOs and then build genuinely different
+transactions from identical, deterministic rules.
+
+Measured with two executors and one shared node, nothing broadcast:
+
+| discovery order | withdrawal 5 | withdrawal 7 |
+|---|---|---|
+| identical | AGREE | AGREE |
+| staggered | **DIVERGED** | **DIVERGED** |
+
+**Wrong claim 2 — "duplicates are already harmless".** True of mints. **Not
+true of payouts**, and the original wording generalised it. With the Phase
+7e signer check bypassed, two operators paid the same withdrawal twice —
+three confirmed payments totalling 90 GLC where 60 was owed:
+
+```
+A w5: 30 GLC   A w7: 30 GLC   B w7: 30 GLC   <- w7 paid twice
+```
+
+The sequence needs no adversary: B pays w7, A never learns, the vault is
+refunded, A still believes w7 unpaid and pays it again.
+
+**The corrected safety model.** Nothing in the *executor* prevented this.
+The guards that do, in order:
+
+1. **Phase 7e's signer check (primary).** A second payout needs quorum
+   signatures, and a peer whose own executor has that withdrawal past the
+   Building/Signing window refuses. This is load-bearing, and it lives in a
+   **different process** from the one that would cause the harm.
+2. **Phase 7f completion + discovery filter (secondary).** Stops a fresh or
+   restarted relayer re-queuing a paid withdrawal; does nothing for one
+   that already ingested it.
+3. **Phase 7g's pre-broadcast check (added because of this measurement).**
+   The executor re-reads the on-chain withdrawal status immediately before
+   broadcasting and refuses if it is already `Completed` — restoring the
+   defence in depth this section originally implied but did not have.
+
+ADR-0019 supersedes this section's mechanism table for payouts.
 
 This closes D8 without introducing consensus of its own — consistent with
 the Phase 0 p2p constraint.

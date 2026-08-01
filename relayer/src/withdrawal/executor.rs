@@ -32,6 +32,7 @@ use crate::glc::withdrawal_db::{
     VaultUtxo, WithdrawalState,
 };
 use crate::withdrawal::address::{decode_p2pkh_hash160, p2pkh_script_hex};
+use crate::withdrawal::assignment::OperatorAssignment;
 use crate::withdrawal::builder::{
     verify_payout_tx, verify_signing_preserved_outputs, DecodedInput, DecodedOutput, DecodedTx,
     PayoutPlan, VerifyError,
@@ -39,6 +40,26 @@ use crate::withdrawal::builder::{
 use crate::withdrawal::coin::{self, SelectionError};
 use crate::withdrawal::config::WithdrawalConfig;
 use crate::withdrawal::multisig::{assemble, MultisigError, Transaction};
+
+/// Reads a withdrawal's **on-chain** status (Phase 7g, ADR-0019 D4).
+///
+/// Consulted immediately before broadcasting. Phase 7g measured two
+/// operators paying the same withdrawal twice with nothing in the executor
+/// to stop it (ADR-0019 §2.2); this is the guard that closes that gap in the
+/// process that would otherwise cause the harm.
+///
+/// It is **defence in depth, not the primary protection** — Phase 7e's
+/// signer check remains that. This cannot catch a payment made but not yet
+/// completed on-chain.
+#[tonic::async_trait]
+pub trait OnChainWithdrawalStatus: Send + Sync {
+    /// Whether the withdrawal is already `Completed` on Solana.
+    ///
+    /// An error must NOT be read as "not completed": the caller treats an
+    /// unavailable chain as a reason to wait, never as permission to
+    /// broadcast.
+    async fn is_completed(&self, withdrawal_index: u64) -> Result<bool, String>;
+}
 
 /// Collects **Goldcoin partial signatures** from the designated quorum
 /// (Phase 7e, ADR-0017).
@@ -167,6 +188,12 @@ pub struct WithdrawalExecutor<R: PayoutRpc, C: PayoutPartialCollector> {
     /// The validator-set epoch stamped onto signing requests, read fresh
     /// each tick from this relayer's own observation.
     epoch: std::sync::Arc<crate::solana::epoch::EpochObservation>,
+    /// This relayer's place in the federation (Phase 7g). `None` means a
+    /// single-operator deployment: everything is designated to us.
+    assignment: Option<OperatorAssignment>,
+    /// The pre-broadcast on-chain check (ADR-0019 D4). `None` disables it,
+    /// which is only appropriate for tests that have no Solana at all.
+    onchain: Option<std::sync::Arc<dyn OnChainWithdrawalStatus>>,
 }
 
 fn now_unix() -> i64 {
@@ -193,6 +220,79 @@ impl<R: PayoutRpc, C: PayoutPartialCollector> WithdrawalExecutor<R, C> {
             config,
             collector,
             epoch,
+            assignment: None,
+            onchain: None,
+        }
+    }
+
+    /// Declares this relayer's place in the federation (Phase 7g, ADR-0019).
+    ///
+    /// Without it the executor behaves as a single operator: designated for
+    /// everything, waiting for nobody. That is the correct behaviour for a
+    /// one-operator deployment and the historical behaviour for tests.
+    pub fn with_assignment(mut self, assignment: OperatorAssignment) -> Self {
+        self.assignment = Some(assignment);
+        self
+    }
+
+    /// Attaches the pre-broadcast on-chain status check (ADR-0019 D4).
+    pub fn with_onchain_status(
+        mut self,
+        status: std::sync::Arc<dyn OnChainWithdrawalStatus>,
+    ) -> Self {
+        self.onchain = Some(status);
+        self
+    }
+
+    /// Whether this operator may build a payout for `index` right now.
+    ///
+    /// ADR-0019 D3: only the designated builder reserves UTXOs, because
+    /// speculative reservation by every operator is what made two honest
+    /// executors build different transactions (§2.1). Others take over only
+    /// after the failover window.
+    fn may_build(&self, index: i64, eligible_since: i64) -> bool {
+        match &self.assignment {
+            None => true,
+            Some(a) => a.may_build(index as u64, eligible_since, now_unix()),
+        }
+    }
+
+    /// The last check before funds move (ADR-0019 D4).
+    ///
+    /// Returns `true` when broadcasting is safe. An unavailable chain
+    /// returns `false` — waiting is always safe, broadcasting on a guess is
+    /// not.
+    ///
+    /// A free function, not a method: holding `&self` across an `.await`
+    /// would require `WithdrawalExecutor: Sync`, which it is not
+    /// (`rusqlite::Connection`'s statement cache uses a `RefCell`), and
+    /// `tokio::spawn` needs the whole future to be `Send`. The same reason
+    /// `Orchestrator::call` is a free function.
+    async fn safe_to_broadcast(
+        onchain: Option<std::sync::Arc<dyn OnChainWithdrawalStatus>>,
+        index: i64,
+    ) -> bool {
+        let Some(status) = onchain else {
+            return true;
+        };
+        match status.is_completed(index as u64).await {
+            Ok(false) => true,
+            Ok(true) => {
+                tracing::error!(
+                    withdrawal_index = index,
+                    "withdrawal is already Completed on-chain — refusing to broadcast a second \
+                     payout for it"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(
+                    withdrawal_index = index,
+                    error = %e,
+                    "could not read on-chain withdrawal status; not broadcasting this tick"
+                );
+                false
+            }
         }
     }
 
@@ -261,6 +361,15 @@ impl<R: PayoutRpc, C: PayoutPartialCollector> WithdrawalExecutor<R, C> {
         }
         for state in [WithdrawalState::AwaitingFunds, WithdrawalState::Validated] {
             for w in self.db.withdrawals_by_state(state)? {
+                // ADR-0019 D3: a non-designated operator stays PASSIVE — it
+                // does not build and therefore does not reserve, which is
+                // what removes the divergence measured in §2.1. It adopts a
+                // proposal when asked to sign one, after verifying it
+                // independently (`p2p::payout_view`).
+                let eligible_since = self.db.withdrawal_eligible_since(w.withdrawal_index)?;
+                if !self.may_build(w.withdrawal_index, eligible_since) {
+                    continue;
+                }
                 self.build(w.withdrawal_index, &mut report).await?;
             }
         }
@@ -368,14 +477,11 @@ impl<R: PayoutRpc, C: PayoutPartialCollector> WithdrawalExecutor<R, C> {
     /// Reassignment when a designated signer is unavailable is explicit and
     /// audited (`Db::reassign_payout_quorum`), never an implicit fallback.
     fn designate_quorum(&self, index: i64) -> Vec<u8> {
-        let n = self.config.vault.signer_count();
-        let m = self.config.vault.threshold;
-        let start = (index.unsigned_abs() as usize) % n;
-        let mut picked: Vec<u8> = (0..m).map(|k| ((start + k) % n) as u8).collect();
-        // Ascending order is part of the canonical encoding, so a quorum has
-        // exactly one representation.
-        picked.sort_unstable();
-        picked
+        crate::withdrawal::assignment::designate_quorum(
+            index,
+            self.config.vault.signer_count(),
+            self.config.vault.threshold,
+        )
     }
 
     async fn build(
@@ -700,6 +806,13 @@ impl<R: PayoutRpc, C: PayoutPartialCollector> WithdrawalExecutor<R, C> {
         let Some(signed) = p.signed_tx_hex.clone() else {
             return Ok(());
         };
+
+        // ADR-0019 D4 — the last check before funds move. Phase 7g measured
+        // two operators paying one withdrawal twice with nothing here to
+        // stop it (§2.2).
+        if !Self::safe_to_broadcast(self.onchain.clone(), index).await {
+            return Ok(());
+        }
 
         // Only ever the identical byte string; never a rebuild.
         match self
