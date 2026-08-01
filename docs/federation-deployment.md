@@ -140,6 +140,9 @@ may have fallen behind.
 | `GLC_FEDERATION_TLS_DOMAIN` | the name peer certificates must be issued for |
 | `GLC_FEDERATION_TLS` | set to `off` for loopback/regtest only; logs a warning every start |
 | `GLC_VAULT_SIGNER_MAP` | `index:base58pubkey,...` — which validator holds which vault position (Phase 7e) |
+| `GLC_RELAYER_VALIDATOR_PUBKEY` | **this** relayer's federation identity (Phase 7g) |
+| `GLC_PAYOUT_BUILD_TIMEOUT_SECS` | failover: seconds before a non-designated operator may build (default 120) |
+| `GLC_MINT_SUBMIT_TIMEOUT_SECS` | failover: seconds before a non-designated operator may submit a mint (default 60) |
 
 `GLC_VAULT_SIGNER_MAP` is validated against the configured redeem script at
 startup and **fails closed**: every vault position must be mapped, no
@@ -161,6 +164,40 @@ apparent agreement by counting one party twice.
 > **Note:** `GLC_SOLANA_VALIDATOR_KEYPAIR_PATHS` no longer exists. The
 > relayer holds no validator key; configuring it with paths to them invited
 > operators to place federation key material in the wrong process.
+
+## Running several relayers at once (Phase 7g)
+
+`GLC_RELAYER_VALIDATOR_PUBKEY` states which federation member this relayer
+acts as. It is **never derived**, and startup fails closed if it appears in
+`GLC_FEDERATION_PEERS` (peers are the *others*) or is absent from
+`GLC_VAULT_SIGNER_MAP` (which is what gives this relayer its operator index).
+
+Work is assigned by arithmetic — `index mod N` — so every operator computes
+the same answer without exchanging a message. There is no election, no lock,
+and no shared database.
+
+**Only the designated operator builds a payout.** Others stay passive: they
+do not build and therefore do not reserve UTXOs, then adopt the designated
+builder's proposal when asked to sign it — after independently validating
+every field against their own state. This is not politeness. Phase 7g
+measured two operators building *different* transactions purely because they
+observed withdrawals in a different order, and speculative reservation was
+the cause ([ADR-0019](adr/0019-multi-relayer-operation.md) §2.1).
+
+If the designated operator is down, the others take over after the failover
+window, so one dead operator cannot strand a withdrawal.
+
+> ### Duplicate payouts are NOT harmless
+>
+> Duplicate *mints* are — the claim PDA's `init` prevents a double-mint and
+> only fees are wasted. Duplicate *payouts* are not: Phase 7g measured two
+> operators paying the same withdrawal twice. ADR-0014 §10 previously said
+> otherwise and has been corrected in place (§10.1).
+>
+> Three things stop it, in order: Phase 7e's signer check (**primary**),
+> Phase 7f's completion plus the discovery filter, and Phase 7g's
+> pre-broadcast on-chain status check. The first lives in the *signer*
+> process — a different process from the executor that would cause the harm.
 
 ## What a peer's answer means
 

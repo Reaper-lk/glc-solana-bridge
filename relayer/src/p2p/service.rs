@@ -137,6 +137,7 @@ struct PayoutArm {
 /// gain a second one purely for an optional arm.
 #[tonic::async_trait]
 trait ErasedPayoutView: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
     async fn sign_payout(
         &self,
         db: &mut Db,
@@ -144,6 +145,7 @@ trait ErasedPayoutView: Send + Sync {
         quorum_attempt: u32,
         canonical_intent: &[u8],
         unsigned_tx_hex: &str,
+        proposer_index: usize,
         now_unix: i64,
     ) -> Result<super::payout_view::PayoutPartial, PayoutRefusal>;
 }
@@ -157,6 +159,7 @@ impl<S: PartialSigner + Send + Sync + 'static> ErasedPayoutView for PayoutView<S
         quorum_attempt: u32,
         canonical_intent: &[u8],
         unsigned_tx_hex: &str,
+        proposer_index: usize,
         now_unix: i64,
     ) -> Result<super::payout_view::PayoutPartial, PayoutRefusal> {
         PayoutView::sign_payout(
@@ -166,6 +169,7 @@ impl<S: PartialSigner + Send + Sync + 'static> ErasedPayoutView for PayoutView<S
             quorum_attempt,
             canonical_intent,
             unsigned_tx_hex,
+            proposer_index,
             now_unix,
         )
         .await
@@ -369,6 +373,7 @@ impl<V: LocalView + Send + Sync + 'static> SignerService<V> {
                 req.quorum_attempt,
                 &req.canonical_intent,
                 &req.unsigned_tx_hex,
+                req.proposer_index as usize,
                 now,
             )
             .await

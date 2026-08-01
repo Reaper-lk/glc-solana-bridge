@@ -122,6 +122,15 @@ message PayoutSignRequest {
   // the exact bytes that get signed.
   string unsigned_tx_hex = 6;
   int64 expiry_unix = 7;
+  // Which operator is proposing (Phase 7g, ADR-0019 D3 check 1).
+  //
+  // ADVISORY, and deliberately so: it decides only whether this proposal is
+  // TIMELY — whether the designated builder is the one asking, or its
+  // failover window has elapsed. It is NOT a security boundary. Every field
+  // of the proposal is independently validated against the responder's own
+  // state regardless of who claims to have sent it, so a false value can
+  // waste a round trip and nothing more.
+  uint32 proposer_index = 8;
 }
 
 message PayoutSignResponse {

@@ -308,6 +308,7 @@ impl GrpcCollector {
     /// registered as holding. The signature itself is verified later, during
     /// assembly, against that input's sighash — which is where a forged or
     /// corrupted partial is actually caught.
+    #[allow(clippy::too_many_arguments)]
     pub async fn collect_payout_partials(
         &self,
         epoch: u64,
@@ -316,6 +317,7 @@ impl GrpcCollector {
         canonical_intent: &[u8],
         unsigned_tx_hex: &str,
         designated: &[DesignatedSigner],
+        proposer_index: u32,
     ) -> PartialRound {
         let mut round = Round::new();
         let mut partials = Vec::with_capacity(designated.len());
@@ -351,6 +353,7 @@ impl GrpcCollector {
                 canonical_intent: canonical_intent.to_vec(),
                 unsigned_tx_hex: unsigned_tx_hex.to_string(),
                 expiry_unix: crate::p2p::service::now_unix() + REQUEST_TTL_SECONDS,
+                proposer_index,
             };
 
             match self.ask_payout(peer, req, d).await {

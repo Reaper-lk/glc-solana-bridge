@@ -45,7 +45,8 @@ use glc_relayer::signer::load_validator_keypair;
 use glc_relayer::solana::epoch::{observe_epoch, run_epoch_refresher, EpochObservation};
 use glc_relayer::solana::rpc::RealSolanaRpc;
 use glc_relayer::withdrawal::adapter::RealPayoutRpc;
-use glc_relayer::withdrawal::vault::MultisigVault;
+use glc_relayer::withdrawal::assignment::OperatorAssignment;
+use glc_relayer::withdrawal::config::{RawWithdrawalConfig, WithdrawalConfig};
 
 fn env_required(name: &str) -> anyhow::Result<String> {
     std::env::var(name)
@@ -104,6 +105,50 @@ impl PartialSigner for NodePartialSigner {
 /// Both the payout arm and the completion arm validate against it, and both
 /// depend on it being independent of the relayer's node — a signer that
 /// inherits the requester's view of the chain is not checking anything.
+/// The validated withdrawal configuration, shared with the relayer so a
+/// signer checks an adopted proposal against identical policy.
+fn withdrawal_config_from_env() -> anyhow::Result<WithdrawalConfig> {
+    let raw = RawWithdrawalConfig {
+        vault_redeem_script_hex: env_required("GLC_VAULT_REDEEM_SCRIPT_HEX")?,
+        vault_address: env_required("GLC_VAULT_ADDRESS")?,
+        change_address: env_required("GLC_VAULT_CHANGE_ADDRESS")?,
+        fee_rate_per_kb: env_required("GLC_PAYOUT_FEE_RATE_PER_KB")?.parse()?,
+        dust_threshold_atomic: env_required("GLC_PAYOUT_DUST_THRESHOLD_ATOMIC")?.parse()?,
+        vault_min_confirmations: env_required("GLC_VAULT_MIN_CONFIRMATIONS")?.parse()?,
+        confirmation_depth: env_required("GLC_WITHDRAWAL_CONFIRMATION_DEPTH")?.parse()?,
+        max_inputs_per_payout: env_required("GLC_PAYOUT_MAX_INPUTS")?.parse()?,
+        reservation_timeout_secs: env_required("GLC_PAYOUT_RESERVATION_TIMEOUT_SECS")?.parse()?,
+        discovery_commitment: env_required("GLC_WITHDRAWAL_DISCOVERY_COMMITMENT")?,
+        poll_interval_ms: 5_000,
+    };
+    WithdrawalConfig::validate(raw)
+        .map_err(|e| anyhow::anyhow!("invalid withdrawal configuration: {e}"))
+}
+
+/// This operator's place in the federation (Phase 7g, ADR-0019 D1).
+///
+/// `None` when the federation is not configured for multi-operator running,
+/// in which case the signer accepts a proposal from anyone — correct for a
+/// single-operator deployment, and the historical behaviour.
+fn operator_assignment_from_env() -> anyhow::Result<Option<OperatorAssignment>> {
+    let (Some(index), Some(count)) = (
+        env_optional("GLC_OPERATOR_INDEX"),
+        env_optional("GLC_OPERATOR_COUNT"),
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(OperatorAssignment::new(
+        index.parse()?,
+        count.parse()?,
+        env_optional("GLC_PAYOUT_BUILD_TIMEOUT_SECS")
+            .unwrap_or_else(|| "120".into())
+            .parse()?,
+        env_optional("GLC_MINT_SUBMIT_TIMEOUT_SECS")
+            .unwrap_or_else(|| "60".into())
+            .parse()?,
+    )?))
+}
+
 fn signer_goldcoin_rpc() -> anyhow::Result<RpcClient> {
     let url = env_required("GLC_SIGNER_GLC_RPC_URL")?;
     let user = env_required("GLC_SIGNER_GLC_RPC_USER")?;
@@ -123,13 +168,17 @@ fn signer_goldcoin_rpc() -> anyhow::Result<RpcClient> {
 }
 
 fn payout_arm() -> anyhow::Result<Option<(PayoutView<NodePartialSigner>, Db)>> {
-    let Some(redeem_hex) = env_optional("GLC_VAULT_REDEEM_SCRIPT_HEX") else {
+    let Some(_redeem_hex) = env_optional("GLC_VAULT_REDEEM_SCRIPT_HEX") else {
         tracing::warn!(
             "GLC_VAULT_REDEEM_SCRIPT_HEX is not set — this signer serves MINT requests only and              will refuse every payout request"
         );
         return Ok(None);
     };
-    let vault = MultisigVault::from_redeem_script_hex(&redeem_hex)?;
+    // The signer validates an adopted proposal against the SAME policy the
+    // executor builds with (ADR-0019 D3), so it loads the same validated
+    // configuration rather than a subset of it.
+    let cfg = withdrawal_config_from_env()?;
+    let vault = cfg.vault.clone();
 
     let index: u8 = env_required("GLC_SIGNER_VAULT_INDEX")?
         .parse()
@@ -162,8 +211,11 @@ fn payout_arm() -> anyhow::Result<Option<(PayoutView<NodePartialSigner>, Db)>> {
     );
 
     let db = Db::open(&PathBuf::from(env_required("GLC_DB_PATH")?))?;
-    let view = PayoutView::new(vault, index, NodePartialSigner { rpc, wif })
+    let mut view = PayoutView::new(cfg, index, NodePartialSigner { rpc, wif })
         .map_err(|e| anyhow::anyhow!(e))?;
+    if let Some(a) = operator_assignment_from_env()? {
+        view = view.with_assignment(a);
+    }
     Ok(Some((view, db)))
 }
 

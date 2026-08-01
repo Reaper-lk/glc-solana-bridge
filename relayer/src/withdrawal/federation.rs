@@ -114,6 +114,15 @@ impl VaultSignerMap {
         Ok(VaultSignerMap { by_index })
     }
 
+    /// This validator's vault signer position, which is also its operator
+    /// index for work assignment (ADR-0019 D1).
+    pub fn index_of(&self, validator: &Pubkey) -> Option<u8> {
+        self.by_index
+            .iter()
+            .find(|(_, v)| *v == validator)
+            .map(|(i, _)| *i)
+    }
+
     pub fn validator_at(&self, index: u8) -> Option<Pubkey> {
         self.by_index.get(&index).copied()
     }
@@ -133,14 +142,23 @@ pub struct FederationPayoutCollector {
     collector: GrpcCollector,
     vault: MultisigVault,
     map: VaultSignerMap,
+    /// This relayer's operator index (Phase 7g, ADR-0019 D1), stamped onto
+    /// proposals so a passive peer can tell whether the proposal is timely.
+    proposer_index: u32,
 }
 
 impl FederationPayoutCollector {
-    pub fn new(collector: GrpcCollector, vault: MultisigVault, map: VaultSignerMap) -> Self {
+    pub fn new(
+        collector: GrpcCollector,
+        vault: MultisigVault,
+        map: VaultSignerMap,
+        proposer_index: u32,
+    ) -> Self {
         FederationPayoutCollector {
             collector,
             vault,
             map,
+            proposer_index,
         }
     }
 
@@ -199,6 +217,7 @@ impl PayoutPartialCollector for FederationPayoutCollector {
                 canonical_intent,
                 unsigned_tx_hex,
                 &designated,
+                self.proposer_index,
             )
             .await
             .partials
@@ -400,6 +419,24 @@ mod tests {
     }
 
     #[test]
+    fn index_of_resolves_each_validator_to_its_own_position() {
+        // ADR-0019 D1: this index decides which work this operator acts on
+        // first. Resolving to the wrong one would silently reassign every
+        // payout in the federation.
+        let v = vault_of(3, 2);
+        let (a, b, c) = (pk(), pk(), pk());
+        let m = VaultSignerMap::parse(&format!("0:{a},1:{b},2:{c}"), &v).unwrap();
+        assert_eq!(m.index_of(&a), Some(0));
+        assert_eq!(m.index_of(&b), Some(1));
+        assert_eq!(m.index_of(&c), Some(2));
+        assert_eq!(
+            m.index_of(&pk()),
+            None,
+            "a validator absent from the map has no operator index"
+        );
+    }
+
+    #[test]
     fn rejects_an_index_outside_the_vault() {
         // A designated quorum must never resolve to a position that does not
         // exist; failing at startup is the whole point of E1.
@@ -488,6 +525,7 @@ mod tests {
             }]),
             v,
             map,
+            0,
         );
         // Position 1 is unmapped.
         let resolved = fc.resolve(&[0, 1]);
@@ -517,6 +555,7 @@ mod tests {
             }]),
             v.clone(),
             map,
+            0,
         );
         let resolved = fc.resolve(&[0, 2]);
         assert_eq!(resolved.len(), 2);
