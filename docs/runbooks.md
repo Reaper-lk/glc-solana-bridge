@@ -569,7 +569,87 @@ exactly one transaction. Afterwards the mint authority is a program PDA and
 freeze authority is `None` (custody #6) — the keypair confers nothing and is
 one more thing to lose.
 
-**3. Verify what actually landed.**
+**3. Give the token its wallet-visible name.**
+
+> **Host the metadata JSON first.** The URI is written once and this command
+> **does not rewrite an existing account** (§14.2). Running it before the
+> file is live bakes in a URI that 404s, and there is no update command —
+> fixing it would need a new instruction and a program upgrade.
+>
+> Verified 2026-08-01: `https://goldcoinproject.org/assets/wglc.json` and
+> `wglc.png` both return **404**. The host is up; the files are not there
+> yet. Publish them, confirm both return 200, and only then run this.
+
+```
+glc-admin token-metadata --note "launch: OPS-1"
+```
+
+Creates Metaplex metadata so wallets show **Wrapped Goldcoin (wGLC)** instead
+of a bare mint address.
+
+The URI defaults to `https://goldcoinproject.org/assets/wglc.json`, whose
+`image` field points at `https://goldcoinproject.org/assets/wglc.png`. Pass
+`--uri <url>` to override it, or `--uri ""` for name and symbol with no
+hosted JSON.
+
+**Idempotent, and it verifies.** If the metadata already exists nothing is
+written; either way the account is read back and checked against what this
+bridge expects. Re-running is how you answer "is the token named correctly?"
+without needing to know whether it was done before — and it is safe to run at
+any time, not only at launch.
+
+Decimals are not set here and cannot be: Metaplex metadata carries no
+decimals field. Wallets read them from the mint, which already says 8.
+
+### 14.2 Changing the name, symbol or URI later
+
+`glc-admin update-token-metadata` changes what wallets display, **without a
+program upgrade**. Admin-gated, like creation.
+
+```
+# move the hosting URL, leaving the name and symbol alone
+glc-admin update-token-metadata \
+  --uri "https://new-host.example/wglc.json" --note "OPS-n: hosting moved"
+
+# rename (rarely wanted; wallets and listings cache aggressively)
+glc-admin update-token-metadata \
+  --name "Wrapped Goldcoin" --symbol "wGLC" --note "OPS-n: ..."
+```
+
+**Omitted values keep whatever is on chain.** Moving only the URL cannot
+rename the token by accident.
+
+**Idempotent.** If the values already match, the program writes nothing and
+makes no CPI — so re-running is how you confirm a change landed, not a
+second write. The command reads the account back and verifies either way.
+
+**It touches only the metadata account.** The instruction takes no mint
+account at all, so the mint address, its decimals, its mint authority and
+its freeze authority cannot be affected. The metadata's own update authority
+stays with the program's mint-authority PDA — an update never hands that to
+a keypair.
+
+**Order matters, as at creation:** publish the new JSON first, confirm it
+returns 200, then update. Wallets and explorers cache metadata, so the change
+may take hours to appear; that is not a failure.
+
+**If the metadata does not exist yet**, this refuses and tells you to run
+`glc-admin token-metadata` first — updating something never created is a
+different mistake from a failed create.
+
+### 14.3 Why the URI was once write-once
+
+`token-metadata` is idempotent by "does metadata exist", **not** by "does it
+match what I passed". A second run with a different `--uri` leaves the
+existing account alone — deliberately, so re-running to verify can never
+silently rewrite what wallets are already displaying.
+
+Changing values after creation is therefore a separate, explicit act:
+`update-token-metadata` (§14.2). That instruction exists precisely so the
+hosting URL can move without a program upgrade, which would otherwise mean
+exercising the single-key upgrade authority (custody #5).
+
+**4. Verify what actually landed.**
 
 ```
 glc-admin show-config
@@ -580,7 +660,7 @@ supply ceiling and deposit/withdrawal floors are what you intended. Reading
 them back is not a formality: nothing else will tell you a digit was
 transposed.
 
-**4. Pause before any funds can move** (§9), then bring operators up.
+**5. Pause before any funds can move** (§9), then bring operators up.
 
 ### 14.1 Admin handover (custody #5)
 

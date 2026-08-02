@@ -506,3 +506,125 @@ fn bridge_config_serialises_at_the_offsets_the_relayer_reads() {
         assert_eq!(&body[off..off + 8], &21_000_000_000_000u64.to_le_bytes());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Token metadata encoding (ADR-0028)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn create_token_metadata_encodes_a_borsh_string() {
+    use anchor_lang::ToAccountMetas;
+
+    let admin = Pubkey::new_unique();
+    let mint = Pubkey::new_unique();
+    let metaplex: Pubkey =
+        anchor_lang::solana_program::pubkey!("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
+    let metadata =
+        Pubkey::find_program_address(&[b"metadata", metaplex.as_ref(), mint.as_ref()], &metaplex).0;
+
+    let ix = anchor_lang::solana_program::instruction::Instruction {
+        program_id: glc_bridge::ID,
+        accounts: glc_bridge::accounts::CreateTokenMetadata {
+            admin,
+            bridge_config: config_pda(),
+            mint_authority: mint_authority_pda(),
+            wrapped_mint: mint,
+            metadata,
+            token_metadata_program: metaplex,
+            system_program: solana_sdk::system_program::id(),
+            rent: anchor_lang::solana_program::sysvar::rent::ID,
+        }
+        .to_account_metas(None),
+        data: glc_bridge::instruction::CreateTokenMetadata {
+            uri: "abc".to_string(),
+        }
+        .data(),
+    };
+
+    assert_eq!(&ix.data[..8], &discriminator("create_token_metadata"));
+    assert_eq!(&ix.data[8..12], &3u32.to_le_bytes(), "Borsh string length");
+    assert_eq!(&ix.data[12..15], b"abc");
+    assert_eq!(ix.data.len(), 15);
+
+    assert_eq!(
+        shape(&ix),
+        vec![
+            (admin, true, true),
+            (config_pda(), false, false),
+            (mint_authority_pda(), false, false),
+            (mint, false, false),
+            (metadata, false, true),
+            (metaplex, false, false),
+            (solana_sdk::system_program::id(), false, false),
+            (anchor_lang::solana_program::sysvar::rent::ID, false, false),
+        ]
+    );
+}
+
+#[test]
+fn the_metadata_name_and_symbol_are_program_constants() {
+    // Constants rather than instruction arguments: an operator cannot typo
+    // them, and what wallets will show is verifiable by reading the program.
+    assert_eq!(
+        glc_bridge::instructions::token_metadata::WRAPPED_GLC_NAME,
+        "Wrapped Goldcoin"
+    );
+    assert_eq!(
+        glc_bridge::instructions::token_metadata::WRAPPED_GLC_SYMBOL,
+        "wGLC"
+    );
+}
+
+#[test]
+fn update_token_metadata_encodes_three_borsh_strings_and_writes_only_metadata() {
+    use anchor_lang::ToAccountMetas;
+
+    let admin = Pubkey::new_unique();
+    let mint = Pubkey::new_unique();
+    let metaplex: Pubkey =
+        anchor_lang::solana_program::pubkey!("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
+    let metadata =
+        Pubkey::find_program_address(&[b"metadata", metaplex.as_ref(), mint.as_ref()], &metaplex).0;
+
+    let ix = anchor_lang::solana_program::instruction::Instruction {
+        program_id: glc_bridge::ID,
+        accounts: glc_bridge::accounts::UpdateTokenMetadata {
+            admin,
+            bridge_config: config_pda(),
+            mint_authority: mint_authority_pda(),
+            metadata,
+            token_metadata_program: metaplex,
+        }
+        .to_account_metas(None),
+        data: glc_bridge::instruction::UpdateTokenMetadata {
+            name: "Wrapped Goldcoin".into(),
+            symbol: "wGLC".into(),
+            uri: "https://x/a.json".into(),
+        }
+        .data(),
+    };
+
+    assert_eq!(&ix.data[..8], &discriminator("update_token_metadata"));
+    let mut off = 8;
+    for expected in ["Wrapped Goldcoin", "wGLC", "https://x/a.json"] {
+        let len = u32::from_le_bytes(ix.data[off..off + 4].try_into().unwrap()) as usize;
+        assert_eq!(len, expected.len());
+        assert_eq!(&ix.data[off + 4..off + 4 + len], expected.as_bytes());
+        off += 4 + len;
+    }
+    assert_eq!(ix.data.len(), off);
+
+    // The mint is absent, and only the metadata account is writable — the
+    // structural reason an update cannot disturb the token itself.
+    assert!(!ix.accounts.iter().any(|m| m.pubkey == mint));
+    assert_eq!(
+        shape(&ix),
+        vec![
+            (admin, true, false),
+            (config_pda(), false, false),
+            (mint_authority_pda(), false, false),
+            (metadata, false, true),
+            (metaplex, false, false),
+        ]
+    );
+}
