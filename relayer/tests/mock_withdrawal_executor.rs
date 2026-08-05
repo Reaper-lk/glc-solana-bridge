@@ -17,6 +17,7 @@ use glc_relayer::solana::epoch::EpochObservation;
 use glc_relayer::withdrawal::address::{encode_p2pkh, p2pkh_script_hex};
 use glc_relayer::withdrawal::builder::{DecodedInput, DecodedOutput, DecodedTx};
 use glc_relayer::withdrawal::config::{RawWithdrawalConfig, WithdrawalConfig};
+use glc_relayer::withdrawal::assignment::OperatorAssignment;
 use glc_relayer::withdrawal::executor::{PayoutRpc, TxStatus, WithdrawalExecutor};
 use glc_relayer::withdrawal::federation::InProcessPayoutCollector;
 
@@ -1240,4 +1241,135 @@ async fn guard_refuses_when_a_payout_is_already_completed() {
         "a completed payout must never be re-signed"
     );
     assert_eq!(h.state(1), WithdrawalState::IntegrityHalted);
+}
+
+// =====================================================================
+// ADR-0019 §2.1 — does a non-designated operator actually stay passive?
+// =====================================================================
+//
+// `docs/federation-deployment.md` states it plainly:
+//
+// > **Only the designated operator builds a payout.** Others stay passive:
+// > they do not build and therefore do not reserve UTXOs, then adopt the
+// > designated builder's proposal when asked to sign it.
+//
+// Nothing asserted that. The suites above assert the *consequence* everyone
+// cares about — no withdrawal is paid twice — which the builder-authoritative
+// reservation and the pre-broadcast check already deliver even if the
+// failover gate never fires. And every fixture above seeds `observed_at: 0`,
+// so `now - observed_at` is ~1.8 billion seconds: the window is ALWAYS
+// already elapsed and the blocking path is unreachable by construction.
+//
+// Observed on a real three-operator federation: withdrawal 0 designates
+// operator 0, yet operators 1 and 2 each built their own payout within one
+// second of observing it and reserved a vault UTXO apiece. Operator 0 paid
+// and completed normally; the other two sat in `Signing` forever, holding
+// reservations, with `/health` reporting a permanent
+// `vault_reconciliation` BREACH — which `runbooks.md` §4 tells an operator
+// to treat as a possible vault-key compromise.
+
+/// A withdrawal this operator has only just seen, so any sane failover
+/// window is still open. Deliberately not `withdrawal()`, whose
+/// `observed_at: 0` makes every window pre-elapsed.
+fn withdrawal_observed_now(index: i64, amount: u64) -> NewWithdrawalRequest {
+    let mut w = withdrawal(index, amount);
+    w.observed_at = now_unix();
+    w
+}
+
+fn reserved_count(db_path: &std::path::Path) -> i64 {
+    rusqlite::Connection::open(db_path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM vault_utxos WHERE state = 'Reserved'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_non_designated_operator_does_not_build_before_its_failover_window() {
+    let h = Harness::new(vec![utxo(0xaa, 0, 40_00000000)]);
+    // This operator is index 1 of 3; withdrawal 0 designates operator 0.
+    let mut exec = h
+        .executor()
+        .with_assignment(OperatorAssignment::new(1, 3, 120, 60).unwrap());
+
+    exec.ingest_discovered(&[withdrawal_observed_now(0, 5_00000000)])
+        .unwrap();
+    exec.tick().await.unwrap();
+
+    let state = h.state(0);
+    assert!(
+        matches!(
+            state,
+            WithdrawalState::Observed | WithdrawalState::Validated
+        ),
+        "operator 1 is not designated for withdrawal 0 and its 120s failover window is still \
+         open, so it must not advance past Validated; it is in {state:?}"
+    );
+    assert!(
+        h.db().get_payout(0).unwrap().is_none(),
+        "a passive operator must not create a payout row — building is what reserves UTXOs, and \
+         speculative reservation is what made two honest operators build different \
+         transactions (ADR-0019 §2.1)"
+    );
+    assert_eq!(
+        reserved_count(&h.db_path),
+        0,
+        "a passive operator must reserve nothing: 'they do not build and therefore do not \
+         reserve UTXOs' (docs/federation-deployment.md)"
+    );
+}
+
+#[tokio::test]
+async fn the_designated_operator_builds_without_waiting() {
+    let h = Harness::new(vec![utxo(0xaa, 0, 40_00000000)]);
+    let mut exec = h
+        .executor()
+        .with_assignment(OperatorAssignment::new(0, 3, 120, 60).unwrap());
+
+    exec.ingest_discovered(&[withdrawal_observed_now(0, 5_00000000)])
+        .unwrap();
+    exec.tick().await.unwrap();
+
+    let state = h.state(0);
+    assert!(
+        !matches!(
+            state,
+            WithdrawalState::Observed | WithdrawalState::Validated
+        ),
+        "the designated operator must build without waiting; it is stuck in {state:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_non_designated_operator_takes_over_after_the_failover_window() {
+    let h = Harness::new(vec![utxo(0xaa, 0, 40_00000000)]);
+    // A one-second window, then genuinely wait it out. Backdating
+    // `observed_at` alone does NOT work: `withdrawal_eligible_since` takes
+    // max(observed_at, last state change), and this operator's own
+    // Observed->Validated bookkeeping resets that to now.
+    let mut exec = h
+        .executor()
+        .with_assignment(OperatorAssignment::new(1, 3, 1, 1).unwrap());
+
+    exec.ingest_discovered(&[withdrawal_observed_now(0, 5_00000000)])
+        .unwrap();
+    exec.tick().await.unwrap();
+    assert_eq!(h.state(0), WithdrawalState::Validated, "blocked at first");
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    exec.tick().await.unwrap();
+
+    let state = h.state(0);
+    assert!(
+        !matches!(
+            state,
+            WithdrawalState::Observed | WithdrawalState::Validated
+        ),
+        "after the failover window a non-designated operator must be able to take over, or one \
+         dead operator strands the withdrawal forever; it is stuck in {state:?}"
+    );
 }
